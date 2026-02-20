@@ -6,7 +6,9 @@ Defines the API routes and wires up providers, pricing, and payment handling.
 from __future__ import annotations
 
 import asyncio
+import importlib.metadata
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 from typing import Any
@@ -80,16 +82,78 @@ async def lifespan(app: FastAPI):
     logger.info("x402gate shut down")
 
 
+_VERSION = importlib.metadata.version("x402gate")
+
 app = FastAPI(
     title="x402gate",
     description="Transparent x402 payment proxy for AI services",
-    version="0.1.0",
+    version=_VERSION,
     lifespan=lifespan,
 )
 
 
-# --- Health Check ---
 
+# --- Service Discovery ---
+
+
+@app.get("/", include_in_schema=False)
+async def service_info() -> dict[str, Any]:
+    """Machine-readable service manifest for AI agents."""
+    base_url = os.environ.get("BASE_URL", "")
+    networks = list(config.payment.networks.keys())
+    commission_pct = int(config.gateway.commission * 100)
+    gas_fee = config.gateway.min_commission
+    return {
+        "name": "x402gate",
+        "version": _VERSION,
+        "description": (
+            "Transparent pay-per-request proxy for AI services via the x402 protocol. "
+            "Send a POST request to any provider endpoint — if no payment header is "
+            "included, a 402 response is returned with USDC payment options."
+        ),
+        "payment_protocol": "x402",
+        "payment_asset": "USDC",
+        "networks": networks,
+        "providers": list(providers.keys()),
+        "commission": f"{commission_pct}% + ${gas_fee} gas per request",
+        "endpoints": {
+            "openapi": f"{base_url}/openapi.json",
+            "docs": f"{base_url}/docs",
+            "health": f"{base_url}/health",
+            "providers": f"{base_url}/v1/providers",
+            "ai_plugin": f"{base_url}/.well-known/ai-plugin.json",
+        },
+        "source": "https://github.com/oponfil/x402gate",
+    }
+
+
+
+@app.get("/.well-known/ai-plugin.json", include_in_schema=False)
+async def ai_plugin_manifest() -> dict[str, Any]:
+    """Standard AI plugin manifest for agent discoverability."""
+    base_url = os.environ.get("BASE_URL", "")
+    return {
+        "schema_version": "v1",
+        "name_for_human": "x402gate",
+        "name_for_model": "x402gate",
+        "description_for_human": "Pay-per-request proxy for AI services via x402/USDC",
+        "description_for_model": (
+            "x402gate is a transparent payment proxy for AI services using the x402 protocol. "
+            "To use it: POST to a provider endpoint (e.g. /v1/wavespeed/{model_path}) with a JSON body. "
+            "If no payment is attached, the server returns HTTP 402 with accepted payment "
+            "options (scheme, network, asset, amount, pay_to address). "
+            "Attach a valid x402 PAYMENT-SIGNATURE header and resubmit to get the AI response. "
+            "Supported networks: Base mainnet (EVM, USDC), Solana mainnet (SVM, USDC). "
+            "Prices are dynamic and fetched from the upstream provider at request time."
+        ),
+        "auth": {"type": "none"},
+        "api": {
+            "type": "openapi",
+            "url": f"{base_url}/openapi.json",
+        },
+        "contact_email": "oponfil@github.com",
+        "legal_info_url": "https://github.com/oponfil/x402gate/blob/main/LICENSE",
+    }
 
 @app.get("/health")
 async def health_check() -> dict[str, str]:

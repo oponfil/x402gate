@@ -65,17 +65,14 @@ def apply_commission(
     Args:
         base_price: The provider's base cost in USD.
         commission_rate: Commission as a decimal (e.g., 0.05 for 5%).
-        min_commission: Minimum commission in USD (e.g., 0.001).
+        min_commission: Fixed gas surcharge in USD always added on top (e.g., 0.001).
 
     Returns:
         Final price rounded up to 6 decimal places (USDC precision).
     """
     commission = base_price * Decimal(str(commission_rate))
-    if min_commission > 0:
-        min_c = Decimal(str(min_commission))
-        if commission < min_c:
-            commission = min_c
-    final = base_price + commission
+    gas_fee = Decimal(str(min_commission)) if min_commission > 0 else Decimal("0")
+    final = base_price + commission + gas_fee
     # Round up to 6 decimal places (USDC has 6 decimals)
     return final.quantize(Decimal("0.000001"), rounding=ROUND_UP)
 

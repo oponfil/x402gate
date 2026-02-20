@@ -112,8 +112,8 @@ class TestWaveSpeedProxy:
         assert "accepts" in body
         assert body["accepts"][0]["scheme"] == "exact"
         # 5% of $0.003 = $0.00015, but min_commission = $0.001
-        # So commission = max($0.00015, $0.001) = $0.001, total = $0.004
-        assert body["accepts"][0]["price"] == "$0.004000"
+        # Price: $0.003 base + 5% ($0.00015) + $0.001 gas = $0.004150
+        assert body["accepts"][0]["price"] == "$0.004150"
 
     @respx.mock
     def test_invalid_json_returns_400(self, client):
