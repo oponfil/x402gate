@@ -1,0 +1,37 @@
+# x402gate configuration
+# See docs/configuration.md for details on all options.
+
+gateway:
+  host: "0.0.0.0"
+  port: 4021
+  commission: 0.05           # 5% markup on provider prices
+  min_commission: 0.001      # minimum $0.001 commission per request
+  price_cache_ttl: 60        # seconds, price cache TTL (0 = disabled)
+
+payment:
+  networks:
+    base:
+      type: "evm"
+      network: "eip155:8453"                                       # Base Mainnet
+      pay_to: "${BASE_PAY_TO_ADDRESS}"
+      token_address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"  # USDC on Base
+      token_name: "USD Coin"
+      token_version: "2"
+      rpc_url: "https://mainnet.base.org"
+      facilitator_key: "${BASE_FACILITATOR_PRIVATE_KEY}"
+    solana:
+      type: "svm"
+      network: "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"          # Solana Mainnet
+      pay_to: "${SOLANA_PAY_TO_ADDRESS}"
+      token_address: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" # USDC on Solana
+      rpc_url: "https://api.mainnet-beta.solana.com"
+      facilitator_key: "${SOLANA_FACILITATOR_PRIVATE_KEY}"
+  max_timeout: 3600
+
+providers:
+  wavespeed:
+    enabled: true
+    base_url: "https://api.wavespeed.ai/api/v3"
+    api_key: "${WAVESPEED_API_KEY}"
+    poll_interval: 1           # seconds, between status polls
+    poll_timeout: 300          # seconds, max wait for result (5 min)

@@ -1,0 +1,139 @@
+"""Transparent proxy and async task polling for x402gate.
+
+Forwards requests to provider APIs and polls for async task results.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from typing import Any
+
+import httpx
+
+logger = logging.getLogger(__name__)
+
+
+class ProxyError(Exception):
+    """Raised when the upstream provider returns an error."""
+
+    def __init__(self, status_code: int, detail: str) -> None:
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(f"Proxy error {status_code}: {detail}")
+
+
+class TaskTimeoutError(Exception):
+    """Raised when task polling exceeds the timeout."""
+
+    def __init__(self, task_id: str, timeout: int) -> None:
+        self.task_id = task_id
+        self.timeout = timeout
+        super().__init__(f"Task {task_id} did not complete within {timeout}s")
+
+
+async def proxy_request(
+    base_url: str,
+    path: str,
+    body: dict[str, Any],
+    api_key: str,
+    timeout: float = 30.0,
+) -> dict[str, Any]:
+    """Forward a request body to the provider API as-is.
+
+    Args:
+        base_url: Provider API base URL (e.g. https://api.wavespeed.ai/api/v3).
+        path: Request path to append (e.g. wavespeed-ai/flux-dev).
+        body: Request body dict, forwarded without modification.
+        api_key: Provider API key for Authorization header.
+        timeout: HTTP request timeout in seconds.
+
+    Returns:
+        Provider response as a dict.
+
+    Raises:
+        ProxyError: If the provider returns a non-2xx response.
+    """
+    url = f"{base_url.rstrip('/')}/{path.lstrip('/')}"
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.post(
+            url,
+            json=body,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+        )
+
+    if response.status_code >= 400:
+        raise ProxyError(
+            status_code=response.status_code,
+            detail=response.text,
+        )
+
+    return response.json()
+
+
+async def poll_result(
+    base_url: str,
+    task_id: str,
+    api_key: str,
+    poll_interval: int = 2,
+    poll_timeout: int = 300,
+) -> dict[str, Any]:
+    """Poll a provider API for async task completion.
+
+    Args:
+        base_url: Provider API base URL.
+        task_id: Task ID to poll.
+        api_key: Provider API key.
+        poll_interval: Seconds between poll requests.
+        poll_timeout: Maximum seconds to wait before timing out.
+
+    Returns:
+        Task result data dict when status is "completed".
+
+    Raises:
+        TaskTimeoutError: If the task doesn't complete within poll_timeout.
+        ProxyError: If the task fails or the API returns an error.
+    """
+    url = f"{base_url.rstrip('/')}/predictions/{task_id}/result"
+    elapsed = 0
+
+    # Brief delay before first poll to let the task register
+    await asyncio.sleep(1)
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        while elapsed < poll_timeout:
+            response = await client.get(
+                url,
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+
+            if response.status_code >= 400:
+                raise ProxyError(
+                    status_code=response.status_code,
+                    detail=response.text,
+                )
+
+            data = response.json()
+            task_data = data.get("data", data)
+            status = task_data.get("status", "")
+
+            if status == "completed":
+                logger.info("Task %s completed after %ds", task_id, elapsed)
+                return task_data
+
+            if status == "failed":
+                error_msg = task_data.get("error", "Task failed without details")
+                raise ProxyError(
+                    status_code=502,
+                    detail=f"Provider task failed: {error_msg}",
+                )
+
+            logger.debug("Task %s status: %s, elapsed: %ds", task_id, status, elapsed)
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+
+    raise TaskTimeoutError(task_id=task_id, timeout=poll_timeout)
