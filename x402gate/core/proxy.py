@@ -127,9 +127,19 @@ async def poll_result(
 
             if status == "failed":
                 error_msg = task_data.get("error", "Task failed without details")
+                # Try to extract clean validation errors from provider response
+                if isinstance(error_msg, dict):
+                    # Some providers return structured errors
+                    error_msg = error_msg.get("message", str(error_msg))
+                elif isinstance(error_msg, str):
+                    # Try to extract "Validation errors: [...]" patterns
+                    import re
+                    match = re.search(r"Validation errors: \[(.+?)\]", error_msg)
+                    if match:
+                        error_msg = match.group(1).strip("'\"")
                 raise ProxyError(
                     status_code=502,
-                    detail=f"Provider task failed: {error_msg}",
+                    detail=error_msg,
                 )
 
             logger.debug("Task %s status: %s, elapsed: %ds", task_id, status, elapsed)

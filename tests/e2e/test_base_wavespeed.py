@@ -10,8 +10,8 @@ import pytest
 @pytest.mark.asyncio
 async def test_base_wavespeed(gateway_process):
     """Full payment flow on Base: pay USDC → generate image → verify balances."""
-    if not os.environ.get("E2ETEST_BASE_PRIVATE_KEY"):
-        pytest.skip("E2ETEST_BASE_PRIVATE_KEY not set")
+    if not os.environ.get("BASE_E2ETEST_PRIVATE_KEY"):
+        pytest.skip("BASE_E2ETEST_PRIVATE_KEY not set")
 
     from eth_account import Account
     from web3 import Web3
@@ -22,7 +22,7 @@ async def test_base_wavespeed(gateway_process):
     base_cfg = cfg.payment.networks["base"]
     w3 = Web3(Web3.HTTPProvider(base_cfg.rpc_url))
     USDC = base_cfg.token_address
-    CLIENT = Account.from_key(os.environ["E2ETEST_BASE_PRIVATE_KEY"]).address
+    CLIENT = Account.from_key(os.environ["BASE_E2ETEST_PRIVATE_KEY"]).address
     PAYTO = base_cfg.pay_to
     bal_sig = w3.keccak(text="balanceOf(address)")[:4]
 

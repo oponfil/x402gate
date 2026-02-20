@@ -346,7 +346,11 @@ async def wavespeed_proxy(path: str, request: Request) -> Any:
     except ProviderError as e:
         return JSONResponse(
             status_code=e.status_code,
-            content={"error": f"Provider error: {e.detail}"},
+            content={
+                "error": e.detail,
+                "provider": e.provider,
+                "status": e.status_code,
+            },
         )
 
     # 7. Poll for result
@@ -369,10 +373,14 @@ async def wavespeed_proxy(path: str, request: Request) -> Any:
             },
         )
     except ProviderError as e:
-        # Don't settle — task failed
+        # Don't settle -- task failed
         return JSONResponse(
             status_code=e.status_code,
-            content={"error": f"Task failed: {e.detail}"},
+            content={
+                "error": e.detail,
+                "provider": e.provider,
+                "status": e.status_code,
+            },
         )
 
     # 8. Settle payment in background (don't block client)

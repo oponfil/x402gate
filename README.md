@@ -1,6 +1,6 @@
 # x402gate
 
-🌐 [x402gate.io](https://www.x402gate.io/) | **Transparent x402 payment proxy for AI services.**
+🌐 [www.x402gate.io](https://www.x402gate.io/) | **Transparent x402 payment proxy for AI services.**
 
 Pay per API call with USDC on **Base** or **Solana** — no accounts, no API keys, no subscriptions.
 
@@ -65,16 +65,32 @@ After each settled payment, the gateway logs a financial summary:
 ```
 +------------------- Transaction Summary -------------------+
 |  Network:                   solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp |
-|  Revenue (client paid):     $0.006000 USDC                 |
+|  Revenue (client paid):     $0.006250 USDC                 |
 |  Provider cost:            -$0.005000 USDC                 |
-|  Commission (5%):           $0.001000 USDC                 |
+|  Commission (5%):           $0.000250 USDC                 |
+|  Gas surcharge:             $0.001000 USDC                 |
 |  Gas cost:                 -$0.000820 (0.0000100010 SOL)   |
 |  --------------------------------------------------------- |
-|  Net profit:                $0.000180 USDC                 |
+|  Net profit:                $0.000430 USDC                 |
 +-----------------------------------------------------------+
 ```
 
 Gas costs are fetched in real-time from the chain. Native token prices (ETH, SOL) come from CoinGecko.
+
+### Error Handling
+
+If the provider rejects a request (e.g. invalid parameters), the gateway returns a structured error **without settling payment** — the client keeps their money:
+
+```json
+{
+  "error": "size does not meet the constraints.",
+  "provider": "wavespeed",
+  "status": 502
+}
+```
+
+
+> **Note:** Payment is settled **only** on success (HTTP 200). On any error, the payment is not settled and no USDC is transferred.
 
 ## Supported Networks
 
@@ -148,12 +164,13 @@ All settings are in `config.yaml`. Secrets use `${ENV_VAR}` interpolation:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `gateway.commission` | `0.05` | Markup rate (5%) |
-| `gateway.min_commission` | `0.001` | Minimum commission per request ($0.001) |
+| `gateway.commission` | `0.05` | Markup rate (5%) added to provider price |
+| `gateway.min_commission` | `0.001` | Fixed gas surcharge ($0.001) added on top of commission |
 | `gateway.price_cache_ttl` | `60` | Price cache TTL in seconds |
 | `payment.networks.base` | — | Base Mainnet (EVM) config |
 | `payment.networks.solana` | — | Solana Mainnet (SVM) config |
 | `providers.wavespeed.poll_timeout` | `300` | Max wait for AI result (seconds) |
+| `providers.blockrun.type` | `passthrough` | Transparent proxy, no commission |
 
 See [docs/configuration.md](docs/configuration.md) for full reference.
 

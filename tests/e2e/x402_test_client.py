@@ -27,18 +27,31 @@ from x402.mechanisms.evm.signers import EthAccountSigner
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("x402-client")
 
-MODEL_PATH = "wavespeed-ai/z-image/turbo"
 OUTPUT_DIR = Path(__file__).parent / "output"
+CONFIG_PATH = Path(__file__).parent.parent.parent / "config.yaml"
+
+
+def _load_example_request() -> tuple[str, dict]:
+    """Load model path and request body from config.yaml."""
+    import yaml
+
+    with open(CONFIG_PATH) as f:
+        cfg = yaml.safe_load(f)
+    example = cfg["providers"]["wavespeed"]["example_request"]
+    return example["model"], example["body"]
 
 
 async def run_client():
     """Run the E2E client test."""
     gateway_url = os.environ.get("GATEWAY_URL", "http://localhost:4021")
-    private_key = os.environ.get("E2ETEST_BASE_PRIVATE_KEY")
+    private_key = os.environ.get("BASE_E2ETEST_PRIVATE_KEY")
 
     if not private_key:
-        logger.error("E2ETEST_BASE_PRIVATE_KEY env var not set")
+        logger.error("BASE_E2ETEST_PRIVATE_KEY env var not set")
         sys.exit(1)
+
+    model_path, body = _load_example_request()
+    logger.info("Model: %s, Body: %s", model_path, body)
 
     # Initialize x402 client with EVM signer
     account = Account.from_key(private_key)
@@ -56,8 +69,8 @@ async def run_client():
         # 1. Request without payment
         logger.info("Sending initial request...")
         response = await http_client.post(
-            f"{gateway_url}/v1/wavespeed/{MODEL_PATH}",
-            json={"prompt": "A futuristic city on Mars, cinematic lighting"},
+            f"{gateway_url}/v1/wavespeed/{model_path}",
+            json=body,
         )
 
         if response.status_code != 402:
@@ -86,8 +99,8 @@ async def run_client():
         # 3. Retry with payment
         logger.info("Retrying with signature...")
         response = await http_client.post(
-            f"{gateway_url}/v1/wavespeed/{MODEL_PATH}",
-            json={"prompt": "A futuristic city on Mars, cinematic lighting"},
+            f"{gateway_url}/v1/wavespeed/{model_path}",
+            json=body,
             headers={"PAYMENT-SIGNATURE": signature},
             timeout=60.0,
         )

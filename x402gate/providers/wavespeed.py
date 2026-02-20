@@ -13,7 +13,7 @@ from decimal import Decimal
 from typing import Any
 
 from x402gate.core.config import ProviderConfig
-from x402gate.core.proxy import TaskTimeoutError, poll_result, proxy_request
+from x402gate.core.proxy import ProxyError, TaskTimeoutError, poll_result, proxy_request
 from x402gate.providers.base import BaseProvider, ProviderError
 
 logger = logging.getLogger(__name__)
@@ -140,8 +140,16 @@ class WaveSpeedProvider(BaseProvider):
             )
         except TaskTimeoutError:
             raise
-        except Exception as e:
+        except ProxyError as e:
+            logger.error("Task %s failed: %s", task_id, e.detail)
             raise ProviderError(
                 provider=self.name,
-                detail=f"Failed to get result for task {task_id}: {e}",
+                detail=e.detail,
+                status_code=e.status_code,
+            ) from e
+        except Exception as e:
+            logger.error("Task %s error: %s", task_id, e)
+            raise ProviderError(
+                provider=self.name,
+                detail=str(e),
             ) from e

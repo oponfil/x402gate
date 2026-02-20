@@ -40,6 +40,8 @@ providers:
       model: "wavespeed-ai/z-image/turbo"
       body:
         prompt: "A futuristic city on Mars, cinematic lighting"
+        size: "1536*1536"
+        seed: -1
   blockrun:
     type: passthrough
     enabled: true
