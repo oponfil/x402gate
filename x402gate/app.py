@@ -23,9 +23,35 @@ from x402gate.core.payment import PaymentHandler
 from x402gate.core.pricing import PriceCache, apply_commission
 from x402gate.core.proxy import TaskTimeoutError
 from x402gate.providers.base import BaseProvider, ProviderError
+from x402gate.providers.openrouter import OpenRouterProvider
 from x402gate.providers.wavespeed import WaveSpeedProvider
 
 logger = logging.getLogger(__name__)
+
+
+def _error_response(
+    status_code: int,
+    error: str,
+    *,
+    provider: str | None = None,
+    **extra: Any,
+) -> JSONResponse:
+    """Build a uniform JSON error response."""
+    body: dict[str, Any] = {"error": error, "status": status_code}
+    if provider:
+        body["provider"] = provider
+    body.update(extra)
+    return JSONResponse(status_code=status_code, content=body)
+
+# ---------------------------------------------------------------------------
+# Provider registry: maps config name → provider class.
+# Passthrough providers don't need a class — they're handled generically.
+# To add a new managed provider, add one line here and create the class.
+# ---------------------------------------------------------------------------
+PROVIDER_REGISTRY: dict[str, type[BaseProvider]] = {
+    "wavespeed": WaveSpeedProvider,
+    "openrouter": OpenRouterProvider,
+}
 
 # Global state (initialized in lifespan)
 config: AppConfig
@@ -53,7 +79,7 @@ async def lifespan(app: FastAPI):
     # Initialize price cache
     price_cache = PriceCache(ttl=config.gateway.price_cache_ttl)
 
-    # Register providers
+    # Register providers from config
     for name, provider_config in config.providers.items():
         if not provider_config.enabled:
             logger.info("Provider '%s' is disabled, skipping", name)
@@ -62,10 +88,13 @@ async def lifespan(app: FastAPI):
         if provider_config.type == "passthrough":
             providers[name] = None  # No provider object needed
             logger.info("Provider '%s' registered (passthrough)", name)
-        elif name == "wavespeed":
-            provider = WaveSpeedProvider(config=provider_config)
+        elif name in PROVIDER_REGISTRY:
+            kwargs = {}
+            if name == "openrouter":
+                kwargs["default_max_tokens"] = config.gateway.default_max_tokens
+            provider = PROVIDER_REGISTRY[name](config=provider_config, **kwargs)
             providers[name] = provider
-            logger.info("Provider '%s' registered", name)
+            logger.info("Provider '%s' registered (managed)", name)
         else:
             logger.warning("Unknown provider '%s', skipping", name)
 
@@ -108,7 +137,7 @@ async def service_info(request: Request) -> Response:
     base_url = os.environ.get("BASE_URL", "")
     networks = list(config.payment.networks.keys())
     commission_pct = int(config.gateway.commission * 100)
-    gas_fee = config.gateway.min_commission
+    gas_fee = config.gateway.gas_surcharge
     provider_docs = {}
     for name, pcfg in config.providers.items():
         doc: dict[str, Any] = {
@@ -322,39 +351,37 @@ async def blockrun_proxy(path: str, request: Request) -> Any:
     return await _passthrough_proxy("blockrun", path, request)
 
 
-# --- WaveSpeed Proxy ---
+# --- Managed Provider Proxy (unified flow for all managed providers) ---
 
 
-@app.post("/v1/wavespeed/{path:path}")
-async def wavespeed_proxy(path: str, request: Request) -> Any:
-    """Transparent proxy endpoint for WaveSpeed AI.
+async def _handle_managed_request(
+    provider_name: str, path: str, request: Request
+) -> Response:
+    """Unified x402 payment flow for managed providers.
 
     Flow:
     1. Parse request body
-    2. Fetch dynamic price from WaveSpeed Pricing API (with cache)
-    3. Apply 5% commission
-    4. If no PAYMENT-SIGNATURE header -> return 402
+    2. Fetch dynamic price from provider (with cache)
+    3. Apply commission (5% + gas fee)
+    4. If no PAYMENT-SIGNATURE header → return 402
     5. Verify payment via facilitator
-    6. Forward request to WaveSpeed as-is
-    7. Poll for async task result
-    8. Settle payment on-chain
+    6. Forward request to provider as-is
+    7. If async (task_id present) → poll for result; else use response directly
+    8. Settle payment on-chain (background)
     9. Return result to client
     """
-    provider = providers.get("wavespeed")
+    provider = providers.get(provider_name)
     if provider is None:
         return JSONResponse(
             status_code=503,
-            content={"error": "WaveSpeed provider is not configured"},
+            content={"error": f"{provider_name} provider is not configured"},
         )
 
     # 1. Parse request body
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse(
-            status_code=400,
-            content={"error": "Invalid JSON body"},
-        )
+        return _error_response(400, "Invalid JSON body")
 
     # 2. Fetch price (with cache)
     try:
@@ -365,14 +392,11 @@ async def wavespeed_proxy(path: str, request: Request) -> Any:
             base_price = await provider.get_price(path, body)
             price_cache.set(path, body, base_price)
     except ProviderError as e:
-        return JSONResponse(
-            status_code=e.status_code,
-            content={"error": f"Pricing unavailable: {e.detail}"},
-        )
+        return _error_response(e.status_code, e.detail, provider=e.provider)
 
     # 3. Apply commission
     final_price = apply_commission(
-        base_price, config.gateway.commission, config.gateway.min_commission
+        base_price, config.gateway.commission, config.gateway.gas_surcharge
     )
 
     # 4. Check for payment
@@ -383,67 +407,69 @@ async def wavespeed_proxy(path: str, request: Request) -> Any:
     # 5. Verify payment (auto-detects network from payload)
     is_valid, payment_network = await payment_handler.verify(payment_sig, final_price)
     if not is_valid:
-        return JSONResponse(
-            status_code=402,
-            content={"error": "Payment verification failed"},
-        )
+        return _error_response(402, "Payment verification failed")
 
     t_start = time.monotonic()  # Start timing after verification
 
-    # 6. Forward request to WaveSpeed
+    # 6. Forward request to provider
+    t_gen_start = time.monotonic()
     try:
         result = await provider.submit(path, body)
     except ProviderError as e:
-        return JSONResponse(
-            status_code=e.status_code,
-            content={
-                "error": e.detail,
-                "provider": e.provider,
-                "status": e.status_code,
-            },
-        )
+        return _error_response(e.status_code, e.detail, provider=e.provider)
 
-    # 7. Poll for result
+    # 7. Determine if response is async (needs polling) or sync (ready)
+    #    - Sync providers (OpenRouter, etc.) return results directly,
+    #      often in OpenAI format with "choices" key
+    #    - Async providers (WaveSpeed) return {"data": {"id": ..., "status": ...}}
     task_data = result.get("data", result)
-    task_id = task_data.get("id")
-    if not task_id:
-        # Synchronous response (no polling needed)
-        await payment_handler.settle(payment_sig, final_price, payment_network)
-        return result
+    is_async = (
+        isinstance(task_data, dict)
+        and "id" in task_data
+        and "status" in task_data
+        and "choices" not in result
+    )
 
-    try:
-        output = await provider.get_result(task_id)
-    except TaskTimeoutError as e:
-        # Don't settle — client keeps their money
-        return JSONResponse(
-            status_code=504,
-            content={
-                "error": f"Task timed out after {e.timeout}s",
-                "task_id": e.task_id,
-            },
-        )
-    except ProviderError as e:
-        # Don't settle -- task failed
-        return JSONResponse(
-            status_code=e.status_code,
-            content={
-                "error": e.detail,
-                "provider": e.provider,
-                "status": e.status_code,
-            },
-        )
+    if is_async:
+        task_id = task_data["id"]
+        # Async provider — poll for completion
+        try:
+            output = await provider.get_result(task_id)
+        except TaskTimeoutError as e:
+            # Don't settle — client keeps their money
+            return _error_response(
+                504, f"Task timed out after {e.timeout}s",
+                provider=provider.name, task_id=e.task_id,
+            )
+        except ProviderError as e:
+            # Don't settle — task failed
+            return _error_response(e.status_code, e.detail, provider=e.provider)
+    else:
+        # Synchronous provider — use result directly
+        output = task_data
 
-    # 8. Settle payment in background (don't block client)
+    generation_s = time.monotonic() - t_gen_start  # Provider processing time
+
+    # 8. Calculate actual cost (if provider supports it)
+    #    x402 exact scheme requires settling the signed amount (final_price).
+    #    Actual cost is used only for Transaction Summary reporting.
+    actual_base_price = await provider.calculate_actual_cost(body, output)
+    if actual_base_price is None:
+        actual_base_price = base_price  # fallback to estimate
+
+    # 9. Settle payment in background (don't block client)
     t_client = time.monotonic() - t_start
 
     async def background_settle() -> None:
         """Settle payment and log financial summary in background."""
         try:
-            inference_ms = output.get("timings", {}).get("inference", 0)
             ctx = {
-                "provider_cost": float(base_price),
-                "inference_ms": inference_ms,
+                "estimated_cost": float(base_price),
+                "provider_cost": float(actual_base_price),
+                "generation_s": generation_s,
                 "t_client": t_client,
+                "commission_rate": config.gateway.commission,
+                "gas_surcharge": config.gateway.gas_surcharge,
             }
             settlement = await payment_handler.settle(
                 payment_sig,
@@ -467,5 +493,20 @@ async def wavespeed_proxy(path: str, request: Request) -> Any:
     _pending_settlements.add(task)
     task.add_done_callback(_pending_settlements.discard)
 
-    # 9. Return result immediately to client
+    # 9. Return result to client
     return JSONResponse(content={"data": output})
+
+
+# --- Per-Provider Routes ---
+
+
+@app.post("/v1/wavespeed/{path:path}")
+async def wavespeed_proxy(path: str, request: Request) -> Any:
+    """Managed proxy for WaveSpeed AI (image/video generation)."""
+    return await _handle_managed_request("wavespeed", path, request)
+
+
+@app.post("/v1/openrouter/{path:path}")
+async def openrouter_proxy(path: str, request: Request) -> Any:
+    """Managed proxy for OpenRouter (300+ LLM models)."""
+    return await _handle_managed_request("openrouter", path, request)

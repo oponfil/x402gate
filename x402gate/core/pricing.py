@@ -58,20 +58,20 @@ class PriceCache:
 
 
 def apply_commission(
-    base_price: Decimal, commission_rate: float, min_commission: float = 0.0
+    base_price: Decimal, commission_rate: float, gas_surcharge: float = 0.0
 ) -> Decimal:
     """Apply commission markup to a base price.
 
     Args:
         base_price: The provider's base cost in USD.
         commission_rate: Commission as a decimal (e.g., 0.05 for 5%).
-        min_commission: Fixed gas surcharge in USD always added on top (e.g., 0.001).
+        gas_surcharge: Fixed gas surcharge in USD always added on top (e.g., 0.001).
 
     Returns:
         Final price rounded up to 6 decimal places (USDC precision).
     """
     commission = base_price * Decimal(str(commission_rate))
-    gas_fee = Decimal(str(min_commission)) if min_commission > 0 else Decimal("0")
+    gas_fee = Decimal(str(gas_surcharge)) if gas_surcharge > 0 else Decimal("0")
     final = base_price + commission + gas_fee
     # Round up to 6 decimal places (USDC has 6 decimals)
     return final.quantize(Decimal("0.000001"), rounding=ROUND_UP)

@@ -54,7 +54,8 @@ class GatewayConfig(BaseModel):
     host: str = "0.0.0.0"
     port: int = 4021
     commission: float = 0.05
-    min_commission: float = 0.001  # minimum $0.001 commission
+    gas_surcharge: float = 0.001  # fixed $0.001 gas surcharge per request
+    default_max_tokens: int = 1024  # default max_tokens when client omits it
     price_cache_ttl: int = 60
 
 

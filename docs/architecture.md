@@ -61,6 +61,7 @@ Client → POST /v1/wavespeed/{model} + PAYMENT-SIGNATURE header
 | **Proxy** | `x402gate/core/proxy.py` | Forward requests, poll async tasks |
 | **Provider Base** | `x402gate/providers/base.py` | Abstract provider interface |
 | **WaveSpeed** | `x402gate/providers/wavespeed.py` | WaveSpeed AI implementation |
+| **OpenRouter** | `x402gate/providers/openrouter.py` | OpenRouter LLM aggregator (300+ models) |
 | **App** | `x402gate/app.py` | FastAPI routes, lifecycle |
 | **Entry** | `x402gate/main.py` | Uvicorn server startup |
 
@@ -85,3 +86,12 @@ Payment is verified **before** starting work, but settled **after** successful c
 ### Custom x402 Flow
 
 The standard `PaymentMiddlewareASGI` from the x402 library requires static route-to-price mappings defined at startup. Since our prices are dynamic per-request, we implement the x402 verify/settle protocol directly using the facilitator's HTTP API.
+
+### Actual Cost Tracking
+
+For token-based providers (OpenRouter), the gateway tracks both estimated and actual costs:
+
+- **Estimated cost** — ceiling calculated upfront from `max_tokens × completion_price + input_tokens × prompt_price`
+- **Actual cost** — computed after response from real `usage.prompt_tokens` and `usage.completion_tokens`
+
+The x402 `exact` scheme requires settling the full signed amount, so the client always pays the ceiling price. Actual cost is used only for financial reporting in the Transaction Summary. When x402 adds a `deferred` scheme (settle ≤ signed amount), the gateway is ready to use actual cost for settlement.

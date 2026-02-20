@@ -26,7 +26,7 @@ gateway:
   host: "127.0.0.1"
   port: 4021
   commission: 0.05
-  min_commission: 0.001
+  gas_surcharge: 0.001
   price_cache_ttl: 0
 
 payment:
@@ -115,7 +115,7 @@ class TestWaveSpeedProxy:
         body = response.json()
         assert "accepts" in body
         assert body["accepts"][0]["scheme"] == "exact"
-        # 5% of $0.003 = $0.00015, but min_commission = $0.001
+        # 5% of $0.003 = $0.00015 + gas_surcharge $0.001
         # Price: $0.003 base + 5% ($0.00015) + $0.001 gas = $0.004150
         assert body["accepts"][0]["price"] == "$0.004150"
 

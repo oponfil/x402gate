@@ -10,6 +10,7 @@ x402gate sits between your AI agent and AI service providers, adding [x402](http
 |----------|------|------|----------|
 | [WaveSpeed AI](https://wavespeed.ai) | Managed | Image/video generation | `/v1/wavespeed/...` |
 | [BlockRun](https://blockrun.ai) | Passthrough | 40+ LLMs (GPT, Claude, Gemini…) | `/v1/blockrun/...` |
+| [OpenRouter](https://openrouter.ai) | Managed | 300+ LLMs (GPT, Claude, Gemini, Llama…) | `/v1/openrouter/...` |
 
 ## How It Works
 
@@ -60,20 +61,27 @@ The payment goes directly to BlockRun's wallet — x402gate earns nothing but pr
 
 ### Transaction Summary
 
-After each settled payment, the gateway logs a financial summary:
+After each settled payment, the gateway logs a financial summary with both estimated and actual costs:
 
 ```
 +------------------- Transaction Summary -------------------+
-|  Network:                   solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp |
-|  Revenue (client paid):     $0.006250 USDC                 |
-|  Provider cost:            -$0.005000 USDC                 |
-|  Commission (5%):           $0.000250 USDC                 |
+|  Network:                   eip155:8453                    |
+|  Revenue (client paid):     $0.003591 USDC                 |
+|  Estimated cost:            $0.002468 USDC                 |
+|  Provider cost:            -$0.002471 USDC                 |
+|  Commission (5%):           $0.000124 USDC                 |
 |  Gas surcharge:             $0.001000 USDC                 |
-|  Gas cost:                 -$0.000820 (0.0000100010 SOL)   |
+|  Gas cost:                 -$0.001941 (0.0000009824 ETH)   |
 |  --------------------------------------------------------- |
-|  Net profit:                $0.000430 USDC                 |
+|  Net profit:               -$0.000821 USDC                 |
+|  Generation time:           12.3s                          |
+|  Client wait time:          12.3s                          |
 +-----------------------------------------------------------+
 ```
+
+- **Estimated cost** — ceiling based on `max_tokens` (shown only when different from actual)
+- **Provider cost** — actual cost computed from real token usage
+- **Net profit** — calculated from actual provider cost, not the estimate
 
 Gas costs are fetched in real-time from the chain. Native token prices (ETH, SOL) come from CoinGecko.
 
@@ -136,6 +144,7 @@ Edit `.env` with your values:
 
 ```env
 WAVESPEED_API_KEY=your_key
+OPENROUTER_API_KEY=your_key
 
 # Base (EVM)
 BASE_PAY_TO_ADDRESS=0xYourWallet
@@ -159,19 +168,16 @@ The gateway starts on `http://localhost:4021`.
 ### 4. Test
 
 ```bash
-# List providers
+# List providers and their endpoints
 curl http://localhost:4021/v1/providers
 
-# WaveSpeed: image generation (returns 402 with price)
-curl -X POST http://localhost:4021/v1/wavespeed/wavespeed-ai/z-image/turbo \
+# Send a request to any provider (returns 402 with price)
+curl -X POST http://localhost:4021/v1/{provider}/{model_path} \
   -H "Content-Type: application/json" \
-  -d '{"prompt": "a cat in space"}'
-
-# BlockRun: LLM chat (returns BlockRun's 402 with price)
-curl -X POST http://localhost:4021/v1/blockrun/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "Hello!"}], "max_tokens": 20}'
+  -d '{ ... }'
 ```
+
+> **Tip:** Each provider has an `example_request` in `config.yaml` with a working model and body. The HTML landing page at `http://localhost:4021` shows ready-to-use curl examples generated from the config.
 
 ## Configuration
 
@@ -180,12 +186,14 @@ All settings are in `config.yaml`. Secrets use `${ENV_VAR}` interpolation:
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `gateway.commission` | `0.05` | Markup rate (5%) added to provider price |
-| `gateway.min_commission` | `0.001` | Fixed gas surcharge ($0.001) added on top of commission |
+| `gateway.gas_surcharge` | `0.001` | Fixed gas surcharge ($0.001) added on top of commission |
+| `gateway.default_max_tokens` | `1024` | Default `max_tokens` when client omits it (for token-based providers) |
 | `gateway.price_cache_ttl` | `60` | Price cache TTL in seconds |
 | `payment.networks.base` | — | Base Mainnet (EVM) config |
 | `payment.networks.solana` | — | Solana Mainnet (SVM) config |
 | `providers.wavespeed.poll_timeout` | `300` | Max wait for AI result (seconds) |
 | `providers.blockrun.type` | `passthrough` | Transparent proxy, no commission |
+| `providers.openrouter.api_key` | — | OpenRouter API key |
 
 See [docs/configuration.md](docs/configuration.md) for full reference.
 
@@ -194,6 +202,9 @@ See [docs/configuration.md](docs/configuration.md) for full reference.
 Run end-to-end tests on mainnet (requires funded wallets):
 
 ```bash
+# OpenRouter on Base (includes actual cost settlement)
+python -m pytest tests/e2e/test_base_openrouter.py -v -s
+
 # WaveSpeed on Solana
 python -m pytest tests/e2e/test_solana_wavespeed.py -v -s
 

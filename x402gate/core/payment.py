@@ -377,36 +377,44 @@ class PaymentHandler:
                 # Print Transaction Summary if context provided
                 if extra_context:
                     provider_cost = extra_context.get("provider_cost", 0)
-                    inference_ms = extra_context.get("inference_ms", 0)
+                    estimated_cost = extra_context.get("estimated_cost", provider_cost)
+                    generation_s = extra_context.get("generation_s", 0)
                     t_client = extra_context.get("t_client", 0)
-                    inference_s = inference_ms / 1000 if inference_ms else 0
-                    commission = amount_usdc - provider_cost
+                    commission_rate = extra_context.get("commission_rate", 0.05)
+                    gas_surcharge_usd = extra_context.get("gas_surcharge", 0)
+
+                    commission_pct = provider_cost * commission_rate
                     profit = amount_usdc - provider_cost - gas_cost_usd
-                    summary = (
-                        "\n"
-                        "+------------------- Transaction Summary -------------------+\n"
-                        "|  Network:                   %-30s |\n"
-                        "|  Revenue (client paid):     $%.6f USDC                 |\n"
-                        "|  Provider cost:            -$%.6f USDC                 |\n"
-                        "|  Commission (5%%):           $%.6f USDC                 |\n"
-                        "|  Gas cost:                 -$%.6f (%.10f %s)   |\n"
-                        "|  --------------------------------------------------------- |\n"
-                        "|  Net profit:                $%.6f USDC                 |\n"
-                        "|  Generation time:           %.1fs                        |\n"
-                        "|  Client wait time:          %.1fs                        |\n"
-                        "+-----------------------------------------------------------+"
-                    ) % (
-                        network,
-                        amount_usdc,
-                        provider_cost,
-                        commission,
-                        gas_cost_usd,
-                        gas_cost_native,
-                        gas_label,
-                        profit,
-                        inference_s,
-                        t_client,
-                    )
+
+                    lines = [
+                        "",
+                        "+------------------- Transaction Summary -------------------+",
+                        "|  Network:                   %-30s |" % network,
+                        "|  Revenue (client paid):     $%.6f USDC                 |" % amount_usdc,
+                    ]
+
+                    # Show estimated cost if it differs from actual
+                    if abs(estimated_cost - provider_cost) > 1e-8:
+                        lines.append(
+                            "|  Estimated cost:            $%.6f USDC                 |" % estimated_cost
+                        )
+
+                    lines.extend([
+                        "|  Provider cost:            -$%.6f USDC                 |" % provider_cost,
+                        "|  Commission (%d%%):          $%.6f USDC                 |" % (
+                            int(commission_rate * 100), commission_pct,
+                        ),
+                        "|  Gas surcharge:             $%.6f USDC                 |" % gas_surcharge_usd,
+                        "|  Gas cost:                 -$%.6f (%.10f %s)   |" % (
+                            gas_cost_usd, gas_cost_native, gas_label,
+                        ),
+                        "|  --------------------------------------------------------- |",
+                        "|  Net profit:                $%.6f USDC                 |" % profit,
+                        "|  Generation time:           %.1fs                        |" % generation_s,
+                        "|  Client wait time:          %.1fs                        |" % t_client,
+                        "+-----------------------------------------------------------+",
+                    ])
+                    summary = "\n".join(lines)
                     import sys
 
                     print(summary, file=sys.stderr, flush=True)

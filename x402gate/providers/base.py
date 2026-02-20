@@ -82,6 +82,24 @@ class BaseProvider(ABC):
             TaskTimeoutError: If polling times out.
         """
 
+    async def calculate_actual_cost(
+        self, body: dict[str, Any], result: dict[str, Any]
+    ) -> Decimal | None:
+        """Calculate actual cost from provider response.
+
+        Override for token-based providers to compute real cost from
+        usage data in the response.  Returns None by default, meaning
+        the estimated price (from get_price) will be used for settlement.
+
+        Args:
+            body: Original request body.
+            result: Provider response (may contain 'usage' etc.).
+
+        Returns:
+            Actual cost in USD, or None to use the estimate.
+        """
+        return None
+
     async def close(self) -> None:
         """Clean up provider resources. Override if needed."""
 
