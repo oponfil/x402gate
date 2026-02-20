@@ -34,5 +34,3 @@ tests/
 
 # Docs (not needed in runtime image)
 docs/
-*.md
-!README.md
