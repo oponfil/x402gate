@@ -93,6 +93,8 @@ class ProviderConfig(BaseModel):
     api_key: str = ""
     poll_interval: int = 2
     poll_timeout: int = 300
+    docs_url: str = ""  # Link to provider API documentation
+    example_request: dict[str, Any] = {}  # Example request: {model, body}
 
 
 class AppConfig(BaseModel):

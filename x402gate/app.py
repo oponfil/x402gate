@@ -103,19 +103,37 @@ async def service_info() -> dict[str, Any]:
     networks = list(config.payment.networks.keys())
     commission_pct = int(config.gateway.commission * 100)
     gas_fee = config.gateway.min_commission
+    provider_docs = {}
+    for name, pcfg in config.providers.items():
+        doc: dict[str, Any] = {
+            "endpoint_pattern": f"/v1/{name}/{{model_path}}",
+        }
+        if pcfg.docs_url:
+            doc["api_reference"] = pcfg.docs_url
+        if pcfg.example_request:
+            model = pcfg.example_request.get("model", "MODEL_PATH")
+            doc["example_request"] = {
+                "method": "POST",
+                "path": f"/v1/{name}/{model}",
+                "body": pcfg.example_request.get("body", {}),
+            }
+        provider_docs[name] = doc
     return {
         "name": "x402gate",
         "version": _VERSION,
         "description": (
             "Transparent pay-per-request proxy for AI services via the x402 protocol. "
             "Send a POST request to any provider endpoint — if no payment header is "
-            "included, a 402 response is returned with USDC payment options."
+            "included, a 402 response is returned with USDC payment options. "
+            "The request body format is defined by the upstream provider — "
+            "x402gate forwards it as-is. See provider_docs for API references."
         ),
         "payment_protocol": "x402",
         "payment_asset": "USDC",
         "networks": networks,
         "providers": list(providers.keys()),
         "commission": f"{commission_pct}% + ${gas_fee} gas per request",
+        "provider_docs": provider_docs,
         "endpoints": {
             "openapi": f"{base_url}/openapi.json",
             "docs": f"{base_url}/docs",
@@ -132,6 +150,22 @@ async def service_info() -> dict[str, Any]:
 async def ai_plugin_manifest() -> dict[str, Any]:
     """Standard AI plugin manifest for agent discoverability."""
     base_url = os.environ.get("BASE_URL", "")
+    # Build provider usage hints from config
+    provider_hints = []
+    for name, pcfg in config.providers.items():
+        hint = f"Provider '{name}': POST /v1/{name}/{{model_path}}"
+        if pcfg.docs_url:
+            hint += f" (docs: {pcfg.docs_url})"
+        if pcfg.example_request:
+            import json
+            model = pcfg.example_request.get("model", "MODEL_PATH")
+            body = pcfg.example_request.get("body", {})
+            hint += f". Example: POST /v1/{name}/{model} with body {json.dumps(body)}"
+        provider_hints.append(hint)
+    providers_text = ". ".join(provider_hints)
+    networks_text = ", ".join(
+        f"{n} ({c.type.upper()}, USDC)" for n, c in config.payment.networks.items()
+    )
     return {
         "schema_version": "v1",
         "name_for_human": "x402gate",
@@ -139,11 +173,13 @@ async def ai_plugin_manifest() -> dict[str, Any]:
         "description_for_human": "Pay-per-request proxy for AI services via x402/USDC",
         "description_for_model": (
             "x402gate is a transparent payment proxy for AI services using the x402 protocol. "
-            "To use it: POST to a provider endpoint (e.g. /v1/wavespeed/{model_path}) with a JSON body. "
+            "The request body format is defined by the upstream provider — "
+            "x402gate forwards it as-is. See the provider docs for body schema. "
+            f"{providers_text}. "
             "If no payment is attached, the server returns HTTP 402 with accepted payment "
             "options (scheme, network, asset, amount, pay_to address). "
             "Attach a valid x402 PAYMENT-SIGNATURE header and resubmit to get the AI response. "
-            "Supported networks: Base mainnet (EVM, USDC), Solana mainnet (SVM, USDC). "
+            f"Supported networks: {networks_text}. "
             "Prices are dynamic and fetched from the upstream provider at request time."
         ),
         "auth": {"type": "none"},

@@ -35,3 +35,8 @@ providers:
     api_key: "${WAVESPEED_API_KEY}"
     poll_interval: 1           # seconds, between status polls
     poll_timeout: 300          # seconds, max wait for result (5 min)
+    docs_url: "https://wavespeed.ai/docs"
+    example_request:
+      model: "wavespeed-ai/z-image/turbo"
+      body:
+        prompt: "A futuristic city on Mars, cinematic lighting"
