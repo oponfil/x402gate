@@ -83,7 +83,7 @@ Both networks are offered simultaneously — the client chooses which to pay on.
 ### 1. Install
 
 ```bash
-git clone https://github.com/x402gate/x402gate.git
+git clone https://github.com/oponfil/x402gate.git
 cd x402gate
 pip install -e .
 ```

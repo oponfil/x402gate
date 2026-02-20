@@ -43,9 +43,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://x402gate.ai"
-Repository = "https://github.com/x402gate/x402gate"
-Documentation = "https://github.com/x402gate/x402gate/tree/main/docs"
+Homepage = "https://github.com/oponfil/x402gate"
+Repository = "https://github.com/oponfil/x402gate"
+Documentation = "https://github.com/oponfil/x402gate/tree/main/docs"
 
 [tool.ruff]
 target-version = "py311"
