@@ -145,13 +145,20 @@ async def service_info(request: Request) -> Response:
         }
         if pcfg.docs_url:
             doc["api_reference"] = pcfg.docs_url
-        if pcfg.example_request:
-            model = pcfg.example_request.get("model", "MODEL_PATH")
-            doc["example_request"] = {
-                "method": "POST",
-                "path": f"/v1/{name}/{model}",
-                "body": pcfg.example_request.get("body", {}),
-            }
+        examples = []
+        for ex_field in sorted(f for f in pcfg.model_fields if f.startswith("example_request")):
+            ex = getattr(pcfg, ex_field, None)
+            if ex:
+                model = ex.get("model", "MODEL_PATH")
+                examples.append({
+                    "method": "POST",
+                    "path": f"/v1/{name}/{model}",
+                    "body": ex.get("body", {}),
+                })
+        if len(examples) == 1:
+            doc["example_request"] = examples[0]
+        elif examples:
+            doc["example_requests"] = examples
         provider_docs[name] = doc
 
     # If browser requests HTML, return a human-readable landing page
@@ -169,13 +176,15 @@ async def service_info(request: Request) -> Response:
         import json as _json
         examples_html = ""
         for name, pcfg in config.providers.items():
-            if not pcfg.example_request:
-                continue
-            model = pcfg.example_request.get("model", "MODEL")
-            body = pcfg.example_request.get("body", {})
-            body_json = _json.dumps(body, ensure_ascii=False)
-            path = f"/v1/{name}/{model}"
-            examples_html += f"""
+            for ex_field in sorted(f for f in pcfg.model_fields if f.startswith("example_request")):
+                ex = getattr(pcfg, ex_field, None)
+                if not ex:
+                    continue
+                model = ex.get("model", "MODEL")
+                body = ex.get("body", {})
+                body_json = _json.dumps(body, ensure_ascii=False)
+                path = f"/v1/{name}/{model}"
+                examples_html += f"""
     <h4>{name} &mdash; <code>{model}</code></h4>
     <pre><code>curl -X POST {base_url}{path} \\
   -H "Content-Type: application/json" \\
@@ -240,11 +249,13 @@ async def ai_plugin_manifest() -> dict[str, Any]:
         hint = f"Provider '{name}': POST /v1/{name}/{{model_path}}"
         if pcfg.docs_url:
             hint += f" (docs: {pcfg.docs_url})"
-        if pcfg.example_request:
-            import json
-            model = pcfg.example_request.get("model", "MODEL_PATH")
-            body = pcfg.example_request.get("body", {})
-            hint += f". Example: POST /v1/{name}/{model} with body {json.dumps(body)}"
+        for ex_field in sorted(f for f in pcfg.model_fields if f.startswith("example_request")):
+            ex = getattr(pcfg, ex_field, None)
+            if ex:
+                import json
+                model = ex.get("model", "MODEL_PATH")
+                body = ex.get("body", {})
+                hint += f". Example: POST /v1/{name}/{model} with body {json.dumps(body)}"
         provider_hints.append(hint)
     providers_text = ". ".join(provider_hints)
     networks_text = ", ".join(

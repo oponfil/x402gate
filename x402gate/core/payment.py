@@ -324,16 +324,18 @@ class PaymentHandler:
                 if ns.config.type == "evm" and ns.w3:
                     try:
                         receipt = await asyncio.to_thread(
-                            ns.w3.eth.get_transaction_receipt,
+                            ns.w3.eth.wait_for_transaction_receipt,
                             result.transaction,
+                            timeout=30,
                         )
                         gas_cost_wei = receipt.gasUsed * receipt.effectiveGasPrice
                         gas_cost_native = gas_cost_wei / 1e18
                         eth_price = await _get_eth_price()
                         gas_cost_usd = gas_cost_native * eth_price if eth_price else 0
                         gas_label = "ETH"
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning("EVM gas cost lookup failed: %s", e)
+                        gas_label = "ETH"
                 elif ns.config.type == "svm" and ns.svm_signer:
                     try:
                         from solders.signature import Signature as SolSignature

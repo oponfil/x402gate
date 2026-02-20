@@ -153,6 +153,7 @@ BASE_FACILITATOR_PRIVATE_KEY=your_key
 # Solana
 SOLANA_PAY_TO_ADDRESS=YourSolanaWallet
 SOLANA_FACILITATOR_PRIVATE_KEY=your_base58_key
+SOLANA_RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY
 ```
 
 > **Note:** Facilitator wallets need a small balance of native tokens (ETH on Base, SOL on Solana) to pay gas for settlement transactions.
@@ -177,7 +178,7 @@ curl -X POST http://localhost:4021/v1/{provider}/{model_path} \
   -d '{ ... }'
 ```
 
-> **Tip:** Each provider has an `example_request` in `config.yaml` with a working model and body. The HTML landing page at `http://localhost:4021` shows ready-to-use curl examples generated from the config.
+> **Tip:** Each provider has `example_request` entries in `config.yaml` (e.g. `example_request`, `example_request_2`) with working models and bodies. The HTML landing page at `http://localhost:4021` shows ready-to-use curl examples generated from the config.
 
 ## Configuration
 
@@ -202,15 +203,20 @@ See [docs/configuration.md](docs/configuration.md) for full reference.
 Run end-to-end tests on mainnet (requires funded wallets):
 
 ```bash
-# OpenRouter on Base (includes actual cost settlement)
-python -m pytest tests/e2e/test_base_openrouter.py -v -s
-
-# WaveSpeed on Solana
-python -m pytest tests/e2e/test_solana_wavespeed.py -v -s
-
-# BlockRun passthrough (Base)
-python -m pytest tests/e2e/test_blockrun_passthrough.py -v -s
+# Run all E2E tests
+python -m pytest tests/e2e/ -v -s
 ```
+
+Individual tests:
+
+| Test | Provider | Network | What |
+|------|----------|---------|------|
+| `test_base_wavespeed` | WaveSpeed | Base | Image generation |
+| `test_base_wavespeed_t2v` | WaveSpeed | Base | Video generation |
+| `test_base_openrouter` | OpenRouter | Base | LLM chat |
+| `test_solana_openrouter` | OpenRouter | Solana | LLM chat |
+| `test_solana_wavespeed` | WaveSpeed | Solana | Image generation |
+| `test_blockrun_passthrough` | BlockRun | Base | Passthrough proxy |
 
 Requires `BASE_E2ETEST_PRIVATE_KEY` and/or `SOLANA_E2ETEST_PRIVATE_KEY` in `.env`.
 

@@ -97,6 +97,7 @@ class ProviderConfig(BaseModel):
     poll_timeout: int = 300
     docs_url: str = ""  # Link to provider API documentation
     example_request: dict[str, Any] = {}  # Example request: {model, body}
+    example_request_2: dict[str, Any] = {}  # Second example: {model, body}
 
 
 class AppConfig(BaseModel):

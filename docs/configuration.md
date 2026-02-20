@@ -49,7 +49,8 @@ Each provider is a key under `providers`:
 | `poll_interval` | int | `2` | Seconds between async task status polls |
 | `poll_timeout` | int | `300` | Max seconds to wait for task completion |
 | `docs_url` | string | `""` | Link to provider API documentation |
-| `example_request` | dict | `{}` | Example request body for the landing page |
+| `example_request` | dict | `{}` | Example request for the landing page (`{model, body}`) |
+| `example_request_2` | dict | `{}` | Second example request (e.g. video model) |
 
 ## Environment Variables
 
@@ -63,5 +64,6 @@ Store secrets in `.env` (see `.env.example`):
 | `BASE_FACILITATOR_PRIVATE_KEY` | Yes | EVM private key for on-chain settlement (needs ETH for gas) |
 | `SOLANA_PAY_TO_ADDRESS` | Solana | Solana wallet address for receiving USDC (base58) |
 | `SOLANA_FACILITATOR_PRIVATE_KEY` | Solana | Solana private key for settlement (base58, needs SOL for gas) |
+| `SOLANA_RPC_URL` | Solana | Solana RPC endpoint (e.g. Helius: `https://mainnet.helius-rpc.com/?api-key=KEY`) |
 | `BASE_E2ETEST_PRIVATE_KEY` | E2E only | Base client wallet key for E2E tests |
 | `SOLANA_E2ETEST_PRIVATE_KEY` | E2E only | Solana client wallet key for E2E tests |
