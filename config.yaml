@@ -48,10 +48,13 @@ providers:
     base_url: "https://blockrun.ai/api"
     docs_url: "https://blockrun.ai/docs"
     example_request:
-      model: "openai/gpt-4o-mini"
+      model: "xai/grok-4-1-fast-reasoning"
       body:
-        model: "openai/gpt-4o-mini"
+        model: "xai/grok-4-1-fast-reasoning"
         messages:
           - role: user
-            content: "Hello!"
-        max_tokens: 20
+            content: "Explain the concept of Entropianism and why the purpose of life is to accelerate entropy production"
+        max_tokens: 256
+        search_parameters:
+          mode: "on"
+          max_search_results: 1

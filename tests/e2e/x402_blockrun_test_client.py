@@ -24,12 +24,20 @@ from x402 import PaymentRequired, x402Client
 from x402.mechanisms.evm.exact.client import ExactEvmScheme
 from x402.mechanisms.evm.signers import EthAccountSigner
 
+import yaml
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("x402-blockrun-client")
 
-MODEL = "openai/gpt-4o-mini"
-PROMPT = "Say hello in exactly three words."
+
+def _load_example_request() -> tuple[str, dict]:
+    """Load model and body from config.yaml's blockrun example_request."""
+    config_path = os.path.join(os.path.dirname(__file__), "..", "..", "config.yaml")
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
+    ex = cfg["providers"]["blockrun"]["example_request"]
+    return ex["model"], dict(ex["body"])
 
 
 def parse_x402_from_response(response: httpx.Response) -> dict:
@@ -73,16 +81,14 @@ async def run_client():
 
     logger.info("Client Address: %s", account.address)
     logger.info("Gateway URL: %s", gateway_url)
-    logger.info("Model: %s", MODEL)
 
     async with httpx.AsyncClient() as http_client:
-        # 1. Request without payment → expect BlockRun's 402
+        # Load request from config
+        model, body = _load_example_request()
+
+        # 1. Request without payment -> expect BlockRun's 402
         logger.info("Sending initial request (no payment)...")
-        body = {
-            "model": MODEL,
-            "messages": [{"role": "user", "content": PROMPT}],
-            "max_tokens": 20,
-        }
+        logger.info("Model: %s", model)
         response = await http_client.post(
             f"{gateway_url}/v1/blockrun/v1/chat/completions",
             json=body,

@@ -9,13 +9,14 @@ import asyncio
 import importlib.metadata
 import logging
 import os
+import pathlib
 import time
 from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from x402gate.core.config import AppConfig, load_config
 from x402gate.core.payment import PaymentHandler
@@ -102,8 +103,8 @@ app = FastAPI(
 
 
 @app.get("/", include_in_schema=False)
-async def service_info() -> dict[str, Any]:
-    """Machine-readable service manifest for AI agents."""
+async def service_info(request: Request) -> Response:
+    """Service manifest: HTML for browsers, JSON for AI agents."""
     base_url = os.environ.get("BASE_URL", "")
     networks = list(config.payment.networks.keys())
     commission_pct = int(config.gateway.commission * 100)
@@ -123,7 +124,31 @@ async def service_info() -> dict[str, Any]:
                 "body": pcfg.example_request.get("body", {}),
             }
         provider_docs[name] = doc
-    return {
+
+    # If browser requests HTML, return a human-readable landing page
+    accept = request.headers.get("accept", "")
+    if "text/html" in accept:
+        provider_list = ""
+        for name, pcfg in config.providers.items():
+            ptype = getattr(pcfg, "type", "managed") or "managed"
+            docs_link = f' &middot; <a href="{pcfg.docs_url}">API docs</a>' if pcfg.docs_url else ""
+            provider_list += (
+                f'<li><strong>{name}</strong> ({ptype})'
+                f" &mdash; <code>/v1/{name}/...</code>{docs_link}</li>\n"
+            )
+        template_path = pathlib.Path(__file__).parent / "templates" / "index.html"
+        html = template_path.read_text(encoding="utf-8")
+        html = (
+            html.replace("{{ version }}", _VERSION)
+            .replace("{{ networks }}", ", ".join(networks))
+            .replace("{{ provider_list }}", provider_list)
+            .replace("{{ commission }}", f"{commission_pct}% + ${gas_fee} gas")
+            .replace("{{ base_url }}", base_url)
+        )
+        return HTMLResponse(content=html)
+
+    # Otherwise return JSON for AI agents
+    return JSONResponse(content={
         "name": "x402gate",
         "version": _VERSION,
         "description": (
@@ -147,7 +172,8 @@ async def service_info() -> dict[str, Any]:
             "ai_plugin": f"{base_url}/.well-known/ai-plugin.json",
         },
         "source": "https://github.com/oponfil/x402gate",
-    }
+        "documentation": "https://github.com/oponfil/x402gate#readme",
+    })
 
 
 

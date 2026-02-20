@@ -8,31 +8,37 @@ import os
 
 import httpx
 import pytest
+import yaml
+
+
+def _load_blockrun_example():
+    """Load model and body from config.yaml's blockrun example_request."""
+    config_path = os.path.join(os.path.dirname(__file__), "..", "..", "config.yaml")
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
+    ex = cfg["providers"]["blockrun"]["example_request"]
+    return ex["model"], ex["body"]
 
 
 @pytest.mark.asyncio
 async def test_blockrun_invalid_model_error(gateway_process):
     """Send a nonexistent model to BlockRun, verify error is forwarded."""
     gateway_url = os.environ.get("GATEWAY_URL", "http://localhost:4022")
+    _model, body = _load_blockrun_example()
+
+    # Override model with a fake one
+    body["model"] = "nonexistent/fake-model-xyz-999"
 
     async with httpx.AsyncClient() as client:
-        # Send request with a model that doesn't exist
         response = await client.post(
             f"{gateway_url}/v1/blockrun/v1/chat/completions",
-            json={
-                "model": "nonexistent/fake-model-xyz-999",
-                "messages": [{"role": "user", "content": "hello"}],
-                "max_tokens": 5,
-            },
+            json=body,
             timeout=30.0,
         )
 
     print(f"\nStatus: {response.status_code}")
     print(f"Body: {response.text[:500]}")
 
-    # BlockRun should return an error (could be 402 with invalid model,
-    # or 4xx/5xx error) — either way it's forwarded as-is
-    # The key point: gateway doesn't crash, it forwards the response
     assert response.status_code != 200, (
         f"Expected error for nonexistent model, got 200: {response.text[:200]}"
     )
@@ -71,6 +77,10 @@ async def test_blockrun_bad_params_error(gateway_process):
         return usdc.functions.balanceOf(Web3.to_checksum_address(addr)).call()
 
     gateway_url = os.environ.get("GATEWAY_URL", "http://localhost:4022")
+    _model, body = _load_blockrun_example()
+
+    # Override max_tokens with invalid value
+    body["max_tokens"] = -999
 
     # --- Record client balance BEFORE ---
     client_before = get_usdc(CLIENT)
@@ -80,11 +90,7 @@ async def test_blockrun_bad_params_error(gateway_process):
         # Step 1: Get 402 from BlockRun (with valid model)
         response = await client.post(
             f"{gateway_url}/v1/blockrun/v1/chat/completions",
-            json={
-                "model": "openai/gpt-4o-mini",
-                "messages": [{"role": "user", "content": "hello"}],
-                "max_tokens": -999,  # <-- invalid
-            },
+            json=body,
             timeout=15.0,
         )
 
@@ -122,11 +128,7 @@ async def test_blockrun_bad_params_error(gateway_process):
             # Step 2: Retry with payment + bad params
             response = await client.post(
                 f"{gateway_url}/v1/blockrun/v1/chat/completions",
-                json={
-                    "model": "openai/gpt-4o-mini",
-                    "messages": [{"role": "user", "content": "hello"}],
-                    "max_tokens": -999,
-                },
+                json=body,
                 headers={"PAYMENT-SIGNATURE": signature},
                 timeout=30.0,
             )

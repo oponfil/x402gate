@@ -92,6 +92,21 @@ If the provider rejects a request (e.g. invalid parameters), the gateway returns
 
 > **Note:** Payment is settled **only** on success (HTTP 200). On any error, the payment is not settled and no USDC is transferred.
 
+### Service Discovery
+
+The root endpoint `GET /` uses content negotiation:
+
+- **Browser** (`Accept: text/html`) → human-readable HTML page with docs, examples, and links
+- **AI agent / curl** (`Accept: */*` or `application/json`) → machine-readable JSON manifest
+
+```bash
+# HTML (as browser sees it)
+curl -H "Accept: text/html" https://your-gateway/
+
+# JSON (for AI agents)
+curl https://your-gateway/
+```
+
 ## Supported Networks
 
 | Network | Chain ID | Token | Gas Token |

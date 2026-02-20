@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>x402gate v{{ version }}</title>
+    <style>
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            max-width: 720px;
+            margin: 60px auto;
+            padding: 0 20px;
+            color: #e0e0e0;
+            background: #0d1117;
+            line-height: 1.6;
+        }
+
+        a {
+            color: #58a6ff;
+        }
+
+        code {
+            background: #161b22;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 0.85em;
+        }
+
+        pre {
+            background: #161b22;
+            padding: 16px;
+            border-radius: 8px;
+            overflow-x: auto;
+            font-size: 0.85em;
+            line-height: 1.5;
+        }
+
+        pre code {
+            padding: 0;
+            background: none;
+        }
+
+        h1 {
+            font-size: 1.6em;
+            margin-bottom: 4px;
+        }
+
+        h3 {
+            margin-bottom: 8px;
+            color: #c9d1d9;
+        }
+
+        .subtitle {
+            color: #8b949e;
+            margin-top: 0;
+        }
+
+        ul {
+            padding-left: 20px;
+            line-height: 1.8;
+        }
+
+        .links {
+            margin-top: 32px;
+            line-height: 2;
+        }
+
+        .links a {
+            margin-right: 16px;
+        }
+
+        hr {
+            border: none;
+            border-top: 1px solid #21262d;
+            margin: 24px 0;
+        }
+
+        .step {
+            color: #8b949e;
+            font-size: 0.9em;
+        }
+
+        .note {
+            background: #0d1d30;
+            border-left: 3px solid #58a6ff;
+            padding: 10px 14px;
+            border-radius: 4px;
+            margin: 12px 0;
+            font-size: 0.9em;
+        }
+    </style>
+</head>
+
+<body>
+
+    <h1>x402gate</h1>
+    <p class="subtitle">v{{ version }} &middot; Pay-per-request AI proxy via x402</p>
+    <p>Pay with <strong>USDC</strong> on {{ networks }} &mdash; no API keys, no subscriptions.</p>
+
+    <hr>
+    <h3>Providers</h3>
+    <ul>
+        {{ provider_list }}
+    </ul>
+    <p>Commission: <strong>{{ commission }}</strong> per request</p>
+
+    <hr>
+    <h3>How It Works</h3>
+    <p class="step"><strong>1.</strong> Send a request &rarr; get <code>402 Payment Required</code> with USDC price</p>
+    <p class="step"><strong>2.</strong> Sign payment with your wallet</p>
+    <p class="step"><strong>3.</strong> Retry with <code>PAYMENT-SIGNATURE</code> header &rarr; get result</p>
+
+    <hr>
+    <h3>Example</h3>
+
+    <p><strong>Step 1:</strong> Request without payment</p>
+    <pre><code>curl -X POST {{ base_url }}/v1/wavespeed/wavespeed-ai/z-image/turbo \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "A sunset over mountains"}'
+
+# Response: 402 Payment Required
+# {"accepts": [{"network": "base", "price": "0.00625", ...}]}</code></pre>
+
+    <p><strong>Step 2:</strong> Retry with signed payment</p>
+    <pre><code>curl -X POST {{ base_url }}/v1/wavespeed/wavespeed-ai/z-image/turbo \
+  -H "Content-Type: application/json" \
+  -H "PAYMENT-SIGNATURE: &lt;base64-signed-payload&gt;" \
+  -d '{"prompt": "A sunset over mountains"}'
+
+# Response: 200 OK
+# {"data": {"outputs": ["https://...image.png"], ...}}</code></pre>
+
+    <hr>
+    <h3>Error Format</h3>
+    <p>If the provider rejects a request, payment is <strong>not settled</strong> &mdash; you keep your USDC:</p>
+    <pre><code>{
+  "error": "size does not meet the constraints.",
+  "provider": "wavespeed",
+  "status": 502
+}</code></pre>
+    <div class="note">Payment is settled <strong>only</strong> on success (HTTP 200). On any error, no USDC is
+        transferred.</div>
+
+    <hr>
+    <div class="links">
+        <a href="https://github.com/oponfil/x402gate#readme">Documentation</a>
+        <a href="{{ base_url }}/docs">API Reference</a>
+        <a href="{{ base_url }}/v1/providers">Providers JSON</a>
+        <a href="{{ base_url }}/health">Health</a>
+        <a href="https://github.com/oponfil/x402gate">Source</a>
+    </div>
+
+</body>
+
+</html>
