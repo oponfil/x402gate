@@ -136,6 +136,29 @@ async def service_info(request: Request) -> Response:
                 f'<li><strong>{name}</strong> ({ptype})'
                 f" &mdash; <code>/v1/{name}/...</code>{docs_link}</li>\n"
             )
+        # Build curl examples from provider configs
+        import json as _json
+        examples_html = ""
+        for name, pcfg in config.providers.items():
+            if not pcfg.example_request:
+                continue
+            model = pcfg.example_request.get("model", "MODEL")
+            body = pcfg.example_request.get("body", {})
+            body_json = _json.dumps(body, ensure_ascii=False)
+            path = f"/v1/{name}/{model}"
+            examples_html += f"""
+    <h4>{name} &mdash; <code>{model}</code></h4>
+    <pre><code>curl -X POST {base_url}{path} \\
+  -H "Content-Type: application/json" \\
+  -d '{body_json}'
+
+# Response: 402 Payment Required
+# Sign payment, then retry with PAYMENT-SIGNATURE header</code></pre>
+"""
+        examples_html += """
+    <div class="note">Payment is settled <strong>only</strong> on success (HTTP 200). On any error, no USDC is
+        transferred.</div>"""
+
         template_path = pathlib.Path(__file__).parent / "templates" / "index.html"
         html = template_path.read_text(encoding="utf-8")
         html = (
@@ -144,6 +167,7 @@ async def service_info(request: Request) -> Response:
             .replace("{{ provider_list }}", provider_list)
             .replace("{{ commission }}", f"{commission_pct}% + ${gas_fee} gas")
             .replace("{{ base_url }}", base_url)
+            .replace("{{ examples }}", examples_html)
         )
         return HTMLResponse(content=html)
 

@@ -112,35 +112,8 @@
     <p class="step"><strong>3.</strong> Retry with <code>PAYMENT-SIGNATURE</code> header &rarr; get result</p>
 
     <hr>
-    <h3>Example</h3>
-
-    <p><strong>Step 1:</strong> Request without payment</p>
-    <pre><code>curl -X POST {{ base_url }}/v1/wavespeed/wavespeed-ai/z-image/turbo \
-  -H "Content-Type: application/json" \
-  -d '{"prompt": "A sunset over mountains"}'
-
-# Response: 402 Payment Required
-# {"accepts": [{"network": "base", "price": "0.00625", ...}]}</code></pre>
-
-    <p><strong>Step 2:</strong> Retry with signed payment</p>
-    <pre><code>curl -X POST {{ base_url }}/v1/wavespeed/wavespeed-ai/z-image/turbo \
-  -H "Content-Type: application/json" \
-  -H "PAYMENT-SIGNATURE: &lt;base64-signed-payload&gt;" \
-  -d '{"prompt": "A sunset over mountains"}'
-
-# Response: 200 OK
-# {"data": {"outputs": ["https://...image.png"], ...}}</code></pre>
-
-    <hr>
-    <h3>Error Format</h3>
-    <p>If the provider rejects a request, payment is <strong>not settled</strong> &mdash; you keep your USDC:</p>
-    <pre><code>{
-  "error": "size does not meet the constraints.",
-  "provider": "wavespeed",
-  "status": 502
-}</code></pre>
-    <div class="note">Payment is settled <strong>only</strong> on success (HTTP 200). On any error, no USDC is
-        transferred.</div>
+    <h3>Examples</h3>
+    {{ examples }}
 
     <hr>
     <div class="links">
@@ -148,7 +121,7 @@
         <a href="{{ base_url }}/docs">API Reference</a>
         <a href="{{ base_url }}/v1/providers">Providers JSON</a>
         <a href="{{ base_url }}/health">Health</a>
-        <a href="https://github.com/oponfil/x402gate">Source</a>
+        <a href="https://github.com/oponfil/x402gate">Open Source</a>
     </div>
 
 </body>
