@@ -88,6 +88,7 @@ class PaymentConfig(BaseModel):
 class ProviderConfig(BaseModel):
     """Configuration for a single provider."""
 
+    type: str = "managed"  # "managed" = full x402 flow, "passthrough" = transparent proxy
     enabled: bool = True
     base_url: str
     api_key: str = ""

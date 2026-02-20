@@ -40,3 +40,16 @@ providers:
       model: "wavespeed-ai/z-image/turbo"
       body:
         prompt: "A futuristic city on Mars, cinematic lighting"
+  blockrun:
+    type: passthrough
+    enabled: true
+    base_url: "https://blockrun.ai/api"
+    docs_url: "https://blockrun.ai/docs"
+    example_request:
+      model: "openai/gpt-4o-mini"
+      body:
+        model: "openai/gpt-4o-mini"
+        messages:
+          - role: user
+            content: "Hello!"
+        max_tokens: 20

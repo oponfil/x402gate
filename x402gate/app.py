@@ -13,8 +13,9 @@ import time
 from contextlib import asynccontextmanager
 from typing import Any
 
+import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from x402gate.core.config import AppConfig, load_config
 from x402gate.core.payment import PaymentHandler
@@ -27,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 # Global state (initialized in lifespan)
 config: AppConfig
-providers: dict[str, BaseProvider] = {}
+providers: dict[str, BaseProvider | None] = {}  # None = passthrough (no provider object)
 payment_handler: PaymentHandler
 price_cache: PriceCache
 _pending_settlements: set[asyncio.Task] = set()
@@ -57,7 +58,10 @@ async def lifespan(app: FastAPI):
             logger.info("Provider '%s' is disabled, skipping", name)
             continue
 
-        if name == "wavespeed":
+        if provider_config.type == "passthrough":
+            providers[name] = None  # No provider object needed
+            logger.info("Provider '%s' registered (passthrough)", name)
+        elif name == "wavespeed":
             provider = WaveSpeedProvider(config=provider_config)
             providers[name] = provider
             logger.info("Provider '%s' registered", name)
@@ -78,7 +82,8 @@ async def lifespan(app: FastAPI):
         logger.info("Waiting for %d pending settlement(s)...", len(_pending_settlements))
         await asyncio.gather(*_pending_settlements, return_exceptions=True)
     for provider in providers.values():
-        await provider.close()
+        if provider is not None:
+            await provider.close()
     logger.info("x402gate shut down")
 
 
@@ -203,15 +208,68 @@ async def health_check() -> dict[str, str]:
 @app.get("/v1/providers")
 async def list_providers() -> dict[str, Any]:
     """List all registered providers and their status."""
-    return {
-        "providers": {
-            name: {
-                "enabled": True,
-                "base_url": provider.config.base_url,
-            }
-            for name, provider in providers.items()
+    result: dict[str, Any] = {}
+    for name in providers:
+        pcfg = config.providers[name]
+        info: dict[str, Any] = {
+            "enabled": True,
+            "base_url": pcfg.base_url,
         }
-    }
+        if pcfg.type == "passthrough":
+            info["type"] = "passthrough"
+        result[name] = info
+    return {"providers": result}
+
+
+# --- Passthrough Proxy (for x402-native providers) ---
+
+
+async def _passthrough_proxy(
+    provider_name: str, path: str, request: Request
+) -> Response:
+    """Transparent HTTP proxy for x402-native providers like BlockRun.
+
+    Forwards everything as-is, including 402 responses and Payment-Signature
+    headers.  x402gate does NOT handle payments — the client pays the
+    upstream provider directly.
+    """
+    provider_cfg = config.providers.get(provider_name)
+    if provider_cfg is None or provider_name not in providers:
+        return JSONResponse(
+            status_code=503,
+            content={"error": f"{provider_name} provider is not configured"},
+        )
+
+    url = f"{provider_cfg.base_url.rstrip('/')}/{path}"
+    body = await request.body()
+
+    # Forward relevant headers (especially Payment-Signature for x402)
+    forward_headers: dict[str, str] = {}
+    for key in ("content-type", "payment-signature", "accept", "authorization"):
+        if val := request.headers.get(key):
+            forward_headers[key] = val
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        resp = await client.post(url, content=body, headers=forward_headers)
+
+    # Filter response headers (avoid hop-by-hop headers)
+    safe_headers: dict[str, str] = {}
+    skip = {"transfer-encoding", "connection", "keep-alive", "content-encoding", "content-length"}
+    for k, v in resp.headers.items():
+        if k.lower() not in skip:
+            safe_headers[k] = v
+
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        headers=safe_headers,
+    )
+
+
+@app.post("/v1/blockrun/{path:path}")
+async def blockrun_proxy(path: str, request: Request) -> Any:
+    """Transparent passthrough proxy for BlockRun (x402-native)."""
+    return await _passthrough_proxy("blockrun", path, request)
 
 
 # --- WaveSpeed Proxy ---

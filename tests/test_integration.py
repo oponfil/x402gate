@@ -49,6 +49,10 @@ providers:
     api_key: "test-key-12345"
     poll_interval: 1
     poll_timeout: 10
+  blockrun:
+    type: passthrough
+    enabled: true
+    base_url: "https://blockrun.ai/api"
 """)
     return config
 
@@ -137,3 +141,84 @@ class TestWaveSpeedProxy:
             json={"prompt": "test"},
         )
         assert response.status_code == 503
+
+
+class TestBlockRunPassthrough:
+    """Integration tests for the BlockRun passthrough proxy."""
+
+    @respx.mock
+    def test_402_passthrough(self, client):
+        """BlockRun 402 is forwarded to client as-is."""
+        blockrun_402 = {
+            "x402Version": 1,
+            "accepts": [
+                {
+                    "scheme": "exact",
+                    "network": "eip155:8453",
+                    "price": "$0.003000",
+                    "payTo": "0xBlockRunWallet",
+                }
+            ],
+        }
+        respx.post("https://blockrun.ai/api/v1/chat/completions").mock(
+            return_value=httpx.Response(402, json=blockrun_402)
+        )
+
+        response = client.post(
+            "/v1/blockrun/v1/chat/completions",
+            json={"model": "openai/gpt-4o", "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+        assert response.status_code == 402
+        body = response.json()
+        assert body["accepts"][0]["payTo"] == "0xBlockRunWallet"
+
+    @respx.mock
+    def test_payment_header_forwarded(self, client):
+        """Payment-Signature header is forwarded to BlockRun."""
+        respx.post("https://blockrun.ai/api/v1/chat/completions").mock(
+            return_value=httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": "Hello!"}}]},
+            )
+        )
+
+        response = client.post(
+            "/v1/blockrun/v1/chat/completions",
+            json={"model": "openai/gpt-4o", "messages": [{"role": "user", "content": "hi"}]},
+            headers={"Payment-Signature": "test-sig-123"},
+        )
+
+        assert response.status_code == 200
+        # Verify the header was forwarded to BlockRun
+        assert respx.calls[0].request.headers["payment-signature"] == "test-sig-123"
+
+    @respx.mock
+    def test_response_body_passthrough(self, client):
+        """Upstream response body is returned unchanged."""
+        upstream_body = {
+            "id": "gen-abc123",
+            "choices": [{"message": {"role": "assistant", "content": "Hi there!"}}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 3, "cost": 0.00002},
+        }
+        respx.post("https://blockrun.ai/api/v1/chat/completions").mock(
+            return_value=httpx.Response(200, json=upstream_body)
+        )
+
+        response = client.post(
+            "/v1/blockrun/v1/chat/completions",
+            json={"model": "openai/gpt-4o", "messages": [{"role": "user", "content": "hi"}]},
+            headers={"Payment-Signature": "valid-sig"},
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["choices"][0]["message"]["content"] == "Hi there!"
+        assert body["usage"]["cost"] == 0.00002
+
+    def test_list_providers_includes_blockrun(self, client):
+        """GET /v1/providers includes blockrun."""
+        response = client.get("/v1/providers")
+        assert response.status_code == 200
+        data = response.json()
+        assert "blockrun" in data["providers"]
