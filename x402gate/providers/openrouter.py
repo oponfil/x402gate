@@ -146,9 +146,7 @@ class OpenRouterProvider(BaseProvider):
 
         # Estimate input tokens from message text
         messages = inputs.get("messages", [])
-        total_chars = sum(
-            len(str(m.get("content", ""))) for m in messages
-        )
+        total_chars = sum(len(str(m.get("content", ""))) for m in messages)
         estimated_input_tokens = max(total_chars // _CHARS_PER_TOKEN, 1)
 
         # Web search plugins inject search results into the prompt,
@@ -177,8 +175,7 @@ class OpenRouterProvider(BaseProvider):
             estimated_cost = Decimal("0.000001")
 
         logger.info(
-            "OpenRouter price estimate for %s: $%s "
-            "(~%d input tokens, %d max output tokens)",
+            "OpenRouter price estimate for %s: $%s (~%d input tokens, %d max output tokens)",
             model_id,
             estimated_cost,
             estimated_input_tokens,
@@ -218,9 +215,11 @@ class OpenRouterProvider(BaseProvider):
         patched_plugins = []
         plugins_changed = False
         for plugin in plugins:
-            if (isinstance(plugin, dict)
-                    and plugin.get("id") == "web"
-                    and "max_results" not in plugin):
+            if (
+                isinstance(plugin, dict)
+                and plugin.get("id") == "web"
+                and "max_results" not in plugin
+            ):
                 plugin = {**plugin, "max_results": self._default_web_search_max_results}
                 plugins_changed = True
                 logger.info(
@@ -327,8 +326,7 @@ class OpenRouterProvider(BaseProvider):
             actual_cost = Decimal("0.000001")
 
         logger.info(
-            "OpenRouter actual cost for %s: $%s "
-            "(prompt=%d, completion=%d tokens)",
+            "OpenRouter actual cost for %s: $%s (prompt=%d, completion=%d tokens)",
             model_id,
             actual_cost,
             prompt_tokens,

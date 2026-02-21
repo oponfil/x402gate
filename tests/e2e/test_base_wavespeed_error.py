@@ -15,7 +15,7 @@ async def test_bad_params_no_settlement(gateway_process, base_chain):
 
     # Run the bad-params client script
     env = {**os.environ, "GATEWAY_URL": "http://localhost:4022"}
-    result = subprocess.run(
+    result = subprocess.run(  # noqa: ASYNC221
         ["python", "tests/e2e/x402_test_client_bad_params.py"],
         env=env,
         capture_output=True,
@@ -28,7 +28,7 @@ async def test_bad_params_no_settlement(gateway_process, base_chain):
 
     # Wait for any potential settlement
     print("Waiting to confirm no settlement...")
-    time.sleep(10)
+    time.sleep(10)  # noqa: ASYNC251
 
     # Verify client balance unchanged
     client_after = base_chain.get_usdc(base_chain.client_address)

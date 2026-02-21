@@ -43,6 +43,7 @@ def _error_response(
     body.update(extra)
     return JSONResponse(status_code=status_code, content=body)
 
+
 # ---------------------------------------------------------------------------
 # Provider registry: maps config name → provider class.
 # Passthrough providers don't need a class — they're handled generically.
@@ -91,15 +92,52 @@ async def lifespan(app: FastAPI):
         elif name in PROVIDER_REGISTRY:
             kwargs = {}
             if name == "openrouter":
-                kwargs["default_max_tokens"] = config.gateway.default_max_tokens
-                kwargs["web_search_tokens_per_result"] = config.gateway.web_search_tokens_per_result
-                kwargs["default_web_search_max_results"] = config.gateway.default_web_search_max_results
-                kwargs["web_search_cost_per_result"] = config.gateway.web_search_cost_per_result
+                gw = config.gateway
+                kwargs["default_max_tokens"] = gw.default_max_tokens
+                kwargs["web_search_tokens_per_result"] = gw.web_search_tokens_per_result
+                kwargs["default_web_search_max_results"] = gw.default_web_search_max_results
+                kwargs["web_search_cost_per_result"] = gw.web_search_cost_per_result
             provider = PROVIDER_REGISTRY[name](config=provider_config, **kwargs)
             providers[name] = provider
             logger.info("Provider '%s' registered (managed)", name)
         else:
             logger.warning("Unknown provider '%s', skipping", name)
+
+    # --- Dynamic route registration from config ---
+    for name in providers:
+        pcfg = config.providers[name]
+        if pcfg.type == "passthrough":
+            # Passthrough: transparent proxy, no payment handling
+            def _make_passthrough(n: str):
+                async def _route(path: str, request: Request) -> Any:
+                    return await _passthrough_proxy(n, path, request)
+
+                _route.__doc__ = f"Transparent passthrough proxy for {n}."
+                return _route
+
+            app.add_api_route(
+                f"/v1/{name}/{{path:path}}",
+                _make_passthrough(name),
+                methods=["POST"],
+                name=f"{name}_proxy",
+            )
+            logger.info("Route registered: POST /v1/%s/{{path}} (passthrough)", name)
+        else:
+            # Managed: full x402 payment flow
+            def _make_managed(n: str):
+                async def _route(path: str, request: Request) -> Any:
+                    return await _handle_managed_request(n, path, request)
+
+                _route.__doc__ = f"Managed proxy for {n}."
+                return _route
+
+            app.add_api_route(
+                f"/v1/{name}/{{path:path}}",
+                _make_managed(name),
+                methods=["POST"],
+                name=f"{name}_proxy",
+            )
+            logger.info("Route registered: POST /v1/%s/{{path}} (managed)", name)
 
     logger.info(
         "x402gate started on %s:%d with %d provider(s)",
@@ -130,7 +168,6 @@ app = FastAPI(
 )
 
 
-
 # --- Service Discovery ---
 
 
@@ -153,11 +190,13 @@ async def service_info(request: Request) -> Response:
             ex = getattr(pcfg, ex_field, None)
             if ex:
                 model = ex.get("model", "MODEL_PATH")
-                examples.append({
-                    "method": "POST",
-                    "path": f"/v1/{name}/{model}",
-                    "body": ex.get("body", {}),
-                })
+                examples.append(
+                    {
+                        "method": "POST",
+                        "path": f"/v1/{name}/{model}",
+                        "body": ex.get("body", {}),
+                    }
+                )
         if len(examples) == 1:
             doc["example_request"] = examples[0]
         elif examples:
@@ -173,11 +212,12 @@ async def service_info(request: Request) -> Response:
             desc = f" &mdash; {pcfg.description}" if pcfg.description else ""
             docs_link = f' &middot; <a href="{pcfg.docs_url}">API docs</a>' if pcfg.docs_url else ""
             provider_list += (
-                f'<li><strong>{name}</strong> ({ptype}){desc}'
+                f"<li><strong>{name}</strong> ({ptype}){desc}"
                 f" &mdash; <code>/v1/{name}/...</code>{docs_link}</li>\n"
             )
         # Build curl examples from provider configs
         import json as _json
+
         examples_html = ""
         for name, pcfg in config.providers.items():
             for ex_field in sorted(f for f in pcfg.model_fields if f.startswith("example_request")):
@@ -198,7 +238,8 @@ async def service_info(request: Request) -> Response:
 # Sign payment, then retry with PAYMENT-SIGNATURE header</code></pre>
 """
         examples_html += """
-    <div class="note">Payment is settled <strong>only</strong> on success (HTTP 200). On any error, no USDC is
+    <div class="note">Payment is settled <strong>only</strong> on success """
+        examples_html += """(HTTP 200). On any error, no USDC is
         transferred.</div>"""
 
         template_path = pathlib.Path(__file__).parent / "templates" / "index.html"
@@ -214,33 +255,34 @@ async def service_info(request: Request) -> Response:
         return HTMLResponse(content=html)
 
     # Otherwise return JSON for AI agents
-    return JSONResponse(content={
-        "name": "x402gate",
-        "version": _VERSION,
-        "description": (
-            "Transparent pay-per-request proxy for AI services via the x402 protocol. "
-            "Send a POST request to any provider endpoint — if no payment header is "
-            "included, a 402 response is returned with USDC payment options. "
-            "The request body format is defined by the upstream provider — "
-            "x402gate forwards it as-is. See provider_docs for API references."
-        ),
-        "payment_protocol": "x402",
-        "payment_asset": "USDC",
-        "networks": networks,
-        "providers": list(providers.keys()),
-        "commission": f"{commission_pct}% + ${gas_fee} gas per request",
-        "provider_docs": provider_docs,
-        "endpoints": {
-            "openapi": f"{base_url}/openapi.json",
-            "docs": f"{base_url}/docs",
-            "health": f"{base_url}/health",
-            "providers": f"{base_url}/v1/providers",
-            "ai_plugin": f"{base_url}/.well-known/ai-plugin.json",
-        },
-        "source": "https://github.com/oponfil/x402gate",
-        "documentation": "https://github.com/oponfil/x402gate#readme",
-    })
-
+    return JSONResponse(
+        content={
+            "name": "x402gate",
+            "version": _VERSION,
+            "description": (
+                "Transparent pay-per-request proxy for AI services via the x402 protocol. "
+                "Send a POST request to any provider endpoint — if no payment header is "
+                "included, a 402 response is returned with USDC payment options. "
+                "The request body format is defined by the upstream provider — "
+                "x402gate forwards it as-is. See provider_docs for API references."
+            ),
+            "payment_protocol": "x402",
+            "payment_asset": "USDC",
+            "networks": networks,
+            "providers": list(providers.keys()),
+            "commission": f"{commission_pct}% + ${gas_fee} gas per request",
+            "provider_docs": provider_docs,
+            "endpoints": {
+                "openapi": f"{base_url}/openapi.json",
+                "docs": f"{base_url}/docs",
+                "health": f"{base_url}/health",
+                "providers": f"{base_url}/v1/providers",
+                "ai_plugin": f"{base_url}/.well-known/ai-plugin.json",
+            },
+            "source": "https://github.com/oponfil/x402gate",
+            "documentation": "https://github.com/oponfil/x402gate#readme",
+        }
+    )
 
 
 @app.get("/.well-known/ai-plugin.json", include_in_schema=False)
@@ -257,6 +299,7 @@ async def ai_plugin_manifest() -> dict[str, Any]:
             ex = getattr(pcfg, ex_field, None)
             if ex:
                 import json
+
                 model = ex.get("model", "MODEL_PATH")
                 body = ex.get("body", {})
                 hint += f". Example: POST /v1/{name}/{model} with body {json.dumps(body)}"
@@ -290,6 +333,7 @@ async def ai_plugin_manifest() -> dict[str, Any]:
         "legal_info_url": "https://github.com/oponfil/x402gate/blob/main/LICENSE",
     }
 
+
 @app.get("/health")
 async def health_check() -> dict[str, str]:
     """Health check endpoint for deployment monitoring."""
@@ -318,9 +362,7 @@ async def list_providers() -> dict[str, Any]:
 # --- Passthrough Proxy (for x402-native providers) ---
 
 
-async def _passthrough_proxy(
-    provider_name: str, path: str, request: Request
-) -> Response:
+async def _passthrough_proxy(provider_name: str, path: str, request: Request) -> Response:
     """Transparent HTTP proxy for x402-native providers like BlockRun.
 
     Forwards everything as-is, including 402 responses and Payment-Signature
@@ -360,18 +402,10 @@ async def _passthrough_proxy(
     )
 
 
-@app.post("/v1/blockrun/{path:path}")
-async def blockrun_proxy(path: str, request: Request) -> Any:
-    """Transparent passthrough proxy for BlockRun (x402-native)."""
-    return await _passthrough_proxy("blockrun", path, request)
-
-
 # --- Managed Provider Proxy (unified flow for all managed providers) ---
 
 
-async def _handle_managed_request(
-    provider_name: str, path: str, request: Request
-) -> Response:
+async def _handle_managed_request(provider_name: str, path: str, request: Request) -> Response:
     """Unified x402 payment flow for managed providers.
 
     Flow:
@@ -426,7 +460,6 @@ async def _handle_managed_request(
     if not is_valid:
         return _error_response(402, "Payment verification failed")
 
-
     # 6. Forward request to provider
     t_gen_start = time.monotonic()
     try:
@@ -454,8 +487,10 @@ async def _handle_managed_request(
         except TaskTimeoutError as e:
             # Don't settle — client keeps their money
             return _error_response(
-                504, f"Task timed out after {e.timeout}s",
-                provider=provider.name, task_id=e.task_id,
+                504,
+                f"Task timed out after {e.timeout}s",
+                provider=provider.name,
+                task_id=e.task_id,
             )
         except ProviderError as e:
             # Don't settle — task failed
@@ -511,18 +546,3 @@ async def _handle_managed_request(
 
     # 9. Return result to client
     return JSONResponse(content={"data": output})
-
-
-# --- Per-Provider Routes ---
-
-
-@app.post("/v1/wavespeed/{path:path}")
-async def wavespeed_proxy(path: str, request: Request) -> Any:
-    """Managed proxy for WaveSpeed AI (image/video generation)."""
-    return await _handle_managed_request("wavespeed", path, request)
-
-
-@app.post("/v1/openrouter/{path:path}")
-async def openrouter_proxy(path: str, request: Request) -> Any:
-    """Managed proxy for OpenRouter (300+ LLM models)."""
-    return await _handle_managed_request("openrouter", path, request)

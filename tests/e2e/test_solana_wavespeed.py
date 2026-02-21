@@ -31,9 +31,9 @@ async def test_solana_wavespeed(gateway_process):
         pytest.skip("SOLANA_E2ETEST_PRIVATE_KEY not set")
 
     test_keypair = Keypair.from_base58_string(os.environ["SOLANA_E2ETEST_PRIVATE_KEY"])
-    CLIENT = str(test_keypair.pubkey())
-    PAYTO = sol_cfg.pay_to
-    USDC_MINT = Pubkey.from_string(sol_cfg.token_address)
+    client_addr = str(test_keypair.pubkey())
+    payto_addr = sol_cfg.pay_to
+    usdc_mint = Pubkey.from_string(sol_cfg.token_address)
 
     def get_spl_balance(owner_str: str) -> int:
         """Get USDC (SPL token) balance for a Solana address."""
@@ -42,10 +42,10 @@ async def test_solana_wavespeed(gateway_process):
 
         owner = Pk.from_string(owner_str)
         # Derive Associated Token Account (ATA)
-        TOKEN_PROGRAM = Pk.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
-        ATA_PROGRAM = Pk.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
-        seeds = [bytes(owner), bytes(TOKEN_PROGRAM), bytes(USDC_MINT)]
-        ata, _ = Pk.find_program_address(seeds, ATA_PROGRAM)
+        token_program = Pk.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+        ata_program = Pk.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
+        seeds = [bytes(owner), bytes(token_program), bytes(usdc_mint)]
+        ata, _ = Pk.find_program_address(seeds, ata_program)
 
         resp = client.get_token_account_balance(ata)
         if resp.value:
@@ -66,11 +66,11 @@ async def test_solana_wavespeed(gateway_process):
     from solders.keypair import Keypair as _Kp
 
     fac_kp = _Kp.from_base58_string(os.environ["SOLANA_FACILITATOR_PRIVATE_KEY"])
-    FAC = str(fac_kp.pubkey())
+    FAC = str(fac_kp.pubkey())  # noqa: N806
 
     # --- Record balances BEFORE ---
-    client_usdc_before = get_spl_balance(CLIENT)
-    payto_usdc_before = get_spl_balance(PAYTO)
+    client_usdc_before = get_spl_balance(client_addr)
+    payto_usdc_before = get_spl_balance(payto_addr)
     fac_sol_before = get_sol_balance(FAC)
 
     print("\n=== [Solana] Balances BEFORE ===")
@@ -80,7 +80,7 @@ async def test_solana_wavespeed(gateway_process):
 
     # Run the Solana client script
     env = {**os.environ, "GATEWAY_URL": "http://localhost:4022"}
-    result = subprocess.run(
+    result = subprocess.run(  # noqa: ASYNC221
         ["python", "tests/e2e/x402_solana_test_client.py"],
         env=env,
         capture_output=True,
@@ -93,11 +93,11 @@ async def test_solana_wavespeed(gateway_process):
 
     # Wait for background settlement (Solana confirmation takes ~2-5s)
     print("Waiting for settlement to confirm on-chain...")
-    time.sleep(15)
+    time.sleep(15)  # noqa: ASYNC251
 
     # --- Record balances AFTER ---
-    client_usdc_after = get_spl_balance(CLIENT)
-    payto_usdc_after = get_spl_balance(PAYTO)
+    client_usdc_after = get_spl_balance(client_addr)
+    payto_usdc_after = get_spl_balance(payto_addr)
     fac_sol_after = get_sol_balance(FAC)
 
     client_diff = client_usdc_before - client_usdc_after

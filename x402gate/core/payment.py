@@ -388,34 +388,41 @@ class PaymentHandler:
                     commission_pct = provider_cost * commission_rate
                     profit = amount_usdc - provider_cost - gas_cost_usd
 
+                    comm_pct = int(commission_rate * 100)
                     lines = [
                         "",
                         "+------------------- Transaction Summary -------------------+",
-                        "|  Network:                   %-30s |" % network,
-                        "|  Revenue (client paid):     $%.6f USDC                 |" % amount_usdc,
+                        f"|  Network:                   {network:<30s} |",
+                        f"|  Revenue (client paid):     ${amount_usdc:.6f} USDC                 |",
                     ]
 
                     # Show estimated cost if it differs from actual
                     if abs(estimated_cost - provider_cost) > 1e-8:
                         lines.append(
-                            "|  Estimated cost:            $%.6f USDC                 |" % estimated_cost
+                            f"|  Estimated cost:            ${estimated_cost:.6f}"
+                            " USDC                 |"
                         )
 
-                    lines.extend([
-                        "|  Provider cost:            -$%.6f USDC                 |" % provider_cost,
-                        "|  Commission (%d%%):          $%.6f USDC                 |" % (
-                            int(commission_rate * 100), commission_pct,
-                        ),
-                        "|  Gas surcharge:             $%.6f USDC                 |" % gas_surcharge_usd,
-                        "|  Gas cost:                 -$%.6f (%.10f %s)   |" % (
-                            gas_cost_usd, gas_cost_native, gas_label,
-                        ),
-                        "|  --------------------------------------------------------- |",
-                        "|  Net profit:                $%.6f USDC                 |" % profit,
-                        "|  Generation time:           %.1fs                        |" % generation_s,
-                        "|  Client wait time:          %.1fs                        |" % t_client,
-                        "+-----------------------------------------------------------+",
-                    ])
+                    lines.extend(
+                        [
+                            f"|  Provider cost:            -${provider_cost:.6f}"
+                            " USDC                 |",
+                            f"|  Commission ({comm_pct}%):"
+                            f"          ${commission_pct:.6f}"
+                            " USDC                 |",
+                            f"|  Gas surcharge:             ${gas_surcharge_usd:.6f}"
+                            " USDC                 |",
+                            f"|  Gas cost:                 -${gas_cost_usd:.6f}"
+                            f" ({gas_cost_native:.10f} {gas_label})   |",
+                            "|  --------------------------------------------------------- |",
+                            f"|  Net profit:                ${profit:.6f} USDC                 |",
+                            f"|  Generation time:           {generation_s:.1f}s"
+                            "                        |",
+                            f"|  Client wait time:          {t_client:.1f}s"
+                            "                        |",
+                            "+-----------------------------------------------------------+",
+                        ]
+                    )
                     summary = "\n".join(lines)
                     import sys
 

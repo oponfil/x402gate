@@ -114,7 +114,7 @@ class TestLoadConfig:
 payment:
   networks: {}
 """)
-        with pytest.raises(Exception):  # Pydantic ValidationError
+        with pytest.raises((ValueError, Exception)):  # noqa: B017
             load_config(config_file)
 
 

@@ -72,8 +72,7 @@ async def run_client():
         # 2. Sign payment
         payment_required = PaymentRequired.model_validate(payment_data)
         base_accepts = [
-            a for a in payment_required.accepts
-            if "eip155:8453" in getattr(a, "network", "")
+            a for a in payment_required.accepts if "eip155:8453" in getattr(a, "network", "")
         ]
         if not base_accepts:
             logger.error("No Base payment option")

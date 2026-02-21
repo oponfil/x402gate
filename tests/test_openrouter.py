@@ -1,7 +1,7 @@
 """Unit tests for OpenRouter provider."""
 
 from decimal import Decimal
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
@@ -33,7 +33,7 @@ def model_info_response():
                     "id": "openai/gpt-4o-mini",
                     "name": "OpenAI: GPT-4o Mini",
                     "pricing": {
-                        "prompt": "0.00000015",   # $0.15 per 1M tokens
+                        "prompt": "0.00000015",  # $0.15 per 1M tokens
                         "completion": "0.0000006",  # $0.60 per 1M tokens
                     },
                 },
@@ -81,15 +81,11 @@ class TestGetPrice:
     """Tests for OpenRouterProvider.get_price()."""
 
     @pytest.mark.asyncio
-    async def test_calculates_price_from_model_pricing(
-        self, provider, model_info_response
-    ):
+    async def test_calculates_price_from_model_pricing(self, provider, model_info_response):
         """Should estimate cost based on input text length and max_tokens."""
         body = {
             "model": "openai/gpt-4o-mini",
-            "messages": [
-                {"role": "user", "content": "What is quantum computing?"}
-            ],
+            "messages": [{"role": "user", "content": "What is quantum computing?"}],
             "max_tokens": 100,
         }
 
@@ -104,10 +100,9 @@ class TestGetPrice:
         #        + 100 output tokens × $0.0000006
         # = ~$0.0000609
         expected_input_tokens = max(len("What is quantum computing?") // 4, 1)
-        expected = (
-            Decimal(expected_input_tokens) * Decimal("0.00000015")
-            + Decimal("100") * Decimal("0.0000006")
-        )
+        expected = Decimal(expected_input_tokens) * Decimal("0.00000015") + Decimal(
+            "100"
+        ) * Decimal("0.0000006")
         assert price == expected
 
     @pytest.mark.asyncio
@@ -158,13 +153,21 @@ class TestGetPrice:
         # Return a valid models list that doesn't contain the requested model
         empty_catalog = httpx.Response(
             status_code=200,
-            json={"data": [{"id": "some/other-model", "pricing": {"prompt": "0.001", "completion": "0.002"}}]},
+            json={
+                "data": [
+                    {
+                        "id": "some/other-model",
+                        "pricing": {"prompt": "0.001", "completion": "0.002"},
+                    }
+                ]
+            },
         )
 
         with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
             mock_get.return_value = empty_catalog
 
             from x402gate.providers.base import ProviderError
+
             with pytest.raises(ProviderError, match="not found"):
                 await provider.get_price("chat/completions", body)
 
@@ -203,11 +206,10 @@ class TestSubmit:
         }
 
         with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
-            mock_post.return_value = httpx.Response(
-                status_code=429, text="Rate limit exceeded"
-            )
+            mock_post.return_value = httpx.Response(status_code=429, text="Rate limit exceeded")
 
             from x402gate.providers.base import ProviderError
+
             with pytest.raises(ProviderError):
                 await provider.submit("chat/completions", body)
 
@@ -229,7 +231,7 @@ class TestSubmit:
         # This would trigger polling — let's verify the managed handler won't
         # by checking the response structure
         assert "data" not in result  # No "data" wrapper
-        assert "choices" in result   # Direct OpenAI format
+        assert "choices" in result  # Direct OpenAI format
 
 
 class TestGetResult:
@@ -262,10 +264,7 @@ class TestCalculateActualCost:
             cost = await provider.calculate_actual_cost(body, result)
 
         assert isinstance(cost, Decimal)
-        expected = (
-            Decimal(10) * Decimal("0.00000015")
-            + Decimal(50) * Decimal("0.0000006")
-        )
+        expected = Decimal(10) * Decimal("0.00000015") + Decimal(50) * Decimal("0.0000006")
         assert cost == expected
 
     @pytest.mark.asyncio

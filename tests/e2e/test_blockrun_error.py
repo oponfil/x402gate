@@ -103,7 +103,7 @@ async def test_blockrun_bad_params_error(gateway_process, base_chain):
         )
 
     # Verify client balance unchanged
-    time.sleep(5)
+    time.sleep(5)  # noqa: ASYNC251
     client_after = base_chain.get_usdc(base_chain.client_address)
     client_diff = client_before - client_after
 

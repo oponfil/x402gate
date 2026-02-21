@@ -67,6 +67,10 @@ Client → POST /v1/wavespeed/{model} + PAYMENT-SIGNATURE header
 
 ## Key Design Decisions
 
+### Dynamic Route Registration
+
+Provider routes (`/v1/{provider}/{path}`) are generated automatically from `config.yaml` at startup. Adding a passthrough provider requires only a config entry — no code changes. Adding a managed provider requires a config entry + a provider class registered in `PROVIDER_REGISTRY`.
+
 ### Transparent Proxy
 
 The gateway forwards request bodies to providers **as-is**. It does not parse, validate, or modify model-specific parameters. This means:

@@ -114,7 +114,7 @@ async def run_client():
             if outputs:
                 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
                 ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                for i, url in enumerate(outputs):
+                for _i, url in enumerate(outputs):
                     ext = Path(url.split("?")[0]).suffix or ".jpeg"
                     img_path = OUTPUT_DIR / f"base_{ts}{ext}"
                     img_resp = await http_client.get(url)

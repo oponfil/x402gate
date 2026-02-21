@@ -104,7 +104,10 @@ async def run_client():
             sys.exit(1)
 
         # We expect a 4xx/5xx error from the provider
-        logger.info("Got error %d as expected — provider rejected bad params ✓", response.status_code)
+        logger.info(
+            "Got error %d as expected — provider rejected bad params ✓",
+            response.status_code,
+        )
         print(f"ERROR_STATUS={response.status_code}")
         sys.exit(0)
 

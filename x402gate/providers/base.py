@@ -100,7 +100,7 @@ class BaseProvider(ABC):
         """
         return None
 
-    async def close(self) -> None:
+    async def close(self) -> None:  # noqa: B027
         """Clean up provider resources. Override if needed."""
 
 

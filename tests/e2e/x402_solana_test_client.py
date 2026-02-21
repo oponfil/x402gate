@@ -62,7 +62,10 @@ async def run_client():
     rpc_url = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 
     # Register the 'exact' scheme for Solana Mainnet
-    x402_client.register("solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp", ExactSvmScheme(signer, rpc_url=rpc_url))
+    x402_client.register(
+        "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+        ExactSvmScheme(signer, rpc_url=rpc_url),
+    )
 
     logger.info("Client Address: %s", signer.address)
     logger.info("Gateway URL: %s", gateway_url)
@@ -130,7 +133,7 @@ async def run_client():
             if outputs:
                 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
                 ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                for i, url in enumerate(outputs):
+                for _i, url in enumerate(outputs):
                     ext = Path(url.split("?")[0]).suffix or ".jpeg"
                     img_path = OUTPUT_DIR / f"solana_{ts}{ext}"
                     img_resp = await http_client.get(url)

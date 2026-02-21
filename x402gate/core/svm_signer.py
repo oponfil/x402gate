@@ -83,12 +83,8 @@ class SolanaSigner:
         # Detect versioned vs legacy transaction
         is_versioned = self._is_versioned_transaction(tx_bytes)
 
-        if is_versioned:
-            # Versioned (MessageV0): prepend 0x80 version byte before signing
-            msg_to_sign = bytes([0x80]) + bytes(message)
-        else:
-            # Legacy: sign message bytes directly
-            msg_to_sign = bytes(message)
+        # Versioned (MessageV0): prepend 0x80; Legacy: sign directly
+        msg_to_sign = bytes([0x80]) + bytes(message) if is_versioned else bytes(message)
 
         sig = self._keypair.sign_message(msg_to_sign)
 

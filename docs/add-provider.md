@@ -1,6 +1,6 @@
 # Adding a New Provider
 
-x402gate supports multiple AI service providers through a modular plugin system. This guide walks you through adding a new one.
+x402gate supports multiple AI service providers through a modular plugin system. Routes are registered automatically from `config.yaml` at startup — no manual route definitions needed.
 
 ## Overview
 
@@ -61,30 +61,23 @@ class YourProvider(BaseProvider):
         )
 ```
 
-### 2. Register in the App
+### 2. Register in the Provider Registry
 
-Add your provider to `x402gate/app.py` in the `lifespan` function:
+Add your provider class to `PROVIDER_REGISTRY` in `x402gate/app.py`:
 
 ```python
 from x402gate.providers.your_provider import YourProvider
 
-# In lifespan():
-if name == "your_provider":
-    provider = YourProvider(config=provider_config)
-    providers[name] = provider
+PROVIDER_REGISTRY: dict[str, type[BaseProvider]] = {
+    "wavespeed": WaveSpeedProvider,
+    "openrouter": OpenRouterProvider,
+    "your_provider": YourProvider,  # ← add this line
+}
 ```
 
-### 3. Add a Route
+The route `POST /v1/your_provider/{path}` is registered automatically from config at startup.
 
-Add a catch-all route in `x402gate/app.py`:
-
-```python
-@app.post("/v1/your_provider/{path:path}")
-async def your_provider_proxy(path: str, request: Request) -> Any:
-    return await _handle_proxy_request("your_provider", path, request)
-```
-
-### 4. Add Configuration
+### 3. Add Configuration
 
 Add the provider to `config.yaml`:
 
@@ -98,7 +91,7 @@ providers:
     poll_timeout: 300
 ```
 
-### 5. Write Tests
+### 4. Write Tests
 
 Create `tests/test_your_provider.py` with mocked API responses.
 

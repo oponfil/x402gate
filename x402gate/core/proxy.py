@@ -37,7 +37,7 @@ async def proxy_request(
     path: str,
     body: dict[str, Any],
     api_key: str,
-    timeout: float = 30.0,
+    request_timeout: float = 30.0,
 ) -> dict[str, Any]:
     """Forward a request body to the provider API as-is.
 
@@ -46,7 +46,7 @@ async def proxy_request(
         path: Request path to append (e.g. wavespeed-ai/flux-dev).
         body: Request body dict, forwarded without modification.
         api_key: Provider API key for Authorization header.
-        timeout: HTTP request timeout in seconds.
+        request_timeout: HTTP request timeout in seconds.
 
     Returns:
         Provider response as a dict.
@@ -56,7 +56,7 @@ async def proxy_request(
     """
     url = f"{base_url.rstrip('/')}/{path.lstrip('/')}"
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(timeout=request_timeout) as client:
         response = await client.post(
             url,
             json=body,
@@ -134,6 +134,7 @@ async def poll_result(
                 elif isinstance(error_msg, str):
                     # Try to extract "Validation errors: [...]" patterns
                     import re
+
                     match = re.search(r"Validation errors: \[(.+?)\]", error_msg)
                     if match:
                         error_msg = match.group(1).strip("'\"")

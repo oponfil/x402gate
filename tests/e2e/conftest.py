@@ -9,10 +9,10 @@ from typing import NamedTuple
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # Environment
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture(scope="session", autouse=True)
 def load_env():
@@ -34,6 +34,7 @@ def load_env():
 # Gateway server
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture(scope="session")
 def gateway_process(load_env):
     """Start the gateway server in a subprocess.
@@ -41,7 +42,7 @@ def gateway_process(load_env):
     Uses a temp file for output instead of a pipe to avoid deadlocks
     on Windows when the pipe buffer fills up (only ~4KB on Windows).
     """
-    log_file = tempfile.NamedTemporaryFile(
+    log_file = tempfile.NamedTemporaryFile(  # noqa: SIM115
         mode="w",
         suffix="_x402gate.log",
         delete=False,
@@ -76,21 +77,21 @@ def gateway_process(load_env):
 # Base (EVM) chain helpers
 # ---------------------------------------------------------------------------
 
+
 class BaseChain:
     """Helper for interacting with Base (EVM) on-chain state."""
 
     def __init__(self):
         from eth_account import Account
         from web3 import Web3
+
         from x402gate.core.config import load_config
 
         cfg = load_config()
         self.base_cfg = cfg.payment.networks["base"]
         self.w3 = Web3(Web3.HTTPProvider(self.base_cfg.rpc_url))
         self.usdc_address = self.base_cfg.token_address
-        self.client_address = Account.from_key(
-            os.environ["BASE_E2ETEST_PRIVATE_KEY"]
-        ).address
+        self.client_address = Account.from_key(os.environ["BASE_E2ETEST_PRIVATE_KEY"]).address
         self.payto_address = self.base_cfg.pay_to
         self._bal_sig = self.w3.keccak(text="balanceOf(address)")[:4]
 
@@ -107,6 +108,7 @@ class BaseChain:
 
 class BalanceSnapshot(NamedTuple):
     """USDC balances at a point in time."""
+
     client_usdc: int
     payto_usdc: int
     payto_eth: int
@@ -114,9 +116,10 @@ class BalanceSnapshot(NamedTuple):
 
 class BalanceDiff(NamedTuple):
     """Balance changes between two snapshots."""
-    client_paid: int      # client_before - client_after  (positive = paid)
-    payto_received: int   # payto_after - payto_before    (positive = received)
-    gas_spent: int        # payto_eth_before - payto_eth_after
+
+    client_paid: int  # client_before - client_after  (positive = paid)
+    payto_received: int  # payto_after - payto_before    (positive = received)
+    gas_spent: int  # payto_eth_before - payto_eth_after
 
 
 @pytest.fixture

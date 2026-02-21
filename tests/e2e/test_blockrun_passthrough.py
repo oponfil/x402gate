@@ -65,7 +65,9 @@ async def test_blockrun_live_search(gateway_process):
             b64 = www.split("=", 1)[1].strip('"')
             payment_data = json.loads(base64.b64decode(b64))
 
-        base_accepts = [a for a in payment_data.get("accepts", []) if "eip155:8453" in a.get("network", "")]
+        base_accepts = [
+            a for a in payment_data.get("accepts", []) if "eip155:8453" in a.get("network", "")
+        ]
         assert base_accepts, "No Base payment option"
         payment_data["accepts"] = base_accepts
 
@@ -93,12 +95,14 @@ async def test_blockrun_live_search(gateway_process):
     content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
     usage = result.get("usage", {})
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     # Sanitize for Windows cp1252 terminal
     safe_content = content.encode("ascii", errors="replace").decode("ascii")
     print(f"LIVE SEARCH RESPONSE:\n\n{safe_content}")
-    print(f"{'='*60}")
-    print(f"Tokens: prompt={usage.get('prompt_tokens')}, "
-          f"completion={usage.get('completion_tokens')}, "
-          f"total={usage.get('total_tokens')}")
+    print(f"{'=' * 60}")
+    print(
+        f"Tokens: prompt={usage.get('prompt_tokens')}, "
+        f"completion={usage.get('completion_tokens')}, "
+        f"total={usage.get('total_tokens')}"
+    )
     print(f"Paid: ${amount / 1e6:.6f} USDC")

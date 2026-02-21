@@ -86,8 +86,7 @@ async def run_client():
         payment_required = PaymentRequired.model_validate(payment_data)
 
         base_accepts = [
-            a for a in payment_required.accepts
-            if "eip155:8453" in getattr(a, "network", "")
+            a for a in payment_required.accepts if "eip155:8453" in getattr(a, "network", "")
         ]
         if not base_accepts:
             logger.error("No Base payment option in 402 response")
@@ -119,10 +118,12 @@ async def run_client():
 
         logger.info("Web Search Response:\n%s", content)
         logger.info("Model: %s", data.get("model", "?"))
-        logger.info("Tokens: prompt=%s, completion=%s, total=%s",
-                     usage.get("prompt_tokens"),
-                     usage.get("completion_tokens"),
-                     usage.get("total_tokens"))
+        logger.info(
+            "Tokens: prompt=%s, completion=%s, total=%s",
+            usage.get("prompt_tokens"),
+            usage.get("completion_tokens"),
+            usage.get("total_tokens"),
+        )
         logger.info("E2E test passed!")
 
 

@@ -19,12 +19,11 @@ import os
 import sys
 
 import httpx
+import yaml
 from eth_account import Account
 from x402 import PaymentRequired, x402Client
 from x402.mechanisms.evm.exact.client import ExactEvmScheme
 from x402.mechanisms.evm.signers import EthAccountSigner
-
-import yaml
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -105,8 +104,7 @@ async def run_client():
         logger.info("x402 version: %s", payment_data.get("x402Version"))
 
         base_accepts = [
-            a for a in payment_data.get("accepts", [])
-            if "eip155:8453" in a.get("network", "")
+            a for a in payment_data.get("accepts", []) if "eip155:8453" in a.get("network", "")
         ]
         if not base_accepts:
             logger.error("No Base (EVM) payment option: %s", payment_data)
@@ -131,6 +129,7 @@ async def run_client():
         except Exception as e:
             logger.error("Failed to sign payment: %s", e)
             import traceback
+
             traceback.print_exc()
             sys.exit(1)
 
@@ -149,9 +148,12 @@ async def run_client():
             usage = result.get("usage", {})
             logger.info("Success!")
             logger.info("Response: %s", content)
-            logger.info("Tokens: prompt=%s, completion=%s, total=%s",
-                        usage.get("prompt_tokens"), usage.get("completion_tokens"),
-                        usage.get("total_tokens"))
+            logger.info(
+                "Tokens: prompt=%s, completion=%s, total=%s",
+                usage.get("prompt_tokens"),
+                usage.get("completion_tokens"),
+                usage.get("total_tokens"),
+            )
             if "cost" in usage:
                 logger.info("Cost: $%.6f", usage["cost"])
         else:

@@ -86,8 +86,7 @@ async def run_client():
 
         # Filter to EVM (Base) only
         evm_accepts = [
-            a for a in payment_data.get("accepts", [])
-            if "eip155:" in a.get("network", "")
+            a for a in payment_data.get("accepts", []) if "eip155:" in a.get("network", "")
         ]
         if not evm_accepts:
             logger.error("No EVM payment option in 402 response")
@@ -100,6 +99,7 @@ async def run_client():
         logger.info("Signing payment...")
         payment_payload = await x402_client.create_payment_payload(payment_required)
         import base64
+
         signature = base64.b64encode(
             payment_payload.model_dump_json(by_alias=True).encode()
         ).decode()

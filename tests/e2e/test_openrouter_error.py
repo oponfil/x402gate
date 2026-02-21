@@ -14,7 +14,8 @@ from tests.e2e.conftest import run_e2e_client
 @pytest.mark.asyncio
 async def test_error_no_settlement(gateway_process, base_chain):
     """Provider error should NOT settle payment — client keeps USDC."""
-    if not os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENROUTER_API_KEY") == "placeholder":
+    or_key = os.environ.get("OPENROUTER_API_KEY")
+    if not or_key or or_key == "placeholder":
         pytest.skip("OPENROUTER_API_KEY not set")
 
     diff = run_e2e_client(

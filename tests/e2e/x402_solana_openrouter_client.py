@@ -86,8 +86,7 @@ async def run_client():
 
         # 2. Filter to Solana only and sign payment
         solana_accepts = [
-            a for a in payment_data.get("accepts", [])
-            if "solana:" in a.get("network", "")
+            a for a in payment_data.get("accepts", []) if "solana:" in a.get("network", "")
         ]
         if not solana_accepts:
             logger.error("No Solana payment option in 402 response")
@@ -120,13 +119,15 @@ async def run_client():
         content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
         usage = data.get("usage", {})
 
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"OPENROUTER RESPONSE:\n\n{content}")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         print(f"Model: {data.get('model', '?')}")
-        print(f"Tokens: prompt={usage.get('prompt_tokens')}, "
-              f"completion={usage.get('completion_tokens')}, "
-              f"total={usage.get('total_tokens')}")
+        print(
+            f"Tokens: prompt={usage.get('prompt_tokens')}, "
+            f"completion={usage.get('completion_tokens')}, "
+            f"total={usage.get('total_tokens')}"
+        )
         logger.info("E2E test passed!")
 
 
