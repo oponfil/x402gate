@@ -8,9 +8,9 @@ x402gate sits between your AI agent and AI service providers, adding [x402](http
 
 | Provider | Type | What | Endpoint |
 |----------|------|------|----------|
-| [WaveSpeed AI](https://wavespeed.ai) | Managed | Image/video generation | `/v1/wavespeed/...` |
-| [BlockRun](https://blockrun.ai) | Passthrough | 40+ LLMs (GPT, Claude, Gemini…) | `/v1/blockrun/...` |
 | [OpenRouter](https://openrouter.ai) | Managed | 300+ LLMs (GPT, Claude, Gemini, Llama…) | `/v1/openrouter/...` |
+| [WaveSpeed AI](https://wavespeed.ai) | Managed | 60+ image/video models (Flux, Wan, Kling, Sora…) | `/v1/wavespeed/...` |
+| [BlockRun](https://blockrun.ai) | Passthrough | 40+ LLMs (GPT, Claude, Gemini…) | `/v1/blockrun/...` |
 
 ## How It Works
 
@@ -22,7 +22,7 @@ Client                    x402gate                  WaveSpeed AI
   ├─ POST /v1/wavespeed/... ─►                          │
   │                          ├─ GET price ──────────────►│
   │                          │◄─ $0.005 ────────────────┤
-  │◄─── 402 ($0.00625) ─────┤  total = provider + 5% + $0.001 gas
+  │◄─── 402 ($0.00620) ─────┤  total = provider + 4% + $0.001 gas
   │                          │                          │
   ├─ POST + PAYMENT-SIGNATURE►                          │
   │                          ├─ verify (on-chain)        │
@@ -66,16 +66,16 @@ After each settled payment, the gateway logs a financial summary with both estim
 ```
 +------------------- Transaction Summary -------------------+
 |  Network:                   eip155:8453                    |
-|  Revenue (client paid):     $0.003591 USDC                 |
-|  Estimated cost:            $0.002468 USDC                 |
-|  Provider cost:            -$0.002471 USDC                 |
-|  Commission (5%):           $0.000124 USDC                 |
+|  Revenue (client paid):     $0.002351 USDC                 |
+|  Estimated cost:            $0.001286 USDC                 |
+|  Provider cost:            -$0.001159 USDC                 |
+|  Commission (4%):           $0.000046 USDC                 |
 |  Gas surcharge:             $0.001000 USDC                 |
-|  Gas cost:                 -$0.001941 (0.0000009824 ETH)   |
+|  Gas cost:                 -$0.001011 (0.0000005147 ETH)   |
 |  --------------------------------------------------------- |
-|  Net profit:               -$0.000821 USDC                 |
-|  Generation time:           12.3s                          |
-|  Client wait time:          12.3s                          |
+|  Net profit:                $0.000181 USDC                 |
+|  Generation time:           5.8s                           |
+|  Client wait time:          8.0s                           |
 +-----------------------------------------------------------+
 ```
 
@@ -117,12 +117,12 @@ curl https://your-gateway/
 
 ## Supported Networks
 
-| Network | Chain ID | Token | Gas Token |
-|---------|----------|-------|-----------|
-| **Base** (EVM) | `eip155:8453` | USDC | ETH |
-| **Solana** (SVM) | `solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp` | USDC | SOL |
+| Network | Chain ID | Token | Gas Token | Payment Overhead |
+|---------|----------|-------|-----------|-----------------|
+| **Base** (EVM) | `eip155:8453` | USDC | ETH | ~2.4s |
+| **Solana** (SVM) | `solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp` | USDC | SOL | ~0.4s |
 
-Both networks are offered simultaneously — the client chooses which to pay on.
+Both networks are offered simultaneously — the client chooses which to pay on. Payment overhead is the additional latency added by on-chain verification and settlement (on top of the AI provider's generation time).
 
 ## Quick Start
 
@@ -186,7 +186,7 @@ All settings are in `config.yaml`. Secrets use `${ENV_VAR}` interpolation:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `gateway.commission` | `0.05` | Markup rate (5%) added to provider price |
+| `gateway.commission` | `0.04` | Markup rate (4%) added to provider price |
 | `gateway.gas_surcharge` | `0.001` | Fixed gas surcharge ($0.001) added on top of commission |
 | `gateway.default_max_tokens` | `1024` | Default `max_tokens` when client omits it (for token-based providers) |
 | `gateway.price_cache_ttl` | `60` | Price cache TTL in seconds |
@@ -214,6 +214,7 @@ Individual tests:
 | `test_base_wavespeed` | WaveSpeed | Base | Image generation |
 | `test_base_wavespeed_t2v` | WaveSpeed | Base | Video generation |
 | `test_base_openrouter` | OpenRouter | Base | LLM chat |
+| `test_base_openrouter_websearch` | OpenRouter | Base | LLM chat + web search |
 | `test_solana_openrouter` | OpenRouter | Solana | LLM chat |
 | `test_solana_wavespeed` | WaveSpeed | Solana | Image generation |
 | `test_blockrun_passthrough` | BlockRun | Base | Passthrough proxy |

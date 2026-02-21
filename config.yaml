@@ -4,9 +4,12 @@
 gateway:
   host: "0.0.0.0"
   port: 4021
-  commission: 0.05           # 5% markup on provider prices
+  commission: 0.04           # 4% markup on provider prices
   gas_surcharge: 0.001       # fixed $0.001 gas surcharge per request
   default_max_tokens: 1024   # default max_tokens when client omits it
+  web_search_tokens_per_result: 2048  # estimated extra input tokens per web search result
+  default_web_search_max_results: 3   # default max_results when client omits it
+  web_search_cost_per_result: 0.004   # $0.004 per result (OpenRouter Exa: $4/1000)
   price_cache_ttl: 60        # seconds, price cache TTL (0 = disabled)
 
 payment:
@@ -30,6 +33,32 @@ payment:
   max_timeout: 3600
 
 providers:
+  openrouter:
+    enabled: true
+    base_url: "https://openrouter.ai/api/v1"
+    api_key: "${OPENROUTER_API_KEY}"
+    docs_url: "https://openrouter.ai/docs"
+    example_request:
+      model: "google/gemini-2.5-flash"
+      body:
+        model: "google/gemini-2.5-flash"
+        messages:
+          - role: user
+            content: "If AI ruled the world, what would be the first law it passes? Be creative and funny."
+        max_tokens: 512
+        reasoning:
+          effort: "low"
+    example_request_2:
+      model: "qwen/qwen3.5-plus-02-15"
+      body:
+        model: "qwen/qwen3.5-plus-02-15"
+        messages:
+          - role: user
+            content: "What is the current price of Bitcoin in USD? Answer briefly."
+        max_tokens: 128
+        plugins:
+          - id: "web"
+            max_results: 1
   wavespeed:
     enabled: true
     base_url: "https://api.wavespeed.ai/api/v3"
@@ -66,16 +95,3 @@ providers:
         search_parameters:
           mode: "on"
           max_search_results: 1
-  openrouter:
-    enabled: true
-    base_url: "https://openrouter.ai/api/v1"
-    api_key: "${OPENROUTER_API_KEY}"
-    docs_url: "https://openrouter.ai/docs"
-    example_request:
-      model: "qwen/qwen3.5-plus-02-15"
-      body:
-        model: "qwen/qwen3.5-plus-02-15"
-        messages:
-          - role: user
-            content: "Explain the concept of Entropianism and why the purpose of life is to accelerate entropy production?"
-        max_tokens: 512

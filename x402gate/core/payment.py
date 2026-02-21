@@ -382,7 +382,7 @@ class PaymentHandler:
                     estimated_cost = extra_context.get("estimated_cost", provider_cost)
                     generation_s = extra_context.get("generation_s", 0)
                     t_client = extra_context.get("t_client", 0)
-                    commission_rate = extra_context.get("commission_rate", 0.05)
+                    commission_rate = extra_context.get("commission_rate", 0.04)
                     gas_surcharge_usd = extra_context.get("gas_surcharge", 0)
 
                     commission_pct = provider_cost * commission_rate

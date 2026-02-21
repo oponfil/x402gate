@@ -10,7 +10,7 @@ x402gate is configured via `config.yaml` in the project root. Secrets are stored
 |---|---|---|---|
 | `host` | string | `"0.0.0.0"` | Server bind address |
 | `port` | int | `4021` | Server port |
-| `commission` | float | `0.05` | Markup rate on provider prices (0.05 = 5%) |
+| `commission` | float | `0.04` | Markup rate on provider prices (0.04 = 4%) |
 | `gas_surcharge` | float | `0.001` | Fixed gas surcharge ($0.001) added per request |
 | `default_max_tokens` | int | `1024` | Default `max_tokens` for token-based providers when client omits it |
 | `price_cache_ttl` | int | `60` | Price cache TTL in seconds. `0` = disabled |

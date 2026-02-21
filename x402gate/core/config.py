@@ -53,9 +53,12 @@ class GatewayConfig(BaseModel):
 
     host: str = "0.0.0.0"
     port: int = 4021
-    commission: float = 0.05
+    commission: float = 0.04
     gas_surcharge: float = 0.001  # fixed $0.001 gas surcharge per request
     default_max_tokens: int = 1024  # default max_tokens when client omits it
+    web_search_tokens_per_result: int = 2048  # estimated extra input tokens per web search result
+    default_web_search_max_results: int = 3  # default max_results when client omits it
+    web_search_cost_per_result: float = 0.004  # $0.004 per search result (OpenRouter Exa: $4/1000)
     price_cache_ttl: int = 60
 
 

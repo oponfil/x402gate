@@ -64,7 +64,7 @@ def apply_commission(
 
     Args:
         base_price: The provider's base cost in USD.
-        commission_rate: Commission as a decimal (e.g., 0.05 for 5%).
+        commission_rate: Commission as a decimal (e.g., 0.04 for 4%).
         gas_surcharge: Fixed gas surcharge in USD always added on top (e.g., 0.001).
 
     Returns:

@@ -166,12 +166,13 @@ def run_e2e_client(
     print(f"PayTo  USDC: {before.payto_usdc / 1e6:.6f}")
 
     # --- Run client ---
-    env = {**os.environ, "GATEWAY_URL": "http://localhost:4022"}
+    env = {**os.environ, "GATEWAY_URL": "http://localhost:4022", "PYTHONIOENCODING": "utf-8"}
     result = subprocess.run(
         ["python", script],
         env=env,
         capture_output=True,
         text=True,
+        encoding="utf-8",
     )
 
     print(result.stdout)

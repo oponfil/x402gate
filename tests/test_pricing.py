@@ -9,9 +9,9 @@ class TestApplyCommission:
     """Tests for the apply_commission function."""
 
     def test_standard_commission(self):
-        """5% commission on $0.003 = $0.003150."""
-        result = apply_commission(Decimal("0.003"), 0.05)
-        assert result == Decimal("0.003150")
+        """4% commission on $0.003 = $0.003120."""
+        result = apply_commission(Decimal("0.003"), 0.04)
+        assert result == Decimal("0.003120")
 
     def test_zero_commission(self):
         """0% commission returns the original price."""
@@ -25,18 +25,18 @@ class TestApplyCommission:
 
     def test_rounds_up_to_6_decimals(self):
         """Commission result is rounded UP to 6 decimal places (USDC precision)."""
-        # 0.007 * 1.05 = 0.00735 -> rounds to 0.007350
-        result = apply_commission(Decimal("0.007"), 0.05)
-        assert result == Decimal("0.007350")
+        # 0.007 * 1.04 = 0.00728 -> rounds to 0.007280
+        result = apply_commission(Decimal("0.007"), 0.04)
+        assert result == Decimal("0.007280")
 
     def test_tiny_price(self):
         """Very small prices are rounded up, never to zero."""
-        result = apply_commission(Decimal("0.0000001"), 0.05)
+        result = apply_commission(Decimal("0.0000001"), 0.04)
         assert result > Decimal("0")
 
     def test_returns_decimal(self):
         """Result is always a Decimal."""
-        result = apply_commission(Decimal("1.0"), 0.05)
+        result = apply_commission(Decimal("1.0"), 0.04)
         assert isinstance(result, Decimal)
 
 

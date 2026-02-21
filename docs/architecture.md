@@ -30,7 +30,7 @@ Client → POST /v1/wavespeed/{model}
            ↓
    x402gate → fetch price from WaveSpeed Pricing API
            ↓
-   x402gate → apply 5% commission
+   x402gate → apply 4% commission
            ↓
    Client ← 402 Payment Required (price: $0.00315)
 ```

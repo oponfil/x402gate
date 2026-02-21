@@ -92,6 +92,9 @@ async def lifespan(app: FastAPI):
             kwargs = {}
             if name == "openrouter":
                 kwargs["default_max_tokens"] = config.gateway.default_max_tokens
+                kwargs["web_search_tokens_per_result"] = config.gateway.web_search_tokens_per_result
+                kwargs["default_web_search_max_results"] = config.gateway.default_web_search_max_results
+                kwargs["web_search_cost_per_result"] = config.gateway.web_search_cost_per_result
             provider = PROVIDER_REGISTRY[name](config=provider_config, **kwargs)
             providers[name] = provider
             logger.info("Provider '%s' registered (managed)", name)
@@ -373,7 +376,7 @@ async def _handle_managed_request(
     Flow:
     1. Parse request body
     2. Fetch dynamic price from provider (with cache)
-    3. Apply commission (5% + gas fee)
+    3. Apply commission (4% + gas fee)
     4. If no PAYMENT-SIGNATURE header → return 402
     5. Verify payment via facilitator
     6. Forward request to provider as-is
@@ -387,6 +390,8 @@ async def _handle_managed_request(
             status_code=503,
             content={"error": f"{provider_name} provider is not configured"},
         )
+
+    t_start = time.monotonic()  # Total client wait time starts here
 
     # 1. Parse request body
     try:
@@ -420,7 +425,6 @@ async def _handle_managed_request(
     if not is_valid:
         return _error_response(402, "Payment verification failed")
 
-    t_start = time.monotonic()  # Start timing after verification
 
     # 6. Forward request to provider
     t_gen_start = time.monotonic()

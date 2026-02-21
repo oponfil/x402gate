@@ -1,13 +1,10 @@
-"""E2E test client for x402gate → OpenRouter.
+"""E2E test client for x402gate → OpenRouter with web search plugin.
 
-Simulates a user:
-1. Sends an LLM chat request to the gateway.
-2. Receives a 402 Payment Required response.
-3. Signs the x402 payment (Exact EVM Scheme, Base).
-4. Resends with payment signature → gets LLM response.
+Same flow as x402_openrouter_test_client.py, but loads example_request_2
+which includes the web search plugin for real-time data.
 
 Usage:
-    python tests/e2e/x402_openrouter_test_client.py
+    python tests/e2e/x402_openrouter_websearch_client.py
 """
 
 import asyncio
@@ -25,21 +22,21 @@ from x402.mechanisms.evm.exact import ExactEvmScheme
 from x402.mechanisms.evm.signers import EthAccountSigner
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("x402-openrouter-client")
+logger = logging.getLogger("x402-openrouter-websearch")
 
 CONFIG_PATH = Path(__file__).parent.parent.parent / "config.yaml"
 
 
 def _load_example_request() -> tuple[str, dict]:
-    """Load model and body from config.yaml's openrouter example_request."""
+    """Load model and body from config.yaml's openrouter example_request_2."""
     with open(CONFIG_PATH) as f:
         cfg = yaml.safe_load(f)
-    ex = cfg["providers"]["openrouter"]["example_request"]
+    ex = cfg["providers"]["openrouter"]["example_request_2"]
     return ex["model"], dict(ex["body"])
 
 
 async def run_client():
-    """Run the E2E client test for OpenRouter."""
+    """Run the E2E client test for OpenRouter with web search."""
     gateway_url = os.environ.get("GATEWAY_URL", "http://localhost:4021")
     private_key = os.environ.get("BASE_E2ETEST_PRIVATE_KEY")
 
@@ -49,7 +46,8 @@ async def run_client():
 
     model, body = _load_example_request()
     logger.info("Model: %s", model)
-    logger.info("Messages: %s", body.get("messages", []))
+    logger.info("Body: %s", body)
+    logger.info("Web search: enabled (plugins: web)")
 
     # Initialize x402 client with EVM signer
     account = Account.from_key(private_key)
@@ -62,7 +60,7 @@ async def run_client():
 
     async with httpx.AsyncClient() as http_client:
         # 1. Request without payment → expect 402
-        logger.info("Sending initial request to OpenRouter via gateway...")
+        logger.info("Sending initial request...")
         response = await http_client.post(
             f"{gateway_url}/v1/openrouter/chat/completions",
             json=body,
@@ -76,7 +74,6 @@ async def run_client():
         logger.info("Got 402 Payment Required")
         payment_data = response.json()
 
-        # Log price info
         for accept in payment_data.get("accepts", []):
             logger.info(
                 "Payment option: %s — $%s",
@@ -84,11 +81,10 @@ async def run_client():
                 int(accept.get("amount", 0)) / 1e6,
             )
 
-        # 2. Sign payment
+        # 2. Sign payment (Base only)
         logger.info("Signing payment...")
         payment_required = PaymentRequired.model_validate(payment_data)
 
-        # Filter to Base only
         base_accepts = [
             a for a in payment_required.accepts
             if "eip155:8453" in getattr(a, "network", "")
@@ -103,8 +99,8 @@ async def run_client():
             payment_payload.model_dump_json(by_alias=True).encode()
         ).decode()
 
-        # 3. Retry with payment → expect 200 with LLM response
-        logger.info("Retrying with payment signature...")
+        # 3. Retry with payment → expect 200 with web-sourced response
+        logger.info("Retrying with payment (web search enabled)...")
         response = await http_client.post(
             f"{gateway_url}/v1/openrouter/chat/completions",
             json=body,
@@ -121,7 +117,7 @@ async def run_client():
         content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
         usage = data.get("usage", {})
 
-        logger.info("Response:\n%s", content)
+        logger.info("Web Search Response:\n%s", content)
         logger.info("Model: %s", data.get("model", "?"))
         logger.info("Tokens: prompt=%s, completion=%s, total=%s",
                      usage.get("prompt_tokens"),

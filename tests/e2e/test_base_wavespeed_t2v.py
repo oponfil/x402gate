@@ -19,7 +19,7 @@ async def test_base_wavespeed_t2v(gateway_process, base_chain):
         label="Base -> WaveSpeed T2V",
     )
 
-    # Wan 2.2 t2v-480p-ultra-fast costs $0.05, with 5% commission + gas surcharge -> ~$0.0535
+    # Wan 2.2 t2v-480p-ultra-fast costs $0.05, with 4% commission + gas surcharge -> ~$0.053
     assert diff.client_paid > 0, f"Client should pay USDC, paid {diff.client_paid}"
     assert diff.payto_received > 0, f"PayTo should receive USDC, got {diff.payto_received}"
     assert diff.client_paid >= 50_000, (

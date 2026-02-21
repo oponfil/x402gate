@@ -25,7 +25,7 @@ def config_file(tmp_path):
 gateway:
   host: "127.0.0.1"
   port: 4021
-  commission: 0.05
+  commission: 0.04
   gas_surcharge: 0.001
   price_cache_ttl: 0
 
@@ -115,9 +115,9 @@ class TestWaveSpeedProxy:
         body = response.json()
         assert "accepts" in body
         assert body["accepts"][0]["scheme"] == "exact"
-        # 5% of $0.003 = $0.00015 + gas_surcharge $0.001
-        # Price: $0.003 base + 5% ($0.00015) + $0.001 gas = $0.004150
-        assert body["accepts"][0]["price"] == "$0.004150"
+        # 4% of $0.003 = $0.00012 + gas_surcharge $0.001
+        # Price: $0.003 base + 4% ($0.00012) + $0.001 gas = $0.004120
+        assert body["accepts"][0]["price"] == "$0.004120"
 
     @respx.mock
     def test_invalid_json_returns_400(self, client):

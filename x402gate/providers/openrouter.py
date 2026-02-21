@@ -31,10 +31,21 @@ class OpenRouterProvider(BaseProvider):
     upfront using the model's published pricing and the request's max_tokens.
     """
 
-    def __init__(self, config: ProviderConfig, *, default_max_tokens: int = 1024) -> None:
+    def __init__(
+        self,
+        config: ProviderConfig,
+        *,
+        default_max_tokens: int = 1024,
+        web_search_tokens_per_result: int = 2048,
+        default_web_search_max_results: int = 3,
+        web_search_cost_per_result: float = 0.004,
+    ) -> None:
         super().__init__(name="openrouter", config=config)
         self._models_cache: dict[str, dict[str, Any]] = {}
         self._default_max_tokens = default_max_tokens
+        self._web_search_tokens_per_result = web_search_tokens_per_result
+        self._default_web_search_max_results = default_web_search_max_results
+        self._web_search_cost_per_result = Decimal(str(web_search_cost_per_result))
 
     async def _fetch_model_info(self, model_id: str) -> dict[str, Any]:
         """Fetch model info (including pricing) from OpenRouter Models API.
@@ -140,11 +151,25 @@ class OpenRouterProvider(BaseProvider):
         )
         estimated_input_tokens = max(total_chars // _CHARS_PER_TOKEN, 1)
 
+        # Web search plugins inject search results into the prompt,
+        # adding significant extra input tokens not visible in messages.
+        # They also have a fixed cost per result (OpenRouter Exa: $4/1000).
+        web_search_cost = Decimal(0)
+        plugins = inputs.get("plugins", [])
+        for plugin in plugins:
+            if isinstance(plugin, dict) and plugin.get("id") == "web":
+                max_results = plugin.get("max_results", self._default_web_search_max_results)
+                estimated_input_tokens += max_results * self._web_search_tokens_per_result
+                web_search_cost = Decimal(max_results) * self._web_search_cost_per_result
+
         max_tokens = inputs.get("max_tokens", self._default_max_tokens)
 
+        # Reasoning tokens are a subset of completion tokens and
+        # capped by max_tokens, so the estimate is simply:
         estimated_cost = (
             Decimal(estimated_input_tokens) * prompt_price_dec
             + Decimal(max_tokens) * completion_price_dec
+            + web_search_cost
         )
 
         # Ensure a minimum cost floor (some models are very cheap)
@@ -177,6 +202,35 @@ class OpenRouterProvider(BaseProvider):
         Raises:
             ProviderError: If the request fails.
         """
+        # Always ensure max_tokens is set so OpenRouter doesn't fall
+        # back to a large provider default (which would cost more
+        # than our estimate).
+        if "max_tokens" not in body:
+            body = {**body, "max_tokens": self._default_max_tokens}
+            logger.info(
+                "Injected max_tokens=%d (default)",
+                self._default_max_tokens,
+            )
+
+        # Inject default max_results into web search plugins so
+        # actual usage matches our cost estimate.
+        plugins = body.get("plugins", [])
+        patched_plugins = []
+        plugins_changed = False
+        for plugin in plugins:
+            if (isinstance(plugin, dict)
+                    and plugin.get("id") == "web"
+                    and "max_results" not in plugin):
+                plugin = {**plugin, "max_results": self._default_web_search_max_results}
+                plugins_changed = True
+                logger.info(
+                    "Injected plugins.web.max_results=%d (default)",
+                    self._default_web_search_max_results,
+                )
+            patched_plugins.append(plugin)
+        if plugins_changed:
+            body = {**body, "plugins": patched_plugins}
+
         url = f"{self._config.base_url.rstrip('/')}/{path.lstrip('/')}"
 
         try:
@@ -255,9 +309,18 @@ class OpenRouterProvider(BaseProvider):
         if prompt_price is None or completion_price is None:
             return None
 
+        # Fixed web search cost per result (OpenRouter Exa: $4/1000)
+        web_search_cost = Decimal(0)
+        plugins = body.get("plugins", [])
+        for plugin in plugins:
+            if isinstance(plugin, dict) and plugin.get("id") == "web":
+                max_results = plugin.get("max_results", self._default_web_search_max_results)
+                web_search_cost = Decimal(max_results) * self._web_search_cost_per_result
+
         actual_cost = (
             Decimal(prompt_tokens) * Decimal(str(prompt_price))
             + Decimal(completion_tokens) * Decimal(str(completion_price))
+            + web_search_cost
         )
 
         if actual_cost < Decimal("0.000001"):

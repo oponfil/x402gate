@@ -94,7 +94,9 @@ async def test_blockrun_live_search(gateway_process):
     usage = result.get("usage", {})
 
     print(f"\n{'='*60}")
-    print(f"LIVE SEARCH RESPONSE:\n\n{content}")
+    # Sanitize for Windows cp1252 terminal
+    safe_content = content.encode("ascii", errors="replace").decode("ascii")
+    print(f"LIVE SEARCH RESPONSE:\n\n{safe_content}")
     print(f"{'='*60}")
     print(f"Tokens: prompt={usage.get('prompt_tokens')}, "
           f"completion={usage.get('completion_tokens')}, "
