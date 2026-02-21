@@ -3,15 +3,23 @@
 Implements the FacilitatorSvmSigner protocol from x402 SDK,
 handling transaction signing, simulation, sending, and confirmation
 on Solana mainnet.
+
+Uses AsyncClient on a dedicated background event loop for non-blocking,
+concurrent RPC calls.  The protocol interface stays synchronous because
+the x402 SDK calls these methods from sync code; coroutines are submitted
+via ``asyncio.run_coroutine_threadsafe`` and block the caller thread only
+until the result is ready — without preventing other coroutines from
+running concurrently on the same loop.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
-import time
+import threading
 
-from solana.rpc.api import Client as SolanaClient
+from solana.rpc.async_api import AsyncClient
 from solders.keypair import Keypair
 from solders.signature import Signature
 from solders.transaction import VersionedTransaction
@@ -24,6 +32,11 @@ class SolanaSigner:
 
     Implements the FacilitatorSvmSigner protocol required by
     x402's ExactSvmScheme.
+
+    A dedicated background thread runs a persistent event loop with a
+    single ``AsyncClient``.  All RPC calls are submitted as coroutines
+    via ``run_coroutine_threadsafe``, allowing multiple verify/settle
+    operations to proceed **concurrently** without blocking each other.
     """
 
     def __init__(self, private_key: str, rpc_url: str) -> None:
@@ -35,11 +48,39 @@ class SolanaSigner:
         """
         self._keypair = Keypair.from_base58_string(private_key)
         self._rpc_url = rpc_url
-        self._client = SolanaClient(rpc_url)
+
+        # Persistent background event loop + async client
+        self._loop = asyncio.new_event_loop()
+        self._client = AsyncClient(rpc_url)
+        self._thread = threading.Thread(
+            target=self._loop.run_forever,
+            daemon=True,
+            name="solana-rpc-loop",
+        )
+        self._thread.start()
+
         logger.info(
             "Solana facilitator initialized (address=%s)",
             str(self._keypair.pubkey()),
         )
+
+    # ------------------------------------------------------------------
+    # Async helper
+    # ------------------------------------------------------------------
+
+    def _run_async(self, coro, *, timeout: float = 90):  # noqa: ANN001
+        """Submit a coroutine to the background loop and wait for the result.
+
+        Multiple callers (from different ``asyncio.to_thread`` workers)
+        can submit coroutines concurrently — the background loop runs
+        them all in parallel via cooperative multitasking.
+        """
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result(timeout=timeout)
+
+    # ------------------------------------------------------------------
+    # Protocol: properties
+    # ------------------------------------------------------------------
 
     @property
     def address(self) -> str:
@@ -49,6 +90,10 @@ class SolanaSigner:
     def get_addresses(self) -> list[str]:
         """Get all fee payer addresses managed by this signer."""
         return [str(self._keypair.pubkey())]
+
+    # ------------------------------------------------------------------
+    # Protocol: sign_transaction  (pure crypto, no RPC)
+    # ------------------------------------------------------------------
 
     def sign_transaction(
         self,
@@ -77,35 +122,27 @@ class SolanaSigner:
         tx_bytes = base64.b64decode(tx_base64)
         tx = VersionedTransaction.from_bytes(tx_bytes)
 
-        # Get the message and existing signatures
         message = tx.message
-
-        # Detect versioned vs legacy transaction
         is_versioned = self._is_versioned_transaction(tx_bytes)
 
-        # Versioned (MessageV0): prepend 0x80; Legacy: sign directly
         msg_to_sign = bytes([0x80]) + bytes(message) if is_versioned else bytes(message)
 
         sig = self._keypair.sign_message(msg_to_sign)
 
-        # Build new signatures list — fee payer is always index 0
         new_sigs = list(tx.signatures)
         new_sigs[0] = sig
 
         signed_tx = VersionedTransaction.populate(message, new_sigs)
-        signed_bytes = bytes(signed_tx)
-        return base64.b64encode(signed_bytes).decode()
+        return base64.b64encode(bytes(signed_tx)).decode()
 
     @staticmethod
     def _is_versioned_transaction(tx_bytes: bytes) -> bool:
-        """Determine if transaction bytes represent a versioned (v0) or legacy transaction.
+        """Determine if tx bytes are versioned (v0) or legacy.
 
-        Versioned transactions have a version byte >= 128 (0x80) at the start
-        of the message portion. Legacy transactions have numRequiredSignatures < 128.
+        Versioned transactions have a version byte >= 128 (0x80) at the
+        start of the message portion.
         """
         offset = 0
-
-        # Read compact u16 for signature count
         first_byte = tx_bytes[offset]
         if first_byte < 0x80:
             num_signatures = first_byte
@@ -114,77 +151,69 @@ class SolanaSigner:
             num_signatures = (first_byte & 0x7F) | ((tx_bytes[offset + 1] & 0x7F) << 7)
             offset += 2
 
-        # Skip signatures (64 bytes each)
         offset += num_signatures * 64
 
-        # First byte of message: >= 128 means versioned, < 128 means legacy
         if offset < len(tx_bytes):
             return tx_bytes[offset] >= 0x80
-
         return False
 
+    # ------------------------------------------------------------------
+    # Protocol: simulate_transaction
+    # ------------------------------------------------------------------
+
     def simulate_transaction(self, tx_base64: str, network: str) -> None:
-        """Simulate a signed transaction to verify it would succeed.
-
-        Args:
-            tx_base64: Base64-encoded fully-signed transaction.
-            network: CAIP-2 network identifier.
-
-        Raises:
-            RuntimeError: If simulation fails.
-        """
+        """Simulate a signed transaction to verify it would succeed."""
         _ = network
+        self._run_async(self._simulate_async(tx_base64))
+
+    async def _simulate_async(self, tx_base64: str) -> None:
         tx_bytes = base64.b64decode(tx_base64)
         tx = VersionedTransaction.from_bytes(tx_bytes)
-
-        result = self._client.simulate_transaction(tx)
+        result = await self._client.simulate_transaction(tx)
         if result.value.err:
             raise RuntimeError(f"Simulation failed: {result.value.err}")
 
+    # ------------------------------------------------------------------
+    # Protocol: send_transaction
+    # ------------------------------------------------------------------
+
     def send_transaction(self, tx_base64: str, network: str) -> str:
-        """Send a signed transaction to the Solana network.
+        """Send a signed transaction to the Solana network."""
+        _ = network
+        return self._run_async(self._send_async(tx_base64))
 
-        Args:
-            tx_base64: Base64-encoded fully-signed transaction.
-            network: CAIP-2 network identifier.
-
-        Returns:
-            Transaction signature (base58-encoded).
-
-        Raises:
-            RuntimeError: If send fails.
-        """
+    async def _send_async(self, tx_base64: str) -> str:
         from solana.rpc.types import TxOpts
 
-        _ = network
         tx_bytes = base64.b64decode(tx_base64)
         tx = VersionedTransaction.from_bytes(tx_bytes)
-
         opts = TxOpts(skip_preflight=False, max_retries=3)
-        result = self._client.send_transaction(tx, opts=opts)
+        result = await self._client.send_transaction(tx, opts=opts)
+
         sig = getattr(result, "value", None)
         if sig:
             logger.info("Transaction sent: %s", sig)
             return str(sig)
         raise RuntimeError(f"Transaction send failed: {result}")
 
+    # ------------------------------------------------------------------
+    # Protocol: confirm_transaction
+    # ------------------------------------------------------------------
+
     def confirm_transaction(self, signature: str, network: str) -> None:
-        """Wait for transaction confirmation on Solana.
-
-        Args:
-            signature: Transaction signature (base58-encoded).
-            network: CAIP-2 network identifier.
-
-        Raises:
-            RuntimeError: If confirmation fails or times out.
-        """
+        """Wait for transaction confirmation on Solana."""
         _ = network
+        self._run_async(self._confirm_async(signature))
+
+    async def _confirm_async(self, signature: str) -> None:
+        import time
+
         sig = Signature.from_string(signature)
-        timeout = 60  # seconds
+        timeout = 60
         start = time.monotonic()
 
         while time.monotonic() - start < timeout:
-            resp = self._client.get_signature_statuses(
+            resp = await self._client.get_signature_statuses(
                 [sig],
                 search_transaction_history=True,
             )
@@ -203,6 +232,42 @@ class SolanaSigner:
                             elapsed,
                         )
                         return
-            time.sleep(2)
+            await asyncio.sleep(2)
 
         raise RuntimeError(f"Transaction {signature} not confirmed within {timeout}s")
+
+    # ------------------------------------------------------------------
+    # Extra: async get_transaction (used by payment.py for gas reporting)
+    # ------------------------------------------------------------------
+
+    async def get_transaction_async(
+        self,
+        tx_sig,  # noqa: ANN001
+        *,
+        commitment: str = "confirmed",
+        max_supported_transaction_version: int = 0,
+    ):
+        """Fetch a confirmed transaction (async, called from payment.py).
+
+        Creates a temporary AsyncClient because this method runs on the
+        main event loop (not the signer's background loop).
+        """
+        async with AsyncClient(self._rpc_url) as client:
+            return await client.get_transaction(
+                tx_sig,
+                commitment=commitment,
+                max_supported_transaction_version=max_supported_transaction_version,
+            )
+
+    # ------------------------------------------------------------------
+    # Cleanup
+    # ------------------------------------------------------------------
+
+    def close(self) -> None:
+        """Shut down the background event loop and client."""
+        import contextlib
+
+        with contextlib.suppress(Exception):
+            asyncio.run_coroutine_threadsafe(self._client.close(), self._loop).result(timeout=5)
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=5)

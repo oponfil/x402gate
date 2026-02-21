@@ -341,12 +341,10 @@ class PaymentHandler:
                         from solders.signature import Signature as SolSignature
 
                         tx_sig = SolSignature.from_string(result.transaction)
-                        tx_resp = await asyncio.to_thread(
-                            lambda: ns.svm_signer._client.get_transaction(
-                                tx_sig,
-                                commitment="confirmed",
-                                max_supported_transaction_version=0,
-                            )
+                        tx_resp = await ns.svm_signer.get_transaction_async(
+                            tx_sig,
+                            commitment="confirmed",
+                            max_supported_transaction_version=0,
                         )
                         fee_lamports = tx_resp.value.transaction.meta.fee
                         gas_cost_native = fee_lamports / 1e9

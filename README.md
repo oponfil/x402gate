@@ -74,7 +74,7 @@ After each settled payment, the gateway logs a financial summary with both estim
 |  --------------------------------------------------------- |
 |  Net profit:                $0.000345 USDC                 |
 |  Generation time:           12.0s                          |
-|  Client wait time:          12.4s                          |
+|  Client wait time:          12.5s                          |
 +-----------------------------------------------------------+
 ```
 
@@ -119,7 +119,7 @@ curl https://x402gate.io/
 | Network | Chain ID | Token | Gas Token | Payment Overhead |
 |---------|----------|-------|-----------|-----------------|
 | **Base** (EVM) | `eip155:8453` | USDC | ETH | ~2.4s |
-| **Solana** (SVM) | `solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp` | USDC | SOL | ~0.4s |
+| **Solana** (SVM) | `solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp` | USDC | SOL | ~0.5s |
 
 Both networks are offered simultaneously — the client chooses which to pay on. Payment overhead is the additional latency added by on-chain verification and settlement (on top of the AI provider's generation time).
 

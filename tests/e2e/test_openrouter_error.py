@@ -12,6 +12,7 @@ from tests.e2e.conftest import run_e2e_client
 
 
 @pytest.mark.asyncio
+@pytest.mark.order("first")
 async def test_error_no_settlement(gateway_process, base_chain):
     """Provider error should NOT settle payment — client keeps USDC."""
     or_key = os.environ.get("OPENROUTER_API_KEY")

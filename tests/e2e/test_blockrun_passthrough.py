@@ -27,6 +27,7 @@ def _load_blockrun_example():
 
 
 @pytest.mark.asyncio
+@pytest.mark.order("last")
 async def test_blockrun_live_search(gateway_process):
     """Pay BlockRun via passthrough, get a response with Live Search data."""
     if not os.environ.get("BASE_E2ETEST_PRIVATE_KEY"):

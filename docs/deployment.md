@@ -2,6 +2,9 @@
 
 x402gate can be deployed using Railway (recommended), Docker, or a traditional VPS.
 
+> [!IMPORTANT]
+> **Single instance only.** x402gate currently stores pending payment settlements in process memory (`asyncio.Task`). Running multiple instances behind a load balancer may cause lost settlements if an instance crashes mid-settlement. Multi-instance support requires adding a persistent task queue (Redis, PostgreSQL, etc.) — planned for a future release.
+
 ## Railway (Recommended)
 
 [Railway](https://railway.app) provides the simplest deployment experience.

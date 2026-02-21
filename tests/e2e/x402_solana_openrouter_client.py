@@ -55,7 +55,14 @@ async def run_client():
     keypair = Keypair.from_base58_string(private_key)
     signer = KeypairSigner(keypair)
     x402_client = x402Client()
-    x402_client.register("solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp", ExactSvmScheme(signer))
+
+    # Use the same Helius RPC URL as the gateway (avoids 403 from public endpoint)
+    rpc_url = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+
+    x402_client.register(
+        "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+        ExactSvmScheme(signer, rpc_url=rpc_url),
+    )
 
     logger.info("Client Address: %s", signer.address)
     logger.info("Gateway URL: %s", gateway_url)
