@@ -37,6 +37,7 @@ providers:
     enabled: true
     base_url: "https://openrouter.ai/api/v1"
     api_key: "${OPENROUTER_API_KEY}"
+    description: "300+ LLMs (GPT, Claude, Gemini, Llama…)"
     docs_url: "https://openrouter.ai/docs"
     example_request:
       model: "google/gemini-2.5-flash"
@@ -63,6 +64,7 @@ providers:
     enabled: true
     base_url: "https://api.wavespeed.ai/api/v3"
     api_key: "${WAVESPEED_API_KEY}"
+    description: "60+ image/video models (Flux, Wan, Kling, Sora…)"
     poll_interval: 1           # seconds, between status polls
     poll_timeout: 300          # seconds, max wait for result (5 min)
     docs_url: "https://wavespeed.ai/docs"
@@ -83,6 +85,7 @@ providers:
     type: passthrough
     enabled: true
     base_url: "https://blockrun.ai/api"
+    description: "40+ LLMs with live web search (GPT, Claude, Gemini…)"
     docs_url: "https://blockrun.ai/docs"
     example_request:
       model: "xai/grok-4-1-fast-reasoning"

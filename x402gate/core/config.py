@@ -99,6 +99,7 @@ class ProviderConfig(BaseModel):
     poll_interval: int = 2
     poll_timeout: int = 300
     docs_url: str = ""  # Link to provider API documentation
+    description: str = ""  # Short description shown on the landing page
     example_request: dict[str, Any] = {}  # Example request: {model, body}
     example_request_2: dict[str, Any] = {}  # Second example: {model, body}
 

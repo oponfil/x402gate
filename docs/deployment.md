@@ -19,7 +19,7 @@ x402gate can be deployed using Railway (recommended), Docker, or a traditional V
 ### Custom Domain
 
 1. Go to **Settings** → **Domains** in Railway
-2. Add your domain (e.g., `api.x402gate.ai`)
+2. Add your domain (e.g., `x402gate.io`)
 3. Configure DNS as instructed by Railway
 
 ### Environment Variables
@@ -77,7 +77,7 @@ docker compose up -d
 
 ```bash
 # Clone and install
-git clone https://github.com/x402gate/x402gate.git
+git clone https://github.com/oponfil/x402gate.git
 cd x402gate
 python -m venv .venv
 source .venv/bin/activate
@@ -123,10 +123,10 @@ sudo systemctl start x402gate
 ```nginx
 server {
     listen 443 ssl;
-    server_name api.x402gate.ai;
+    server_name x402gate.io;
 
-    ssl_certificate /etc/letsencrypt/live/api.x402gate.ai/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/api.x402gate.ai/privkey.pem;
+    ssl_certificate /etc/letsencrypt/live/x402gate.io/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/x402gate.io/privkey.pem;
 
     location / {
         proxy_pass http://127.0.0.1:4021;

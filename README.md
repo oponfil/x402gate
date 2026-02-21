@@ -1,6 +1,6 @@
 # x402gate
 
-🌐 [www.x402gate.io](https://www.x402gate.io/) | **Transparent x402 payment proxy for AI services.**
+🌐 [x402gate.io](https://x402gate.io/) | **Transparent x402 payment proxy for AI services.**
 
 Pay per API call with USDC on **Base** or **Solana** — no accounts, no API keys, no subscriptions.
 
@@ -65,17 +65,16 @@ After each settled payment, the gateway logs a financial summary with both estim
 
 ```
 +------------------- Transaction Summary -------------------+
-|  Network:                   eip155:8453                    |
-|  Revenue (client paid):     $0.002351 USDC                 |
-|  Estimated cost:            $0.001286 USDC                 |
-|  Provider cost:            -$0.001159 USDC                 |
-|  Commission (4%):           $0.000046 USDC                 |
+|  Network:                   solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp |
+|  Revenue (client paid):     $0.006200 USDC                 |
+|  Provider cost:            -$0.005000 USDC                 |
+|  Commission (4%):           $0.000200 USDC                 |
 |  Gas surcharge:             $0.001000 USDC                 |
-|  Gas cost:                 -$0.001011 (0.0000005147 ETH)   |
+|  Gas cost:                 -$0.000855 (0.0000100010 SOL)   |
 |  --------------------------------------------------------- |
-|  Net profit:                $0.000181 USDC                 |
-|  Generation time:           5.8s                           |
-|  Client wait time:          8.0s                           |
+|  Net profit:                $0.000345 USDC                 |
+|  Generation time:           12.0s                          |
+|  Client wait time:          12.4s                          |
 +-----------------------------------------------------------+
 ```
 
@@ -109,10 +108,10 @@ The root endpoint `GET /` uses content negotiation:
 
 ```bash
 # HTML (as browser sees it)
-curl -H "Accept: text/html" https://your-gateway/
+curl -H "Accept: text/html" https://x402gate.io/
 
 # JSON (for AI agents)
-curl https://your-gateway/
+curl https://x402gate.io/
 ```
 
 ## Supported Networks
@@ -164,21 +163,21 @@ SOLANA_RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY
 python -m x402gate.main
 ```
 
-The gateway starts on `http://localhost:4021`.
+The gateway starts on `http://localhost:4021`. Production: [https://x402gate.io](https://x402gate.io)
 
 ### 4. Test
 
 ```bash
 # List providers and their endpoints
-curl http://localhost:4021/v1/providers
+curl https://x402gate.io/v1/providers
 
 # Send a request to any provider (returns 402 with price)
-curl -X POST http://localhost:4021/v1/{provider}/{model_path} \
+curl -X POST https://x402gate.io/v1/{provider}/{model_path} \
   -H "Content-Type: application/json" \
   -d '{ ... }'
 ```
 
-> **Tip:** Each provider has `example_request` entries in `config.yaml` (e.g. `example_request`, `example_request_2`) with working models and bodies. The HTML landing page at `http://localhost:4021` shows ready-to-use curl examples generated from the config.
+> **Tip:** Each provider has `example_request` entries in `config.yaml` (e.g. `example_request`, `example_request_2`) with working models and bodies. The HTML landing page at [https://x402gate.io](https://x402gate.io) shows ready-to-use curl examples generated from the config.
 
 ## Configuration
 

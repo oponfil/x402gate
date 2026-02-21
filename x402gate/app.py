@@ -170,9 +170,10 @@ async def service_info(request: Request) -> Response:
         provider_list = ""
         for name, pcfg in config.providers.items():
             ptype = getattr(pcfg, "type", "managed") or "managed"
+            desc = f" &mdash; {pcfg.description}" if pcfg.description else ""
             docs_link = f' &middot; <a href="{pcfg.docs_url}">API docs</a>' if pcfg.docs_url else ""
             provider_list += (
-                f'<li><strong>{name}</strong> ({ptype})'
+                f'<li><strong>{name}</strong> ({ptype}){desc}'
                 f" &mdash; <code>/v1/{name}/...</code>{docs_link}</li>\n"
             )
         # Build curl examples from provider configs
