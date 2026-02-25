@@ -160,7 +160,8 @@ class TungstenProvider(BaseProvider):
         result = response.json()
 
         # Tungsten returns a list of generation objects.
-        # Each item has: { "uuid": "<image_uuid>", "generation": { "uuid": "<generation_uuid>", ... } }
+        # Each item has: { "uuid": "<image_uuid>",
+        #   "generation": { "uuid": "<generation_uuid>", ... } }
         # The track endpoint needs the GENERATION uuid, not the image uuid.
         if isinstance(result, list) and len(result) > 0:
             first = result[0] if isinstance(result[0], dict) else {}
@@ -319,7 +320,7 @@ class TungstenProvider(BaseProvider):
             # Tungsten returns this as a dict: {image_uuid: upload_uuid}
             upload_uuids = item.get("image_upload_uuids")
             if upload_uuids and isinstance(upload_uuids, dict):
-                for img_uuid in upload_uuids.keys():
+                for img_uuid in upload_uuids:
                     if not isinstance(img_uuid, str) or not img_uuid:
                         continue
                     download_url = f"{base_url}/generated_images/{img_uuid}/png"
@@ -414,7 +415,8 @@ class TungstenProvider(BaseProvider):
                 code = data.get("code")
                 if code == 30100:
                     blocked = data.get("detail_struct", {}).get("blocked", [])
-                    return f"Prompt blocked by safety filter: {', '.join(blocked) if blocked else 'unspecified'}"
+                    reasons = ', '.join(blocked) if blocked else 'unspecified'
+                    return f"Prompt blocked by safety filter: {reasons}"
                 if code == 30002:
                     return "Tungsten concurrency limit reached, try again later"
                 if detail:

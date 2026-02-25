@@ -5,7 +5,6 @@ from __future__ import annotations
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
 import pytest
 
 from x402gate.core.config import ProviderConfig

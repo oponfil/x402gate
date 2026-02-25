@@ -19,7 +19,6 @@ import sys
 from pathlib import Path
 
 import httpx
-import yaml
 from eth_account import Account
 from x402 import PaymentRequired, x402Client
 from x402.mechanisms.evm.exact import ExactEvmScheme
