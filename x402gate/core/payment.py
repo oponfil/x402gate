@@ -271,7 +271,7 @@ class PaymentHandler:
             result = await asyncio.to_thread(ns.scheme.verify, payload, requirements)
             amount_usdc = int(requirements.amount) / 1_000_000
             logger.info(
-                "Payment verified: $%.6f USDC from %s on %s (valid=%s)",
+                "Payment verified: $%g USDC from %s on %s (valid=%s)",
                 amount_usdc,
                 result.payer,
                 network,
@@ -363,68 +363,35 @@ class PaymentHandler:
                 settle_data["amount_usdc"] = amount_usdc
                 settle_data["network_type"] = ns.config.type
 
-                logger.info(
-                    "Payment settled: $%.6f USDC from %s on %s -> tx %s (gas: %.10f %s ~ $%.6f)",
-                    amount_usdc,
-                    result.payer,
-                    network,
-                    result.transaction,
-                    gas_cost_native,
-                    gas_label,
-                    gas_cost_usd,
-                )
+                # Compact single-line transaction summary
+                provider_cost = 0.0
+                generation_s = 0.0
+                t_client = 0.0
+                provider_label = "?"
+                profit = amount_usdc - gas_cost_usd
 
-                # Print Transaction Summary if context provided
                 if extra_context:
                     provider_cost = extra_context.get("provider_cost", 0)
-                    estimated_cost = extra_context.get("estimated_cost", provider_cost)
                     generation_s = extra_context.get("generation_s", 0)
-                    t_client = extra_context.get("t_client", 0)
-                    commission_rate = extra_context.get("commission_rate", 0.04)
-                    gas_surcharge_usd = extra_context.get("gas_surcharge", 0)
-
-                    commission_pct = provider_cost * commission_rate
+                    provider_label = extra_context.get("provider_name", "?")
+                    t_client = extra_context.get("t_client", generation_s)
                     profit = amount_usdc - provider_cost - gas_cost_usd
 
-                    comm_pct = int(commission_rate * 100)
-                    lines = [
-                        "",
-                        "+------------------- Transaction Summary -------------------+",
-                        f"|  Network:                   {network:<30s} |",
-                        f"|  Revenue (client paid):     ${amount_usdc:.6f} USDC                 |",
-                    ]
+                def _fmt(v: float) -> str:
+                    """Format USD with meaningful precision, no trailing zeros."""
+                    return f"{v:.6f}".rstrip("0").rstrip(".")
 
-                    # Show estimated cost if it differs from actual
-                    if abs(estimated_cost - provider_cost) > 1e-8:
-                        lines.append(
-                            f"|  Estimated cost:            ${estimated_cost:.6f}"
-                            " USDC                 |"
-                        )
-
-                    lines.extend(
-                        [
-                            f"|  Provider cost:            -${provider_cost:.6f}"
-                            " USDC                 |",
-                            f"|  Commission ({comm_pct}%):"
-                            f"          ${commission_pct:.6f}"
-                            " USDC                 |",
-                            f"|  Gas surcharge:             ${gas_surcharge_usd:.6f}"
-                            " USDC                 |",
-                            f"|  Gas cost:                 -${gas_cost_usd:.6f}"
-                            f" ({gas_cost_native:.10f} {gas_label})   |",
-                            "|  --------------------------------------------------------- |",
-                            f"|  Net profit:                ${profit:.6f} USDC                 |",
-                            f"|  Generation time:           {generation_s:.1f}s"
-                            "                        |",
-                            f"|  Client wait time:          {t_client:.1f}s"
-                            "                        |",
-                            "+-----------------------------------------------------------+",
-                        ]
-                    )
-                    summary = "\n".join(lines)
-                    import sys
-
-                    print(summary, file=sys.stderr, flush=True)
+                logger.info(
+                    "TX %s settled: $%s -> cost=$%s gas=$%s %s profit=$%s (%.1fs -> %.1fs)",
+                    provider_label,
+                    _fmt(amount_usdc),
+                    _fmt(provider_cost),
+                    _fmt(gas_cost_usd),
+                    gas_label,
+                    _fmt(profit),
+                    generation_s,
+                    t_client,
+                )
             else:
                 logger.warning(
                     "Settlement failed: $%.6f USDC from %s on %s -- %s: %s",

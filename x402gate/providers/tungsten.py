@@ -175,10 +175,9 @@ class TungstenProvider(BaseProvider):
                 task_id = first.get("uuid", "")
 
             logger.info(
-                "Tungsten generation submitted: %s (%d image(s)), raw keys: %s",
+                "Tungsten generation submitted: %s (%d image(s))",
                 task_id,
                 len(result),
-                list(first.keys()),
             )
             return {
                 "data": {
@@ -214,6 +213,7 @@ class TungstenProvider(BaseProvider):
         client = await self._get_client()
         track_url = f"{self._config.base_url.rstrip('/')}/generations/track"
         elapsed = 0
+        prev_status = ""
 
         # Brief delay before first poll
         await asyncio.sleep(1)
@@ -257,14 +257,6 @@ class TungstenProvider(BaseProvider):
             if status_info:
                 status = status_info.get("status", "")
 
-                logger.info(
-                    "Tungsten task %s status: '%s', elapsed: %ds, keys: %s",
-                    task_id,
-                    status,
-                    elapsed,
-                    list(status_info.keys()),
-                )
-
                 if status in ("completed", "succeeded", "done", "success"):
                     logger.info("Tungsten task %s completed after %ds", task_id, elapsed)
                     return await self._download_images(result)
@@ -276,11 +268,9 @@ class TungstenProvider(BaseProvider):
                         detail=f"Generation failed: {reason}",
                     )
             else:
-                logger.info(
-                    "Tungsten task %s: no status_info, raw result type=%s len=%s, elapsed: %ds",
+                logger.warning(
+                    "Tungsten task %s: no status in response (elapsed: %ds)",
                     task_id,
-                    type(result).__name__,
-                    len(result) if isinstance(result, list) else "N/A",
                     elapsed,
                 )
 

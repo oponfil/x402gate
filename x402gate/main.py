@@ -28,7 +28,12 @@ def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
     )
+
+    # Suppress noisy third-party loggers
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     # Read host/port from env or defaults
     host = os.environ.get("HOST", "0.0.0.0")
@@ -39,6 +44,7 @@ def main() -> None:
         host=host,
         port=port,
         log_level="info",
+        access_log=False,
     )
 
 

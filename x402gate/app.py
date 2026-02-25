@@ -520,6 +520,7 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
         """Settle payment and log financial summary in background."""
         try:
             ctx = {
+                "provider_name": provider_name,
                 "estimated_cost": float(base_price),
                 "provider_cost": float(actual_base_price),
                 "generation_s": generation_s,
