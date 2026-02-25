@@ -213,7 +213,6 @@ class TungstenProvider(BaseProvider):
         client = await self._get_client()
         track_url = f"{self._config.base_url.rstrip('/')}/generations/track"
         elapsed = 0
-        prev_status = ""
 
         # Brief delay before first poll
         await asyncio.sleep(1)
