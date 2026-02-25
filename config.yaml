@@ -107,7 +107,7 @@ providers:
     poll_interval: 3
     poll_timeout: 300
     description: "AI image generator (Stable Diffusion / Flux, LoRA support)"
-    docs_url: "https://tungsten.run"
+    docs_url: "https://github.com/oponfil/x402gate/blob/main/docs/tungsten.md"
     example_request:
       model: "generations"
       body:
