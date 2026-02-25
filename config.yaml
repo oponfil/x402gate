@@ -98,3 +98,59 @@ providers:
         search_parameters:
           mode: "on"
           max_search_results: 1
+  tungsten:
+    enabled: true
+    base_url: "https://api.tungsten.run/v1"
+    jwt_token: "${TUNGSTEN_JWT_TOKEN}"
+    cf_clearance: "${TUNGSTEN_CF_CLEARANCE}"
+    fixed_price_usd: 0.01
+    poll_interval: 3
+    poll_timeout: 300
+    description: "AI image generator (Stable Diffusion / Flux, LoRA support)"
+    docs_url: "https://tungsten.run"
+    example_request:
+      model: "generations"
+      body:
+        type: "z_image_turbo"
+        data:
+          model_version_uuid: "59sCgDpS76"
+          prompt: "erotic scene with an adult woman, explicit pose, passionate atmosphere, detailed body, soft lighting"
+          negative_prompt: "worst_quality, bad_quality, lowres, deformed, blurry"
+          num_images: 1
+          sampler: "euler"
+          steps: 10
+          cfg: 1.0
+          clip_skip: 2
+          width: 1024
+          height: 1440
+          loras: []
+          embeddings: []
+          controlnets: []
+          img2img: null
+    example_request_2:
+      model: "generations"
+      body:
+        type: "sdxl"
+        data:
+          model_version_uuid: "BJN9tyLbsY"
+          prompt: "1girl, anime style, detailed eyes, masterpiece"
+          negative_prompt: "bad quality,worst quality,sketch,censor"
+          num_images: 1
+          sampler: "euler_ancestral"
+          steps: 30
+          cfg: 5.5
+          clip_skip: 2
+          width: 832
+          height: 1216
+          loras:
+            - model_version_uuid: "4ZXZZoqd5x"
+              weight: 0.5
+            - model_version_uuid: "Jv8b5eApyr"
+              weight: 0.35
+          embeddings:
+            - model_version_uuid: "5AUTocEdT9"
+              weight: 0.75
+            - model_version_uuid: "Kdt9kaTwJP"
+              weight: 0.75
+          controlnets: []
+          img2img: null

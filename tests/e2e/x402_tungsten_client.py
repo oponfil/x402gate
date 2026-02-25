@@ -1,0 +1,121 @@
+"""E2E test client for x402gate → Tungsten image generation.
+
+This client simulates a user:
+1. Sends a request to the gateway (Tungsten provider).
+2. Receives a 402 Payment Required response.
+3. Signs the payment using x402 EVM scheme.
+4. Resends with payment → gets generated image as base64.
+
+Usage:
+    BASE_E2ETEST_PRIVATE_KEY=... python tests/e2e/x402_tungsten_client.py
+"""
+
+import asyncio
+import base64
+import logging
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+
+import httpx
+import yaml
+from eth_account import Account
+from x402 import PaymentRequired, x402Client
+from x402.mechanisms.evm.exact import ExactEvmScheme
+from x402.mechanisms.evm.signers import EthAccountSigner
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("x402-tungsten-client")
+
+OUTPUT_DIR = Path(__file__).parent / "output"
+CONFIG_PATH = Path(__file__).parent.parent.parent / "config.yaml"
+
+
+def _load_example_request() -> tuple[str, dict]:
+    """Load model path and request body from config.yaml."""
+    with open(CONFIG_PATH) as f:
+        cfg = yaml.safe_load(f)
+    example = cfg["providers"]["tungsten"]["example_request_2"]
+    return example["model"], example["body"]
+
+
+async def run_client():
+    """Run the E2E client test."""
+    gateway_url = os.environ.get("GATEWAY_URL", "http://localhost:4021")
+    private_key = os.environ.get("BASE_E2ETEST_PRIVATE_KEY")
+
+    if not private_key:
+        logger.error("BASE_E2ETEST_PRIVATE_KEY env var not set")
+        sys.exit(1)
+
+    model_path, body = _load_example_request()
+    logger.info("Model path: %s", model_path)
+    logger.info("Body: %s", body)
+
+    # Initialize x402 client with EVM signer
+    account = Account.from_key(private_key)
+    signer = EthAccountSigner(account)
+    x402_client = x402Client()
+    x402_client.register("eip155:8453", ExactEvmScheme(signer))
+
+    logger.info("Client Address: %s", account.address)
+    logger.info("Gateway URL: %s", gateway_url)
+
+    async with httpx.AsyncClient() as http_client:
+        # 1. Request without payment → should get 402
+        logger.info("Sending initial request (no payment)...")
+        response = await http_client.post(
+            f"{gateway_url}/v1/tungsten/{model_path}",
+            json=body,
+        )
+
+        if response.status_code != 402:
+            logger.error("Expected 402, got %d: %s", response.status_code, response.text)
+            sys.exit(1)
+
+        logger.info("Got 402 Payment Required ✓")
+
+        # Parse 402 and sign payment
+        payment_required = PaymentRequired.model_validate(response.json())
+        logger.info("Signing payment...")
+        payment_payload = await x402_client.create_payment_payload(payment_required)
+        signature = base64.b64encode(
+            payment_payload.model_dump_json(by_alias=True).encode()
+        ).decode()
+
+        # 2. Retry with payment → should get image
+        logger.info("Retrying with payment signature...")
+        response = await http_client.post(
+            f"{gateway_url}/v1/tungsten/{model_path}",
+            json=body,
+            headers={"PAYMENT-SIGNATURE": signature},
+            timeout=600.0,  # Tungsten can take a while
+        )
+
+        if response.status_code == 200:
+            result = response.json()
+            data = result.get("data", result)
+            images = data.get("images", [])
+            count = data.get("count", 0)
+
+            logger.info("Success! Generated %d image(s)", count)
+
+            # Save images to disk
+            if images:
+                OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+                ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                for i, img in enumerate(images):
+                    b64_data = img.get("base64_png", "")
+                    if b64_data:
+                        img_bytes = base64.b64decode(b64_data)
+                        img_path = OUTPUT_DIR / f"base_tungsten_{ts}_{i}.png"
+                        img_path.write_bytes(img_bytes)
+                        logger.info("Saved image: %s (%d bytes)", img_path, len(img_bytes))
+        else:
+            logger.error("Failed: %d %s", response.status_code, response.text)
+            sys.exit(1)
+
+
+if __name__ == "__main__":
+    asyncio.run(run_client())

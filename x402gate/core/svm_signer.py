@@ -232,6 +232,9 @@ class SolanaSigner:
                             elapsed,
                         )
                         return
+            # NOTE: This polling interval does NOT affect client latency.
+            # Settlement runs as a background task (asyncio.create_task in app.py),
+            # so the HTTP response is already returned to the client before this runs.
             await asyncio.sleep(2)
 
         raise RuntimeError(f"Transaction {signature} not confirmed within {timeout}s")

@@ -10,6 +10,7 @@ x402gate sits between your AI agent and AI service providers, adding [x402](http
 |----------|------|------|----------|
 | [OpenRouter](https://openrouter.ai) | Managed | 300+ LLMs (GPT, Claude, Gemini, Llama…) | `/v1/openrouter/...` |
 | [WaveSpeed AI](https://wavespeed.ai) | Managed | 60+ image/video models (Flux, Wan, Kling, Sora…) | `/v1/wavespeed/...` |
+| [Tungsten](https://tungsten.run) | Managed | AI image generation (SDXL, Flux, Qwen, Z-Image…) | `/v1/tungsten/...` |
 | [BlockRun](https://blockrun.ai) | Passthrough | 40+ LLMs (GPT, Claude, Gemini…) | `/v1/blockrun/...` |
 
 ## How It Works
@@ -144,6 +145,8 @@ Edit `.env` with your values:
 ```env
 WAVESPEED_API_KEY=your_key
 OPENROUTER_API_KEY=your_key
+TUNGSTEN_JWT_TOKEN=your_jwt_cookie
+TUNGSTEN_CF_CLEARANCE=your_cf_cookie
 
 # Base (EVM)
 BASE_PAY_TO_ADDRESS=0xYourWallet
@@ -214,6 +217,7 @@ Individual tests:
 | `test_base_wavespeed_t2v` | WaveSpeed | Base | Video generation |
 | `test_base_openrouter` | OpenRouter | Base | LLM chat |
 | `test_base_openrouter_websearch` | OpenRouter | Base | LLM chat + web search |
+| `test_base_tungsten` | Tungsten | Base | Image generation |
 | `test_solana_openrouter` | OpenRouter | Solana | LLM chat |
 | `test_solana_wavespeed` | WaveSpeed | Solana | Image generation |
 | `test_blockrun_passthrough` | BlockRun | Base | Passthrough proxy |
@@ -234,6 +238,7 @@ See [docs/add-provider.md](docs/add-provider.md) for a step-by-step guide.
 - [Architecture](docs/architecture.md) — how x402gate works under the hood
 - [Deployment](docs/deployment.md) — Railway, Docker, VPS guides
 - [Configuration](docs/configuration.md) — all config options
+- [Tungsten](docs/tungsten.md) — Tungsten image generation provider
 - [Adding a Provider](docs/add-provider.md) — extend with new AI services
 
 ## Contributing

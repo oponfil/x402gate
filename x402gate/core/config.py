@@ -102,6 +102,10 @@ class ProviderConfig(BaseModel):
     description: str = ""  # Short description shown on the landing page
     example_request: dict[str, Any] = {}  # Example request: {model, body}
     example_request_2: dict[str, Any] = {}  # Second example: {model, body}
+    # Tungsten-specific: cookie-based auth (no API keys)
+    jwt_token: str = ""
+    cf_clearance: str = ""
+    fixed_price_usd: float = 0.0  # Fixed price per request (when provider has no pricing API)
 
 
 class AppConfig(BaseModel):

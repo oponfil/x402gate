@@ -24,6 +24,7 @@ from x402gate.core.pricing import PriceCache, apply_commission
 from x402gate.core.proxy import TaskTimeoutError
 from x402gate.providers.base import BaseProvider, ProviderError
 from x402gate.providers.openrouter import OpenRouterProvider
+from x402gate.providers.tungsten import TungstenProvider
 from x402gate.providers.wavespeed import WaveSpeedProvider
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,7 @@ def _error_response(
 PROVIDER_REGISTRY: dict[str, type[BaseProvider]] = {
     "wavespeed": WaveSpeedProvider,
     "openrouter": OpenRouterProvider,
+    "tungsten": TungstenProvider,
 }
 
 # Global state (initialized in lifespan)
@@ -97,6 +99,9 @@ async def lifespan(app: FastAPI):
                 kwargs["web_search_tokens_per_result"] = gw.web_search_tokens_per_result
                 kwargs["default_web_search_max_results"] = gw.default_web_search_max_results
                 kwargs["web_search_cost_per_result"] = gw.web_search_cost_per_result
+            elif name == "tungsten":
+                kwargs["jwt_token"] = provider_config.jwt_token
+                kwargs["cf_clearance"] = provider_config.cf_clearance
             provider = PROVIDER_REGISTRY[name](config=provider_config, **kwargs)
             providers[name] = provider
             logger.info("Provider '%s' registered (managed)", name)
