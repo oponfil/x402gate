@@ -119,10 +119,12 @@ class TestSubmit:
         mock_response = MagicMock()
         mock_response.status_code = 400
         mock_response.text = "Bad Request"
-        mock_response.json.return_value = [{
-            "code": 30100,
-            "detail_struct": {"blocked": ["word1", "word2"], "prompt": "test"},
-        }]
+        mock_response.json.return_value = [
+            {
+                "code": 30100,
+                "detail_struct": {"blocked": ["word1", "word2"], "prompt": "test"},
+            }
+        ]
 
         with patch.object(provider, "_get_client") as mock_get:
             mock_client = AsyncMock()
@@ -148,11 +150,13 @@ class TestGetResult:
 
         track_completed = MagicMock()
         track_completed.status_code = 200
-        track_completed.json.return_value = [{
-            "uuid": "gen_123",
-            "status": "success",
-            "image_upload_uuids": {"img_uuid_001": "upload_uuid_001"},
-        }]
+        track_completed.json.return_value = [
+            {
+                "uuid": "gen_123",
+                "status": "success",
+                "image_upload_uuids": {"img_uuid_001": "upload_uuid_001"},
+            }
+        ]
 
         # Image download response
         download_response = MagicMock()
@@ -179,11 +183,13 @@ class TestGetResult:
 
         track_failed = MagicMock()
         track_failed.status_code = 200
-        track_failed.json.return_value = [{
-            "uuid": "gen_fail",
-            "status": "failed",
-            "failure_reason": "NSFW content detected",
-        }]
+        track_failed.json.return_value = [
+            {
+                "uuid": "gen_fail",
+                "status": "failed",
+                "failure_reason": "NSFW content detected",
+            }
+        ]
 
         with patch.object(provider, "_get_client") as mock_get:
             mock_client = AsyncMock()

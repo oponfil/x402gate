@@ -176,7 +176,9 @@ class TungstenProvider(BaseProvider):
 
             logger.info(
                 "Tungsten generation submitted: %s (%d image(s)), raw keys: %s",
-                task_id, len(result), list(first.keys()),
+                task_id,
+                len(result),
+                list(first.keys()),
             )
             return {
                 "data": {
@@ -257,7 +259,10 @@ class TungstenProvider(BaseProvider):
 
                 logger.info(
                     "Tungsten task %s status: '%s', elapsed: %ds, keys: %s",
-                    task_id, status, elapsed, list(status_info.keys()),
+                    task_id,
+                    status,
+                    elapsed,
+                    list(status_info.keys()),
                 )
 
                 if status in ("completed", "succeeded", "done", "success"):
@@ -273,7 +278,8 @@ class TungstenProvider(BaseProvider):
             else:
                 logger.info(
                     "Tungsten task %s: no status_info, raw result type=%s len=%s, elapsed: %ds",
-                    task_id, type(result).__name__,
+                    task_id,
+                    type(result).__name__,
                     len(result) if isinstance(result, list) else "N/A",
                     elapsed,
                 )
@@ -314,7 +320,6 @@ class TungstenProvider(BaseProvider):
         for item in items:
             if not isinstance(item, dict):
                 continue
-
 
             # Strategy 1: image_upload_uuids from track response
             # Tungsten returns this as a dict: {image_uuid: upload_uuid}
@@ -389,10 +394,13 @@ class TungstenProvider(BaseProvider):
                 return base64.b64encode(response.content).decode("ascii")
             except Exception as e:
                 if attempt < _DOWNLOAD_RETRIES - 1:
-                    delay = 2 ** attempt
+                    delay = 2**attempt
                     logger.warning(
                         "Image download attempt %d/%d failed: %s, retrying in %ds",
-                        attempt + 1, _DOWNLOAD_RETRIES, e, delay,
+                        attempt + 1,
+                        _DOWNLOAD_RETRIES,
+                        e,
+                        delay,
                     )
                     await asyncio.sleep(delay)
                 else:
@@ -415,7 +423,7 @@ class TungstenProvider(BaseProvider):
                 code = data.get("code")
                 if code == 30100:
                     blocked = data.get("detail_struct", {}).get("blocked", [])
-                    reasons = ', '.join(blocked) if blocked else 'unspecified'
+                    reasons = ", ".join(blocked) if blocked else "unspecified"
                     return f"Prompt blocked by safety filter: {reasons}"
                 if code == 30002:
                     return "Tungsten concurrency limit reached, try again later"
