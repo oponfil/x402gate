@@ -49,7 +49,16 @@ In **prepaid mode**, `max_tokens` is **not injected** — the model responds wit
 
 Top up your prepaid balance.
 
-**Without payment header** → returns 402 with payment requirements (like any managed endpoint).
+**Request body** (optional):
+```json
+{"amount": 0.50}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `amount` | float | `0.10` (min_prepaid_topup) | Desired top-up amount in USD ($0.10 – $10) |
+
+**Without payment header** → validates amount, returns 402 with payment requirements for the specified amount.
 
 **With `PAYMENT-SIGNATURE` header** → verifies the USDC payment, deducts commission (4% + $0.001 gas), and credits the remaining amount to your wallet's prepaid balance.
 

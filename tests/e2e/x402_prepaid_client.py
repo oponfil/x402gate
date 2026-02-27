@@ -33,7 +33,7 @@ logger = logging.getLogger("x402-prepaid-client")
 CONFIG_PATH = Path(__file__).parent.parent.parent / "config.yaml"
 
 # Top-up amount in USDC
-TOPUP_AMOUNT = "0.100000"  # $0.10
+TOPUP_AMOUNT = "0.110000"  # $0.11
 
 
 def _load_config():
@@ -51,6 +51,7 @@ async def _topup(
     logger.info("Requesting top-up (%s USDC)...", TOPUP_AMOUNT)
     response = await http_client.post(
         f"{gateway_url}/v1/topup",
+        json={"amount": float(TOPUP_AMOUNT)},
         timeout=15.0,
     )
 
@@ -67,12 +68,6 @@ async def _topup(
     if not solana_accepts:
         logger.error("No Solana payment option in 402 response")
         sys.exit(1)
-
-    # Override amount to our desired top-up amount
-    usdc_amount = int(float(TOPUP_AMOUNT) * 1_000_000)
-    for a in solana_accepts:
-        a["amount"] = str(usdc_amount)
-        a["price"] = f"${TOPUP_AMOUNT}"
 
     payment_data["accepts"] = solana_accepts
     payment_required = PaymentRequired.model_validate(payment_data)

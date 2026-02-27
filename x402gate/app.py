@@ -380,10 +380,31 @@ async def topup(request: Request) -> Response:
     top-up amount. Gateway verifies, settles, deducts commission + gas,
     and credits the remainder to the sender's prepaid balance.
     """
+    # Parse desired top-up amount from request body (default: min_prepaid_topup)
+    min_topup = Decimal(str(config.gateway.min_prepaid_topup))
+    max_topup = Decimal(str(config.gateway.max_prepaid_topup))
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    raw_amount = body.get("amount") if isinstance(body, dict) else None
+    if raw_amount is not None:
+        try:
+            requested_amount = Decimal(str(raw_amount))
+        except Exception:
+            return _error_response(400, "Invalid amount value")
+        if requested_amount < min_topup:
+            return _error_response(400, f"Top-up amount below minimum (${min_topup})")
+        if requested_amount > max_topup:
+            return _error_response(400, f"Top-up amount exceeds maximum (${max_topup})")
+    else:
+        requested_amount = min_topup
+
     payment_sig = payment_handler.extract_payment_signature(request)
     if not payment_sig:
-        # Return 402 with a suggested top-up amount ($0.10)
-        return payment_handler.create_payment_required(Decimal("0.100000"))
+        return payment_handler.create_payment_required(requested_amount)
 
     # Parse the requested top-up amount from the payment payload
     try:
@@ -396,14 +417,6 @@ async def topup(request: Request) -> Response:
 
     if topup_amount <= 0:
         return _error_response(400, "Top-up amount must be positive")
-
-    min_topup = Decimal(str(config.gateway.min_prepaid_topup))
-    if topup_amount < min_topup:
-        return _error_response(400, f"Top-up amount below minimum (${min_topup})")
-
-    max_topup = Decimal(str(config.gateway.max_prepaid_topup))
-    if topup_amount > max_topup:
-        return _error_response(400, f"Top-up amount exceeds maximum (${max_topup})")
 
     # Verify payment
     is_valid, payment_network, payer = await payment_handler.verify(payment_sig, topup_amount)
