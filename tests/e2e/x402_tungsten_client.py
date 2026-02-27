@@ -20,11 +20,10 @@ from pathlib import Path
 import httpx
 import yaml
 from eth_account import Account
+from helpers import save_images
 from x402 import PaymentRequired, x402Client
 from x402.mechanisms.evm.exact import ExactEvmScheme
 from x402.mechanisms.evm.signers import EthAccountSigner
-
-from helpers import save_images
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("x402-tungsten-client")

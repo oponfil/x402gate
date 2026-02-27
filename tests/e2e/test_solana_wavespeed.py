@@ -1,17 +1,17 @@
 """E2E test: Solana (SVM) payment → WaveSpeed generation."""
-from solana.rpc.api import Client as SolanaClient
-from solders.keypair import Keypair
-from solders.pubkey import Pubkey
-from x402gate.core.config import load_config
-from x402gate.core.config import load_config as _lc
-from solders.keypair import Keypair as _Kp
-from solders.pubkey import Pubkey as Pk
-
 import os
 import subprocess
 import time
 
 import pytest
+from solana.rpc.api import Client as SolanaClient
+from solders.keypair import Keypair
+from solders.keypair import Keypair as _Kp
+from solders.pubkey import Pubkey
+from solders.pubkey import Pubkey as Pk
+
+from x402gate.core.config import load_config
+from x402gate.core.config import load_config as _lc
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,4 @@
 """Unit tests for OpenRouter provider."""
-from x402gate.providers.base import ProviderError
-
 from decimal import Decimal
 from unittest.mock import AsyncMock, patch
 
@@ -8,6 +6,7 @@ import httpx
 import pytest
 
 from x402gate.core.config import ProviderConfig
+from x402gate.providers.base import ProviderError
 from x402gate.providers.openrouter import OpenRouterProvider
 
 

@@ -1,6 +1,5 @@
 """Unit tests for prepaid balance management."""
 import time
-
 from decimal import Decimal
 
 import pytest

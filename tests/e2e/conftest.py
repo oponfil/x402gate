@@ -1,8 +1,4 @@
 """Shared fixtures and helpers for E2E tests."""
-from eth_account import Account
-from web3 import Web3
-from x402gate.core.config import load_config
-
 import os
 import subprocess
 import tempfile
@@ -11,6 +7,10 @@ from pathlib import Path
 from typing import NamedTuple
 
 import pytest
+from eth_account import Account
+from web3 import Web3
+
+from x402gate.core.config import load_config
 
 # ---------------------------------------------------------------------------
 # Environment

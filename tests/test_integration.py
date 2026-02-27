@@ -3,22 +3,21 @@
 Uses respx to mock WaveSpeed and facilitator APIs,
 and httpx.AsyncClient with FastAPI's TestClient for request testing.
 """
-from x402gate.core.config import load_config as real_load
-from x402gate.app import app
 import asyncio
-from x402gate.core.prepaid import deposit, reset
-import time
-from solders.keypair import Keypair
-from x402gate.core.prepaid import deposit, get_balance, reset
-from x402gate.core.prepaid import reset
-
 import os
+import time
+from decimal import Decimal
 from unittest.mock import patch
 
 import httpx
 import pytest
 import respx
 from fastapi.testclient import TestClient
+from solders.keypair import Keypair
+
+from x402gate.app import app
+from x402gate.core.config import load_config as real_load
+from x402gate.core.prepaid import deposit, get_balance, reset
 
 # Set env vars before importing the app
 os.environ.setdefault("WAVESPEED_API_KEY", "test-key-12345")
@@ -244,7 +243,9 @@ class TestPrepaidFlow:
 
 
         reset()
-        asyncio.get_event_loop().run_until_complete(deposit("TestPubKey", __import__("decimal").Decimal("5.00")))
+        asyncio.get_event_loop().run_until_complete(
+            deposit("TestPubKey", Decimal("5.00"))
+        )
 
         response = client.get("/v1/balance/TestPubKey")
         assert response.status_code == 200
@@ -260,7 +261,9 @@ class TestPrepaidFlow:
         reset()
         kp = Keypair()
         pubkey_str = str(kp.pubkey())
-        asyncio.get_event_loop().run_until_complete(deposit(pubkey_str, __import__("decimal").Decimal("1.00")))
+        asyncio.get_event_loop().run_until_complete(
+            deposit(pubkey_str, Decimal("1.00"))
+        )
 
         # Mock WaveSpeed pricing + submit
         respx.post("https://api.wavespeed.ai/api/v3/model/pricing").mock(
@@ -298,8 +301,9 @@ class TestPrepaidFlow:
         reset()
         kp = Keypair()
         pubkey_str = str(kp.pubkey())
-        # Deposit less than the expected price
-        asyncio.get_event_loop().run_until_complete(deposit(pubkey_str, __import__("decimal").Decimal("0.001")))
+        asyncio.get_event_loop().run_until_complete(
+            deposit(pubkey_str, Decimal("0.001"))
+        )
 
         respx.post("https://api.wavespeed.ai/api/v3/model/pricing").mock(
             return_value=httpx.Response(200, json={"data": {"unit_price": 0.003}})

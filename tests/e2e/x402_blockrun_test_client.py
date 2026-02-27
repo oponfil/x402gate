@@ -10,14 +10,13 @@ This client tests the passthrough proxy flow:
 Usage:
     BASE_E2ETEST_PRIVATE_KEY=... python tests/e2e/x402_blockrun_test_client.py
 """
-import traceback
-
 import asyncio
 import base64
 import json
 import logging
 import os
 import sys
+import traceback
 
 import httpx
 import yaml

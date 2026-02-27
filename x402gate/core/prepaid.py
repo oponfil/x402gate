@@ -118,7 +118,7 @@ def build_signing_message(path: str, timestamp: int) -> bytes:
     Returns:
         Message bytes for Ed25519 signing.
     """
-    return f"x402gate:{path}:{timestamp}".encode("utf-8")
+    return f"x402gate:{path}:{timestamp}".encode()
 
 
 def validate_timestamp(timestamp: int) -> bool:

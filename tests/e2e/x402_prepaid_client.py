@@ -21,12 +21,11 @@ from pathlib import Path
 
 import httpx
 import yaml
+from helpers import save_from_urls, save_images
 from solders.keypair import Keypair
 from x402 import PaymentRequired, x402Client
 from x402.mechanisms.svm.exact.client import ExactSvmScheme
 from x402.mechanisms.svm.signers import KeypairSigner
-
-from helpers import save_from_urls, save_images
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("x402-prepaid-client")
@@ -112,7 +111,7 @@ async def _prepaid_request(
     sub_path: str,
     body: dict,
     label: str,
-    timeout: float = 60.0,
+    request_timeout: float = 60.0,
 ) -> dict:
     """Make a prepaid API request with Ed25519 signature.
 
@@ -121,11 +120,11 @@ async def _prepaid_request(
         sub_path: path after /v1/{provider}/, e.g. "chat/completions"
         body: JSON body to send
         label: human-readable label for logging
-        timeout: request timeout in seconds
+        request_timeout: request timeout in seconds
     """
     full_path = f"{provider}/{sub_path}"
     ts = int(time.time())
-    msg = f"x402gate:{full_path}:{ts}".encode("utf-8")
+    msg = f"x402gate:{full_path}:{ts}".encode()
     sig = keypair.sign_message(msg)
 
     logger.info("[%s] Sending prepaid request to /v1/%s ...", label, full_path)
@@ -137,7 +136,7 @@ async def _prepaid_request(
             "X-PREPAID-SIGNATURE": str(sig),
             "X-PREPAID-TIMESTAMP": str(ts),
         },
-        timeout=timeout,
+        timeout=request_timeout,
     )
 
     if response.status_code != 200:
@@ -267,7 +266,7 @@ async def run_client():
             sub_path=ws_model,
             body=ws_ex["body"],
             label="WaveSpeed",
-            timeout=120.0,  # image gen can take a while
+            request_timeout=120.0,  # image gen can take a while
         )
         balances["wavespeed"] = await _check_balance(
             http_client, gateway_url, pubkey_str, "WaveSpeed"
@@ -282,7 +281,7 @@ async def run_client():
             sub_path=tg_model,
             body=tg_ex["body"],
             label="Tungsten",
-            timeout=300.0,  # Tungsten can take 60-120+ seconds
+            request_timeout=300.0,  # Tungsten can take 60-120+ seconds
         )
         balances["tungsten"] = await _check_balance(
             http_client, gateway_url, pubkey_str, "Tungsten"

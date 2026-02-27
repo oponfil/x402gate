@@ -1,15 +1,15 @@
 """E2E test: Solana (SVM) payment → OpenRouter chat completion."""
-from solana.rpc.api import Client as SolanaClient
-from solders.keypair import Keypair
-from solders.pubkey import Pubkey
-from x402gate.core.config import load_config
-from solders.pubkey import Pubkey as Pk
-
 import os
 import subprocess
 import time
 
 import pytest
+from solana.rpc.api import Client as SolanaClient
+from solders.keypair import Keypair
+from solders.pubkey import Pubkey
+from solders.pubkey import Pubkey as Pk
+
+from x402gate.core.config import load_config
 
 
 @pytest.mark.asyncio

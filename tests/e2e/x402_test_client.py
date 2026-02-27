@@ -19,11 +19,10 @@ from pathlib import Path
 import httpx
 import yaml
 from eth_account import Account
+from helpers import save_from_urls
 from x402 import PaymentRequired, x402Client
 from x402.mechanisms.evm.exact import ExactEvmScheme
 from x402.mechanisms.evm.signers import EthAccountSigner
-
-from helpers import save_from_urls
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
