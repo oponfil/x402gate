@@ -8,6 +8,7 @@ Implements the BaseProvider interface for OpenRouter's API:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from decimal import Decimal
 from typing import Any
@@ -240,17 +241,61 @@ class OpenRouterProvider(BaseProvider):
             body = {**body, "plugins": patched_plugins}
 
         url = f"{self._config.base_url.rstrip('/')}/{path.lstrip('/')}"
+        max_retries = 2
+        retry_delay = 2.0
+        last_error: ProviderError | None = None
 
-        try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                resp = await client.post(
-                    url,
-                    json=body,
-                    headers={
-                        "Authorization": f"Bearer {self._config.api_key}",
-                        "Content-Type": "application/json",
-                    },
+        for attempt in range(1 + max_retries):
+            try:
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    resp = await client.post(
+                        url,
+                        json=body,
+                        headers={
+                            "Authorization": f"Bearer {self._config.api_key}",
+                            "Content-Type": "application/json",
+                        },
+                    )
+            except httpx.TimeoutException:
+                last_error = ProviderError(
+                    provider=self.name,
+                    detail="OpenRouter request timed out after 120s",
+                    status_code=504,
                 )
+                if attempt < max_retries:
+                    delay = retry_delay * (2**attempt)
+                    logger.warning(
+                        "OpenRouter timeout (attempt %d/%d), retrying in %.1fs",
+                        attempt + 1,
+                        1 + max_retries,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise last_error from None
+            except Exception as e:
+                raise ProviderError(
+                    provider=self.name,
+                    detail=f"Failed to submit request: {e}",
+                ) from e
+
+            if resp.status_code >= 500 and attempt < max_retries:
+                delay = retry_delay * (2**attempt)
+                logger.warning(
+                    "OpenRouter returned %d (attempt %d/%d), retrying in %.1fs: %s",
+                    resp.status_code,
+                    attempt + 1,
+                    1 + max_retries,
+                    delay,
+                    resp.text[:200],
+                )
+                last_error = ProviderError(
+                    provider=self.name,
+                    detail=f"OpenRouter API error: {resp.text}",
+                    status_code=resp.status_code,
+                )
+                await asyncio.sleep(delay)
+                continue
 
             if resp.status_code >= 400:
                 raise ProviderError(
@@ -267,13 +312,12 @@ class OpenRouterProvider(BaseProvider):
             )
             return result
 
-        except ProviderError:
-            raise
-        except Exception as e:
-            raise ProviderError(
-                provider=self.name,
-                detail=f"Failed to submit request: {e}",
-            ) from e
+        # Safety net — all retries exhausted
+        raise last_error or ProviderError(
+            provider=self.name,
+            detail="All retries exhausted",
+            status_code=502,
+        )
 
     async def get_result(self, task_id: str) -> dict[str, Any]:
         """Not used — OpenRouter returns results synchronously."""

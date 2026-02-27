@@ -39,8 +39,13 @@ async def proxy_request(
     body: dict[str, Any],
     api_key: str,
     request_timeout: float = 30.0,
+    max_retries: int = 2,
+    retry_delay: float = 2.0,
 ) -> dict[str, Any]:
     """Forward a request body to the provider API as-is.
+
+    Retries on 5xx server errors (up to max_retries times) with exponential
+    backoff.  4xx client errors fail immediately.
 
     Args:
         base_url: Provider API base URL (e.g. https://api.wavespeed.ai/api/v3).
@@ -48,32 +53,76 @@ async def proxy_request(
         body: Request body dict, forwarded without modification.
         api_key: Provider API key for Authorization header.
         request_timeout: HTTP request timeout in seconds.
+        max_retries: Max retry attempts on 5xx errors (default: 2).
+        retry_delay: Base delay between retries in seconds (doubles each attempt).
 
     Returns:
         Provider response as a dict.
 
     Raises:
-        ProxyError: If the provider returns a non-2xx response.
+        ProxyError: If the provider returns a non-2xx response after all retries.
     """
     url = f"{base_url.rstrip('/')}/{path.lstrip('/')}"
+    last_error: ProxyError | None = None
 
-    async with httpx.AsyncClient(timeout=request_timeout) as client:
-        response = await client.post(
-            url,
-            json=body,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-        )
+    for attempt in range(1 + max_retries):
+        try:
+            async with httpx.AsyncClient(timeout=request_timeout) as client:
+                response = await client.post(
+                    url,
+                    json=body,
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                )
+        except httpx.TimeoutException:
+            last_error = ProxyError(
+                status_code=504,
+                detail=f"Request to {url} timed out after {request_timeout}s",
+            )
+            if attempt < max_retries:
+                delay = retry_delay * (2**attempt)
+                logger.warning(
+                    "Proxy timeout (attempt %d/%d), retrying in %.1fs: %s",
+                    attempt + 1,
+                    1 + max_retries,
+                    delay,
+                    url,
+                )
+                await asyncio.sleep(delay)
+                continue
+            raise last_error from None
 
-    if response.status_code >= 400:
+        if response.status_code < 400:
+            return response.json()
+
+        if response.status_code >= 500 and attempt < max_retries:
+            # 5xx server error — transient, retry with backoff
+            delay = retry_delay * (2**attempt)
+            logger.warning(
+                "Provider returned %d (attempt %d/%d), retrying in %.1fs: %s",
+                response.status_code,
+                attempt + 1,
+                1 + max_retries,
+                delay,
+                response.text[:200],
+            )
+            last_error = ProxyError(
+                status_code=response.status_code,
+                detail=response.text,
+            )
+            await asyncio.sleep(delay)
+            continue
+
+        # 4xx or final 5xx attempt — fail immediately
         raise ProxyError(
             status_code=response.status_code,
             detail=response.text,
         )
 
-    return response.json()
+    # Should not reach here, but safety net
+    raise last_error or ProxyError(status_code=502, detail="All retries exhausted")
 
 
 async def poll_result(

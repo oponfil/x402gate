@@ -28,6 +28,7 @@ Client                    x402gate                  WaveSpeed AI
   ├─ POST + PAYMENT-SIGNATURE►                          │
   │                          ├─ verify (on-chain)        │
   │                          ├─ forward request ────────►│
+  │                          │◄─ 503? retry (2× backoff)►│
   │                          │◄─ result ────────────────┤
   │                          ├─ settle (on-chain)        │
   │◄─── 200 + result ───────┤                          │
@@ -96,6 +97,8 @@ If the provider rejects a request (e.g. invalid parameters), the gateway returns
   "status": 502
 }
 ```
+
+**Retry on 5xx:** If a provider returns a server error (502, 503, etc.), x402gate automatically retries the request up to **2 times** with exponential backoff (2s → 4s) before returning the error. This prevents payment loss during brief provider outages (e.g. CDN restarts). Timeouts are also retried. Client errors (4xx) are never retried.
 
 
 > **Note:** Payment is settled **only** on success (HTTP 200). On any error, the payment is not settled and no USDC is transferred.
