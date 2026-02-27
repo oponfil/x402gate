@@ -116,13 +116,14 @@
 
     <hr>
     <h3>Prepaid Mode</h3>
-    <p>Top-up once with Solana USDC &rarr; make requests without on-chain transactions.</p>
+    <p>Top-up once with USDC (Solana or Base) &rarr; make requests without on-chain transactions.</p>
     <p class="step"><strong>1.</strong> <code>POST /v1/topup</code> with USDC payment &rarr; balance credited (minus
         commission + gas)</p>
-    <p class="step"><strong>2.</strong> Sign requests with your wallet key (Ed25519) &mdash; no blockchain fee</p>
+    <p class="step"><strong>2.</strong> Sign requests with your wallet key (Ed25519 or EIP-191) &mdash; no blockchain
+        fee</p>
     <p class="step"><strong>3.</strong> Only provider base cost is deducted per request</p>
-    <div class="note">Balance is stored <strong>in memory only</strong> and will be lost on server restart. Max top-up:
-        $10.
+    <div class="note">Balance is stored <strong>in memory only</strong> and will be lost on server restart. Top-up:
+        $0.10 &ndash; $10.
         <a href="{{ base_url }}/v1/balance/YOUR_PUBKEY">Check balance</a> &middot;
         <a href="https://github.com/oponfil/x402gate/blob/main/docs/prepaid.md">Docs</a>
     </div>

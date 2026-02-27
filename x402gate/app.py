@@ -377,6 +377,10 @@ async def topup(request: Request) -> Response:
     if topup_amount <= 0:
         return _error_response(400, "Top-up amount must be positive")
 
+    min_topup = Decimal(str(config.gateway.min_prepaid_topup))
+    if topup_amount < min_topup:
+        return _error_response(400, f"Top-up amount below minimum (${min_topup})")
+
     max_topup = Decimal(str(config.gateway.max_prepaid_topup))
     if topup_amount > max_topup:
         return _error_response(400, f"Top-up amount exceeds maximum (${max_topup})")
@@ -587,7 +591,7 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
     # 6. Forward request to provider
     t_gen_start = time.monotonic()
     try:
-        result = await provider.submit(path, body)
+        result = await provider.submit(path, body, prepaid=prepaid_mode)
     except ProviderError as e:
         return _error_response(e.status_code, e.detail, provider=e.provider)
 

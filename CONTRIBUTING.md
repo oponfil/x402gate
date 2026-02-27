@@ -20,6 +20,19 @@
 - Common E2E utilities go in `tests/e2e/helpers.py`.
 - Common core logic goes in `x402gate/core/`.
 
+## Workflow
+
+1. **Code review** — run `ruff check` and `ruff format --check`. Fix all found issues. Report results to the user in chat (what was found, what was fixed).
+2. **Tests** — run unit tests (`pytest tests/test_*.py`) and relevant E2E tests.
+3. **Commit** — only after review and tests pass.
+
+```bash
+python -m ruff check x402gate/ tests/
+python -m ruff format --check x402gate/ tests/
+python -m pytest tests/ -v --timeout=30
+git add -A && git commit -m "feat: description"
+```
+
 ## Testing
 
 - Every new feature MUST have unit tests (`tests/test_*.py`) and integration tests (`tests/test_integration.py`).
@@ -47,6 +60,6 @@
 
 ## Security
 
-- Ed25519 signatures for prepaid authentication.
+- Ed25519 (Solana) and EIP-191 (EVM) signatures for prepaid authentication.
 - Timestamp validation (60s window) to prevent replay attacks.
 - Never log private keys or full signatures.

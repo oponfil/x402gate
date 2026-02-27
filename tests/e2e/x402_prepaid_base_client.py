@@ -1,14 +1,14 @@
-"""E2E test client for x402gate prepaid mode.
+"""E2E test client for x402gate prepaid mode (Base / EVM).
 
-Simulates the full prepaid flow:
-1. Top-up: Send Solana USDC payment to /v1/topup → get prepaid balance.
+Simulates the full prepaid flow using an Ethereum wallet:
+1. Top-up: Send Base USDC payment to /v1/topup → get prepaid balance.
 2. OpenRouter call #1 and #2: LLM chat with prepaid headers.
 3. WaveSpeed call: Image generation with prepaid headers.
 4. Tungsten call: Image generation with prepaid headers.
 5. Check final balance.
 
 Usage:
-    SOLANA_E2ETEST_PRIVATE_KEY=... python tests/e2e/x402_prepaid_client.py
+    BASE_E2ETEST_PRIVATE_KEY=... python tests/e2e/x402_prepaid_base_client.py
 """
 
 import asyncio
@@ -21,14 +21,15 @@ from pathlib import Path
 
 import httpx
 import yaml
+from eth_account import Account
+from eth_account.messages import encode_defunct
 from helpers import save_from_urls, save_images
-from solders.keypair import Keypair
 from x402 import PaymentRequired, x402Client
-from x402.mechanisms.svm.exact.client import ExactSvmScheme
-from x402.mechanisms.svm.signers import KeypairSigner
+from x402.mechanisms.evm.exact import ExactEvmScheme
+from x402.mechanisms.evm.signers import EthAccountSigner
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("x402-prepaid-client")
+logger = logging.getLogger("x402-prepaid-base-client")
 
 CONFIG_PATH = Path(__file__).parent.parent.parent / "config.yaml"
 
@@ -60,25 +61,23 @@ async def _topup(
 
     payment_data = response.json()
 
-    # Filter to Solana only
-    solana_accepts = [
-        a for a in payment_data.get("accepts", []) if "solana:" in a.get("network", "")
-    ]
-    if not solana_accepts:
-        logger.error("No Solana payment option in 402 response")
+    # Filter to Base (EVM) only
+    base_accepts = [a for a in payment_data.get("accepts", []) if "eip155:" in a.get("network", "")]
+    if not base_accepts:
+        logger.error("No Base (EVM) payment option in 402 response")
         sys.exit(1)
 
     # Override amount to our desired top-up amount
     usdc_amount = int(float(TOPUP_AMOUNT) * 1_000_000)
-    for a in solana_accepts:
+    for a in base_accepts:
         a["amount"] = str(usdc_amount)
         a["price"] = f"${TOPUP_AMOUNT}"
 
-    payment_data["accepts"] = solana_accepts
+    payment_data["accepts"] = base_accepts
     payment_required = PaymentRequired.model_validate(payment_data)
 
     # Sign and submit payment
-    logger.info("Signing Solana payment for top-up...")
+    logger.info("Signing Base (EVM) payment for top-up...")
     payment_payload = await x402_client.create_payment_payload(payment_required)
     signature = base64.b64encode(payment_payload.model_dump_json(by_alias=True).encode()).decode()
 
@@ -104,14 +103,14 @@ async def _topup(
 async def _prepaid_request(
     http_client: httpx.AsyncClient,
     gateway_url: str,
-    keypair: Keypair,
+    account: Account,
     provider: str,
     sub_path: str,
     body: dict,
     label: str,
     request_timeout: float = 60.0,
 ) -> dict:
-    """Make a prepaid API request with Ed25519 signature.
+    """Make a prepaid API request with EIP-191 personal_sign signature.
 
     Args:
         provider: e.g. "openrouter", "wavespeed", "tungsten"
@@ -122,16 +121,18 @@ async def _prepaid_request(
     """
     full_path = f"{provider}/{sub_path}"
     ts = int(time.time())
-    msg = f"x402gate:{full_path}:{ts}".encode()
-    sig = keypair.sign_message(msg)
+    msg_bytes = f"x402gate:{full_path}:{ts}".encode()
+    signable = encode_defunct(msg_bytes)
+    signed = account.sign_message(signable)
+    sig_hex = signed.signature.hex()
 
     logger.info("[%s] Sending prepaid request to /v1/%s ...", label, full_path)
     response = await http_client.post(
         f"{gateway_url}/v1/{full_path}",
         json=body,
         headers={
-            "X-PREPAID-PUBKEY": str(keypair.pubkey()),
-            "X-PREPAID-SIGNATURE": str(sig),
+            "X-PREPAID-PUBKEY": account.address,
+            "X-PREPAID-SIGNATURE": sig_hex,
             "X-PREPAID-TIMESTAMP": str(ts),
         },
         timeout=request_timeout,
@@ -164,12 +165,12 @@ async def _prepaid_request(
     if content:
         print(f"\n{content[:200]}")
     if images:
-        saved = save_images(images, f"prepaid_{label}")
+        saved = save_images(images, f"prepaid_base_{label}")
         print(f"\n  Images returned: {len(images)}, saved: {len(saved)}")
         for p in saved:
             print(f"  -> {p}")
     if output_urls:
-        saved = await save_from_urls(output_urls, f"prepaid_{label}", http_client)
+        saved = await save_from_urls(output_urls, f"prepaid_base_{label}", http_client)
         print(f"\n  Outputs downloaded: {len(output_urls)}, saved: {len(saved)}")
         for p in saved:
             print(f"  -> {p}")
@@ -184,114 +185,111 @@ async def _prepaid_request(
 
 
 async def _check_balance(
-    http_client: httpx.AsyncClient, gateway_url: str, pubkey: str, label: str
+    http_client: httpx.AsyncClient, gateway_url: str, address: str, label: str
 ) -> str:
     """Check and log the current prepaid balance."""
-    resp = await http_client.get(f"{gateway_url}/v1/balance/{pubkey}")
+    resp = await http_client.get(f"{gateway_url}/v1/balance/{address}")
     balance = resp.json()["balance"]
     logger.info("Balance after %s: $%s", label, balance)
     return balance
 
 
 async def run_client():
-    """Run the full prepaid E2E flow."""
+    """Run the full prepaid E2E flow with Base (EVM) wallet."""
     gateway_url = os.environ.get("GATEWAY_URL", "http://localhost:4021")
-    private_key = os.environ.get("SOLANA_E2ETEST_PRIVATE_KEY")
+    private_key = os.environ.get("BASE_E2ETEST_PRIVATE_KEY")
 
     if not private_key:
-        logger.error("SOLANA_E2ETEST_PRIVATE_KEY env var not set")
+        logger.error("BASE_E2ETEST_PRIVATE_KEY env var not set")
         sys.exit(1)
 
     cfg = _load_config()
 
-    # Initialize x402 client with SVM signer
-    keypair = Keypair.from_base58_string(private_key)
-    signer = KeypairSigner(keypair)
+    # Initialize x402 client with EVM signer
+    account = Account.from_key(private_key)
+    signer = EthAccountSigner(account)
     x402_client = x402Client()
 
-    rpc_url = os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
-    x402_client.register(
-        "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
-        ExactSvmScheme(signer, rpc_url=rpc_url),
-    )
+    # Register the 'exact' scheme for Base Mainnet
+    x402_client.register("eip155:8453", ExactEvmScheme(signer))
 
-    pubkey_str = str(keypair.pubkey())
-    logger.info("Client wallet: %s", pubkey_str)
+    evm_address = account.address
+    logger.info("Client wallet (EVM): %s", evm_address)
     logger.info("Gateway: %s", gateway_url)
 
     balances = {}
 
     async with httpx.AsyncClient() as http_client:
-        # 1. Top-up
+        # 1. Top-up via Base x402 payment
         topup_result = await _topup(http_client, gateway_url, x402_client)
-        balances["top-up"] = await _check_balance(http_client, gateway_url, pubkey_str, "top-up")
+        balances["top-up"] = await _check_balance(http_client, gateway_url, evm_address, "top-up")
 
         # 2. OpenRouter call #1
         or_ex = cfg["providers"]["openrouter"]["example_request"]
         await _prepaid_request(
             http_client,
             gateway_url,
-            keypair,
+            account,
             provider="openrouter",
             sub_path="chat/completions",
             body=or_ex["body"],
             label="OpenRouter #1",
         )
         balances["openrouter-1"] = await _check_balance(
-            http_client, gateway_url, pubkey_str, "OpenRouter #1"
+            http_client, gateway_url, evm_address, "OpenRouter #1"
         )
 
         # 3. OpenRouter call #2
         await _prepaid_request(
             http_client,
             gateway_url,
-            keypair,
+            account,
             provider="openrouter",
             sub_path="chat/completions",
             body=or_ex["body"],
             label="OpenRouter #2",
         )
         balances["openrouter-2"] = await _check_balance(
-            http_client, gateway_url, pubkey_str, "OpenRouter #2"
+            http_client, gateway_url, evm_address, "OpenRouter #2"
         )
 
         # 4. WaveSpeed call (image generation)
         ws_ex = cfg["providers"]["wavespeed"]["example_request"]
-        ws_model = ws_ex["model"]  # e.g. "wavespeed-ai/z-image/turbo"
+        ws_model = ws_ex["model"]
         await _prepaid_request(
             http_client,
             gateway_url,
-            keypair,
+            account,
             provider="wavespeed",
             sub_path=ws_model,
             body=ws_ex["body"],
             label="WaveSpeed",
-            request_timeout=120.0,  # image gen can take a while
+            request_timeout=120.0,
         )
         balances["wavespeed"] = await _check_balance(
-            http_client, gateway_url, pubkey_str, "WaveSpeed"
+            http_client, gateway_url, evm_address, "WaveSpeed"
         )
 
         # 5. Tungsten call (image generation)
         tg_ex = cfg["providers"]["tungsten"]["example_request"]
-        tg_model = tg_ex["model"]  # e.g. "generations"
+        tg_model = tg_ex["model"]
         await _prepaid_request(
             http_client,
             gateway_url,
-            keypair,
+            account,
             provider="tungsten",
             sub_path=tg_model,
             body=tg_ex["body"],
             label="Tungsten",
-            request_timeout=300.0,  # Tungsten can take 60-120+ seconds
+            request_timeout=300.0,
         )
         balances["tungsten"] = await _check_balance(
-            http_client, gateway_url, pubkey_str, "Tungsten"
+            http_client, gateway_url, evm_address, "Tungsten"
         )
 
         # Summary
         print(f"\n{'=' * 60}")
-        print("PREPAID E2E SUMMARY:")
+        print("PREPAID (BASE) E2E SUMMARY:")
         print(f"  Top-up credited:          ${topup_result['credited']}")
         for label, bal in balances.items():
             print(f"  Balance after {label:16s} ${bal}")

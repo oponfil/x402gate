@@ -12,6 +12,7 @@ gateway:
   web_search_cost_per_result: 0.004   # $0.004 per result (OpenRouter Exa: $4/1000)
   price_cache_ttl: 60        # seconds, price cache TTL (0 = disabled)
   max_prepaid_topup: 10.0    # max single top-up amount in USD
+  min_prepaid_topup: 0.10    # min single top-up amount in USD
 
 payment:
   networks:

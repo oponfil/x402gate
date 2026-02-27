@@ -1,8 +1,8 @@
 """Prepaid balance management for x402gate.
 
-In-memory wallet-bound balances: users top-up once via Solana transaction,
-then spend from the balance on subsequent requests using Ed25519 signatures
-(no on-chain transactions per request).
+In-memory wallet-bound balances: users top-up once via USDC transaction
+(Solana or Base), then spend from the balance on subsequent requests
+using wallet signatures (Ed25519 for Solana, EIP-191 for EVM).
 
 WARNING: Balances are stored in RAM only and will be lost on server restart.
 """
@@ -14,6 +14,8 @@ import logging
 import time
 from decimal import Decimal
 
+from eth_account import Account
+from eth_account.messages import encode_defunct
 from solders.pubkey import Pubkey
 from solders.signature import Signature
 
@@ -31,7 +33,7 @@ async def deposit(pubkey: str, amount: Decimal) -> Decimal:
     """Add funds to a wallet's prepaid balance.
 
     Args:
-        pubkey: Solana public key (base58).
+        pubkey: Wallet address (Solana base58 or EVM hex).
         amount: Amount in USD to add (after commission deduction).
 
     Returns:
@@ -54,7 +56,7 @@ async def deduct(pubkey: str, amount: Decimal) -> bool:
     """Deduct funds from a wallet's prepaid balance.
 
     Args:
-        pubkey: Solana public key (base58).
+        pubkey: Wallet address (Solana base58 or EVM hex).
         amount: Amount in USD to deduct.
 
     Returns:
@@ -78,7 +80,7 @@ def get_balance(pubkey: str) -> Decimal:
     """Get current prepaid balance for a wallet.
 
     Args:
-        pubkey: Solana public key (base58).
+        pubkey: Wallet address (Solana base58 or EVM hex).
 
     Returns:
         Current balance in USD (0 if unknown).
@@ -88,25 +90,55 @@ def get_balance(pubkey: str) -> Decimal:
 
 def verify_wallet_signature(
     pubkey_str: str,
-    signature_b58: str,
+    signature_str: str,
     message: bytes,
 ) -> bool:
-    """Verify an Ed25519 signature proves wallet ownership.
+    """Verify a wallet signature proves ownership.
+
+    Auto-detects wallet type by address format:
+    - 0x... (42 chars) → EVM: EIP-191 personal_sign recovery
+    - Otherwise → Solana: Ed25519 signature verification
 
     Args:
-        pubkey_str: Solana public key (base58).
-        signature_b58: Ed25519 signature (base58-encoded).
+        pubkey_str: Wallet address (EVM hex or Solana base58).
+        signature_str: Signature string (hex for EVM, base58 for Solana).
         message: The signed message bytes.
 
     Returns:
-        True if the signature is valid for the given pubkey and message.
+        True if the signature is valid for the given address and message.
     """
+    if pubkey_str.startswith("0x") and len(pubkey_str) == 42:
+        return _verify_evm_signature(pubkey_str, signature_str, message)
+    return _verify_solana_signature(pubkey_str, signature_str, message)
+
+
+def _verify_solana_signature(
+    pubkey_str: str,
+    signature_b58: str,
+    message: bytes,
+) -> bool:
+    """Verify a Solana Ed25519 signature."""
     try:
         pubkey = Pubkey.from_string(pubkey_str)
         sig = Signature.from_string(signature_b58)
         return sig.verify(pubkey, message)
     except Exception:
-        logger.debug("Signature verification failed for %s", pubkey_str[:12] + "…")
+        logger.debug("Solana signature verification failed for %s", pubkey_str[:12] + "…")
+        return False
+
+
+def _verify_evm_signature(
+    address: str,
+    signature_hex: str,
+    message: bytes,
+) -> bool:
+    """Verify an EVM EIP-191 personal_sign signature."""
+    try:
+        msg = encode_defunct(message)
+        recovered = Account.recover_message(msg, signature=signature_hex)
+        return recovered.lower() == address.lower()
+    except Exception:
+        logger.debug("EVM signature verification failed for %s", address[:12] + "…")
         return False
 
 

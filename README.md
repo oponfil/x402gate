@@ -107,19 +107,21 @@ For high-frequency usage, you can top-up a prepaid balance and skip on-chain tra
 ```
 Client                    x402gate
   │                          │
-  ├─ POST /v1/topup (402) ───►  ← pay once (Solana USDC)
+  ├─ POST /v1/topup (402) ───►  ← pay once (Solana or Base USDC)
   ├─ POST /v1/topup + sig ──►  ← balance credited
   │                          │
-  ├─ POST /v1/openrouter/... ►  ← Ed25519 signature (no blockchain tx)
-  │  X-PREPAID-PUBKEY         │  ← deduct base_price from balance
+  ├─ POST /v1/openrouter/... ►  ← wallet signature (no blockchain tx)
+  │  X-PREPAID-PUBKEY         │  ← deduct actual_cost from balance
   │  X-PREPAID-SIGNATURE      │
   │  X-PREPAID-TIMESTAMP      │
   │◄─── 200 + result ────────┤
 ```
 
-Commission and gas are charged **once at top-up**. Subsequent requests deduct only the provider's base cost.
+Commission and gas are charged **once at top-up**. Subsequent requests deduct only the provider's actual cost. In prepaid mode, `max_tokens` is not injected — models respond fully, and you pay for actual usage.
 
-> **⚠️ Warning:** Prepaid balances are stored in memory only and are lost on server restart. Max top-up: $10. See [docs/prepaid.md](docs/prepaid.md) for full details.
+Supports both **Solana** (Ed25519) and **Base/EVM** (EIP-191) wallets — auto-detected by address format.
+
+> **⚠️ Warning:** Prepaid balances are stored in memory only and are lost on server restart. Top-up: $0.10 – $10. See [docs/prepaid.md](docs/prepaid.md) for full details.
 
 ### Service Discovery
 
@@ -211,9 +213,10 @@ All settings are in `config.yaml`. Secrets use `${ENV_VAR}` interpolation:
 |---------|---------|-------------|
 | `gateway.commission` | `0.04` | Markup rate (4%) added to provider price |
 | `gateway.gas_surcharge` | `0.001` | Fixed gas surcharge ($0.001) added on top of commission |
-| `gateway.default_max_tokens` | `1024` | Default `max_tokens` when client omits it (for token-based providers) |
+| `gateway.default_max_tokens` | `1024` | Default `max_tokens` when client omits it (x402 mode only; skipped in prepaid) |
 | `gateway.price_cache_ttl` | `60` | Price cache TTL in seconds |
 | `gateway.max_prepaid_topup` | `10.0` | Maximum single top-up amount in USD |
+| `gateway.min_prepaid_topup` | `0.10` | Minimum single top-up amount in USD |
 | `payment.networks.base` | — | Base Mainnet (EVM) config |
 | `payment.networks.solana` | — | Solana Mainnet (SVM) config |
 | `providers.wavespeed.poll_timeout` | `300` | Max wait for AI result (seconds) |
@@ -243,7 +246,8 @@ Individual tests:
 | `test_solana_openrouter` | OpenRouter | Solana | LLM chat |
 | `test_solana_wavespeed` | WaveSpeed | Solana | Image generation |
 | `test_blockrun_passthrough` | BlockRun | Base | Passthrough proxy |
-| `test_prepaid_openrouter` | OpenRouter | Solana | Prepaid mode (top-up + 2 calls) |
+| `test_prepaid_openrouter` | Mixed | Solana | Prepaid mode (Solana wallet) |
+| `test_prepaid_base` | Mixed | Base | Prepaid mode (EVM wallet) |
 
 Requires `BASE_E2ETEST_PRIVATE_KEY` and/or `SOLANA_E2ETEST_PRIVATE_KEY` in `.env`.
 

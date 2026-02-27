@@ -51,7 +51,13 @@ class BaseProvider(ABC):
         """
 
     @abstractmethod
-    async def submit(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+    async def submit(
+        self,
+        path: str,
+        body: dict[str, Any],
+        *,
+        prepaid: bool = False,
+    ) -> dict[str, Any]:
         """Submit a task to the provider API.
 
         The request body is forwarded as-is without modification.
@@ -59,6 +65,8 @@ class BaseProvider(ABC):
         Args:
             path: API path (e.g. 'wavespeed-ai/flux-dev').
             body: Request body dict.
+            prepaid: If True, skip cost-limiting defaults (e.g. max_tokens)
+                since actual usage will be charged post-request.
 
         Returns:
             Provider response including task ID and status.

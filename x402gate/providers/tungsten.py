@@ -111,7 +111,13 @@ class TungstenProvider(BaseProvider):
         logger.info("Tungsten fixed price: $%s", result)
         return result
 
-    async def submit(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+    async def submit(
+        self,
+        path: str,
+        body: dict[str, Any],
+        *,
+        prepaid: bool = False,
+    ) -> dict[str, Any]:
         """Submit a generation task to Tungsten's API.
 
         Forwards the request body as-is to POST /v1/generations.

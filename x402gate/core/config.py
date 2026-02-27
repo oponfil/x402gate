@@ -61,6 +61,7 @@ class GatewayConfig(BaseModel):
     web_search_cost_per_result: float = 0.004  # $0.004 per search result (OpenRouter Exa: $4/1000)
     price_cache_ttl: int = 60
     max_prepaid_topup: float = 10.0  # max single top-up amount in USD
+    min_prepaid_topup: float = 0.10  # min single top-up amount in USD
 
 
 class NetworkConfig(BaseModel):

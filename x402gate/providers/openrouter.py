@@ -183,7 +183,13 @@ class OpenRouterProvider(BaseProvider):
         )
         return estimated_cost
 
-    async def submit(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+    async def submit(
+        self,
+        path: str,
+        body: dict[str, Any],
+        *,
+        prepaid: bool = False,
+    ) -> dict[str, Any]:
         """Submit a chat completion request to OpenRouter.
 
         Sends the request to POST /api/v1/chat/completions.  OpenRouter
@@ -192,6 +198,8 @@ class OpenRouterProvider(BaseProvider):
         Args:
             path: API sub-path (typically 'chat/completions').
             body: Request body, forwarded without modification.
+            prepaid: If True, skip max_tokens injection (actual usage
+                will be charged post-request from prepaid balance).
 
         Returns:
             OpenRouter response dict (OpenAI-compatible format).
@@ -199,10 +207,11 @@ class OpenRouterProvider(BaseProvider):
         Raises:
             ProviderError: If the request fails.
         """
-        # Always ensure max_tokens is set so OpenRouter doesn't fall
-        # back to a large provider default (which would cost more
-        # than our estimate).
-        if "max_tokens" not in body:
+        # In x402 mode, ensure max_tokens is set so OpenRouter doesn't
+        # fall back to a large provider default (which would cost more
+        # than our estimate).  In prepaid mode, skip this — we charge
+        # actual usage, so let the model respond fully.
+        if not prepaid and "max_tokens" not in body:
             body = {**body, "max_tokens": self._default_max_tokens}
             logger.info(
                 "Injected max_tokens=%d (default)",

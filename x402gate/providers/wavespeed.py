@@ -79,7 +79,13 @@ class WaveSpeedProvider(BaseProvider):
                 status_code=503,
             ) from e
 
-    async def submit(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+    async def submit(
+        self,
+        path: str,
+        body: dict[str, Any],
+        *,
+        prepaid: bool = False,
+    ) -> dict[str, Any]:
         """Submit a task to WaveSpeed's API.
 
         Forwards the request body as-is to POST /api/v3/{path}.

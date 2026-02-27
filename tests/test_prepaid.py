@@ -142,3 +142,46 @@ class TestSigningMessage:
 
         assert verify_wallet_signature(str(kp.pubkey()), str(sig), msg) is True
         assert validate_timestamp(ts) is True
+
+
+# --- EVM (EIP-191) signature verification ---
+
+
+class TestEvmSignatureVerification:
+    """Tests for verify_wallet_signature with EVM wallets."""
+
+    def test_evm_valid_signature(self):
+        """EVM personal_sign roundtrip: sign → verify."""
+        from eth_account import Account
+        from eth_account.messages import encode_defunct
+
+        acct = Account.create()
+        message = b"x402gate:openrouter/test:1234567890"
+        msg = encode_defunct(message)
+        signed = acct.sign_message(msg)
+
+        assert verify_wallet_signature(acct.address, signed.signature.hex(), message) is True
+
+    def test_evm_wrong_address(self):
+        """Signature from one EVM wallet fails verification with another address."""
+        from eth_account import Account
+        from eth_account.messages import encode_defunct
+
+        acct1 = Account.create()
+        acct2 = Account.create()
+        message = b"x402gate:openrouter/test:1234567890"
+        msg = encode_defunct(message)
+        signed = acct1.sign_message(msg)
+
+        assert verify_wallet_signature(acct2.address, signed.signature.hex(), message) is False
+
+    def test_evm_garbage_signature(self):
+        """Invalid hex signature returns False."""
+        assert (
+            verify_wallet_signature(
+                "0x0000000000000000000000000000000000000001",
+                "not_a_hex_sig",
+                b"test",
+            )
+            is False
+        )

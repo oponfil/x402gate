@@ -115,7 +115,20 @@ async def poll_result(
                     headers={"Authorization": f"Bearer {api_key}"},
                 )
 
-                if response.status_code >= 400:
+                if response.status_code >= 500:
+                    # Server error — may be transient, retry like network errors
+                    logger.warning(
+                        "Task %s poll #%d: HTTP %d after %ds — %s",
+                        task_id,
+                        poll_count,
+                        response.status_code,
+                        elapsed,
+                        response.text[:200],
+                    )
+                    # Fall through to sleep and retry
+
+                elif response.status_code >= 400:
+                    # Client error (4xx) — won't change on retry, fail immediately
                     logger.warning(
                         "Task %s poll #%d: HTTP %d after %ds — %s",
                         task_id,
@@ -129,53 +142,53 @@ async def poll_result(
                         detail=response.text,
                     )
 
-                data = response.json()
-                task_data = data.get("data", data)
-                status = task_data.get("status", "")
+                else:
+                    data = response.json()
+                    task_data = data.get("data", data)
+                    status = task_data.get("status", "")
 
-                if status == "completed":
-                    logger.info(
-                        "Task %s completed after %ds (%d polls)",
-                        task_id,
-                        elapsed,
-                        poll_count,
-                    )
-                    return task_data
+                    if status == "completed":
+                        logger.info(
+                            "Task %s completed after %ds (%d polls)",
+                            task_id,
+                            elapsed,
+                            poll_count,
+                        )
+                        return task_data
 
-                if status == "failed":
-                    error_msg = task_data.get("error", "Task failed without details")
-                    logger.error(
-                        "Task %s failed after %ds (%d polls): %s",
-                        task_id,
-                        elapsed,
-                        poll_count,
-                        str(error_msg)[:200],
-                    )
-                    # Try to extract clean validation errors from provider response
-                    if isinstance(error_msg, dict):
-                        # Some providers return structured errors
-                        error_msg = error_msg.get("message", str(error_msg))
-                    elif isinstance(error_msg, str):
-                        # Try to extract "Validation errors: [...]" patterns
+                    if status == "failed":
+                        error_msg = task_data.get("error", "Task failed without details")
+                        logger.error(
+                            "Task %s failed after %ds (%d polls): %s",
+                            task_id,
+                            elapsed,
+                            poll_count,
+                            str(error_msg)[:200],
+                        )
+                        # Try to extract clean validation errors from provider response
+                        if isinstance(error_msg, dict):
+                            # Some providers return structured errors
+                            error_msg = error_msg.get("message", str(error_msg))
+                        elif isinstance(error_msg, str):
+                            # Try to extract "Validation errors: [...]" patterns
+                            match = re.search(r"Validation errors: \[(.+?)\]", error_msg)
+                            if match:
+                                error_msg = match.group(1).strip("'\"")
+                        raise ProxyError(
+                            status_code=502,
+                            detail=error_msg,
+                        )
 
-                        match = re.search(r"Validation errors: \[(.+?)\]", error_msg)
-                        if match:
-                            error_msg = match.group(1).strip("'\"")
-                    raise ProxyError(
-                        status_code=502,
-                        detail=error_msg,
-                    )
-
-                # Log every poll at INFO for first 5, then every 10th
-                if poll_count <= 5 or poll_count % 10 == 0:
-                    logger.info(
-                        "Task %s poll #%d: status=%s, elapsed=%ds/%ds",
-                        task_id,
-                        poll_count,
-                        status,
-                        elapsed,
-                        poll_timeout,
-                    )
+                    # Log every poll at INFO for first 5, then every 10th
+                    if poll_count <= 5 or poll_count % 10 == 0:
+                        logger.info(
+                            "Task %s poll #%d: status=%s, elapsed=%ds/%ds",
+                            task_id,
+                            poll_count,
+                            status,
+                            elapsed,
+                            poll_timeout,
+                        )
 
             except httpx.RequestError as e:
                 logger.warning(
@@ -189,6 +202,10 @@ async def poll_result(
                 # Fall through to sleep and retry
 
             await asyncio.sleep(poll_interval)
+            # NOTE: elapsed counts sleep time only, not HTTP request duration.
+            # Real wall-clock time may be higher if requests are slow (up to
+            # 30s httpx timeout each).  Actual user-facing latency is tracked
+            # via time.monotonic() in app.py, not here.
             elapsed += poll_interval
 
     logger.error(

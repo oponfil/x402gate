@@ -12,8 +12,13 @@ x402gate is configured via `config.yaml` in the project root. Secrets are stored
 | `port` | int | `4021` | Server port |
 | `commission` | float | `0.04` | Markup rate on provider prices (0.04 = 4%) |
 | `gas_surcharge` | float | `0.001` | Fixed gas surcharge ($0.001) added per request |
-| `default_max_tokens` | int | `1024` | Default `max_tokens` for token-based providers when client omits it |
+| `default_max_tokens` | int | `1024` | Default `max_tokens` for token-based providers when client omits it (x402 mode only; skipped in prepaid mode) |
+| `web_search_tokens_per_result` | int | `2048` | Estimated extra input tokens per web search result |
+| `default_web_search_max_results` | int | `3` | Default `max_results` for web search plugins when client omits it |
+| `web_search_cost_per_result` | float | `0.004` | Fixed cost per web search result ($0.004, OpenRouter Exa: $4/1000) |
 | `price_cache_ttl` | int | `60` | Price cache TTL in seconds. `0` = disabled |
+| `max_prepaid_topup` | float | `10.0` | Maximum single top-up amount in USD |
+| `min_prepaid_topup` | float | `0.10` | Minimum single top-up amount in USD |
 
 ### `payment`
 
