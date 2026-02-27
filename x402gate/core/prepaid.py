@@ -43,7 +43,9 @@ async def deposit(pubkey: str, amount: Decimal) -> Decimal:
         _balances[pubkey] = new_balance
         logger.info(
             "Prepaid deposit: +$%s to %s (balance: $%s)",
-            amount, pubkey[:12] + "…", new_balance,
+            amount,
+            pubkey[:12] + "…",
+            new_balance,
         )
         return new_balance
 
@@ -65,7 +67,9 @@ async def deduct(pubkey: str, amount: Decimal) -> bool:
         _balances[pubkey] = current - amount
         logger.info(
             "Prepaid deduct: -$%s from %s (remaining: $%s)",
-            amount, pubkey[:12] + "…", _balances[pubkey],
+            amount,
+            pubkey[:12] + "…",
+            _balances[pubkey],
         )
         return True
 

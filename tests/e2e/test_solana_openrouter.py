@@ -1,4 +1,5 @@
 """E2E test: Solana (SVM) payment → OpenRouter chat completion."""
+
 import os
 import subprocess
 import time
@@ -24,8 +25,6 @@ async def test_solana_openrouter(gateway_process):
     or_key = os.environ.get("OPENROUTER_API_KEY")
     if not or_key or or_key == "placeholder":
         pytest.skip("OPENROUTER_API_KEY not set")
-
-
 
     cfg = load_config()
     sol_cfg = cfg.payment.networks["solana"]

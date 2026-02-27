@@ -9,6 +9,7 @@ This client simulates a user paying with Solana USDC:
 Usage:
     SOLANA_E2ETEST_PRIVATE_KEY=... python tests/e2e/x402_solana_test_client.py
 """
+
 import asyncio
 import base64
 import logging

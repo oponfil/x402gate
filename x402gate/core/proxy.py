@@ -118,7 +118,10 @@ async def poll_result(
                 if response.status_code >= 400:
                     logger.warning(
                         "Task %s poll #%d: HTTP %d after %ds — %s",
-                        task_id, poll_count, response.status_code, elapsed,
+                        task_id,
+                        poll_count,
+                        response.status_code,
+                        elapsed,
                         response.text[:200],
                     )
                     raise ProxyError(
@@ -133,7 +136,9 @@ async def poll_result(
                 if status == "completed":
                     logger.info(
                         "Task %s completed after %ds (%d polls)",
-                        task_id, elapsed, poll_count,
+                        task_id,
+                        elapsed,
+                        poll_count,
                     )
                     return task_data
 
@@ -141,7 +146,10 @@ async def poll_result(
                     error_msg = task_data.get("error", "Task failed without details")
                     logger.error(
                         "Task %s failed after %ds (%d polls): %s",
-                        task_id, elapsed, poll_count, str(error_msg)[:200],
+                        task_id,
+                        elapsed,
+                        poll_count,
+                        str(error_msg)[:200],
                     )
                     # Try to extract clean validation errors from provider response
                     if isinstance(error_msg, dict):
@@ -162,13 +170,21 @@ async def poll_result(
                 if poll_count <= 5 or poll_count % 10 == 0:
                     logger.info(
                         "Task %s poll #%d: status=%s, elapsed=%ds/%ds",
-                        task_id, poll_count, status, elapsed, poll_timeout,
+                        task_id,
+                        poll_count,
+                        status,
+                        elapsed,
+                        poll_timeout,
                     )
 
             except httpx.RequestError as e:
                 logger.warning(
                     "Task %s poll #%d failed after %ds: %s: %s",
-                    task_id, poll_count, elapsed, type(e).__name__, e,
+                    task_id,
+                    poll_count,
+                    elapsed,
+                    type(e).__name__,
+                    e,
                 )
                 # Fall through to sleep and retry
 
@@ -177,6 +193,9 @@ async def poll_result(
 
     logger.error(
         "Task %s timed out after %ds (%d polls, url=%s)",
-        task_id, poll_timeout, poll_count, url,
+        task_id,
+        poll_timeout,
+        poll_count,
+        url,
     )
     raise TaskTimeoutError(task_id=task_id, timeout=poll_timeout)

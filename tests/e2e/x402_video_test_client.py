@@ -8,6 +8,7 @@ Generates a short 480p video using Wan 2.2:
 Usage:
     BASE_E2ETEST_PRIVATE_KEY=... python tests/e2e/x402_video_test_client.py
 """
+
 import asyncio
 import base64
 import logging

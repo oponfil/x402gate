@@ -9,6 +9,7 @@ This client simulates a user:
 Usage:
     python tests/e2e/x402_test_client.py
 """
+
 import asyncio
 import base64
 import logging

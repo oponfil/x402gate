@@ -10,6 +10,7 @@ This client tests the passthrough proxy flow:
 Usage:
     BASE_E2ETEST_PRIVATE_KEY=... python tests/e2e/x402_blockrun_test_client.py
 """
+
 import asyncio
 import base64
 import json

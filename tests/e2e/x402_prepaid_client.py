@@ -80,9 +80,7 @@ async def _topup(
     # Sign and submit payment
     logger.info("Signing Solana payment for top-up...")
     payment_payload = await x402_client.create_payment_payload(payment_required)
-    signature = base64.b64encode(
-        payment_payload.model_dump_json(by_alias=True).encode()
-    ).decode()
+    signature = base64.b64encode(payment_payload.model_dump_json(by_alias=True).encode()).decode()
 
     response = await http_client.post(
         f"{gateway_url}/v1/topup",
@@ -140,9 +138,7 @@ async def _prepaid_request(
     )
 
     if response.status_code != 200:
-        logger.error(
-            "[%s] Failed: %d %s", label, response.status_code, response.text[:300]
-        )
+        logger.error("[%s] Failed: %d %s", label, response.status_code, response.text[:300])
         sys.exit(1)
 
     result = response.json()
@@ -228,14 +224,14 @@ async def run_client():
     async with httpx.AsyncClient() as http_client:
         # 1. Top-up
         topup_result = await _topup(http_client, gateway_url, x402_client)
-        balances["top-up"] = await _check_balance(
-            http_client, gateway_url, pubkey_str, "top-up"
-        )
+        balances["top-up"] = await _check_balance(http_client, gateway_url, pubkey_str, "top-up")
 
         # 2. OpenRouter call #1
         or_ex = cfg["providers"]["openrouter"]["example_request"]
         await _prepaid_request(
-            http_client, gateway_url, keypair,
+            http_client,
+            gateway_url,
+            keypair,
             provider="openrouter",
             sub_path="chat/completions",
             body=or_ex["body"],
@@ -247,7 +243,9 @@ async def run_client():
 
         # 3. OpenRouter call #2
         await _prepaid_request(
-            http_client, gateway_url, keypair,
+            http_client,
+            gateway_url,
+            keypair,
             provider="openrouter",
             sub_path="chat/completions",
             body=or_ex["body"],
@@ -261,7 +259,9 @@ async def run_client():
         ws_ex = cfg["providers"]["wavespeed"]["example_request"]
         ws_model = ws_ex["model"]  # e.g. "wavespeed-ai/z-image/turbo"
         await _prepaid_request(
-            http_client, gateway_url, keypair,
+            http_client,
+            gateway_url,
+            keypair,
             provider="wavespeed",
             sub_path=ws_model,
             body=ws_ex["body"],
@@ -276,7 +276,9 @@ async def run_client():
         tg_ex = cfg["providers"]["tungsten"]["example_request"]
         tg_model = tg_ex["model"]  # e.g. "generations"
         await _prepaid_request(
-            http_client, gateway_url, keypair,
+            http_client,
+            gateway_url,
+            keypair,
             provider="tungsten",
             sub_path=tg_model,
             body=tg_ex["body"],

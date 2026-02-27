@@ -382,9 +382,7 @@ async def topup(request: Request) -> Response:
         return _error_response(400, f"Top-up amount exceeds maximum (${max_topup})")
 
     # Verify payment
-    is_valid, payment_network, payer = await payment_handler.verify(
-        payment_sig, topup_amount
-    )
+    is_valid, payment_network, payer = await payment_handler.verify(payment_sig, topup_amount)
     if not is_valid or not payer:
         return _error_response(402, "Payment verification failed")
 
@@ -414,12 +412,14 @@ async def topup(request: Request) -> Response:
     _pending_settlements.add(task)
     task.add_done_callback(_pending_settlements.discard)
 
-    return JSONResponse(content={
-        "pubkey": payer,
-        "credited": str(net_credit),
-        "balance": str(new_balance),
-        "warning": "Balance is stored in memory only. It will be lost on server restart.",
-    })
+    return JSONResponse(
+        content={
+            "pubkey": payer,
+            "credited": str(net_credit),
+            "balance": str(new_balance),
+            "warning": "Balance is stored in memory only. It will be lost on server restart.",
+        }
+    )
 
 
 @app.get("/v1/balance/{pubkey}")
@@ -430,7 +430,6 @@ async def check_balance(pubkey: str) -> dict[str, Any]:
         "pubkey": pubkey,
         "balance": str(balance),
     }
-
 
 
 # --- Provider Info ---
@@ -550,9 +549,7 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
 
     if payment_sig:
         # 5a. Standard x402 payment flow
-        is_valid, payment_network, _ = await payment_handler.verify(
-            payment_sig, final_price
-        )
+        is_valid, payment_network, _ = await payment_handler.verify(payment_sig, final_price)
         if not is_valid:
             return _error_response(402, "Payment verification failed")
     elif prepaid_pubkey:
@@ -561,9 +558,7 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
         prepaid_ts = request.headers.get("x-prepaid-timestamp", "")
 
         if not prepaid_sig or not prepaid_ts:
-            return _error_response(
-                401, "Missing X-PREPAID-SIGNATURE or X-PREPAID-TIMESTAMP header"
-            )
+            return _error_response(401, "Missing X-PREPAID-SIGNATURE or X-PREPAID-TIMESTAMP header")
 
         try:
             ts_int = int(prepaid_ts)

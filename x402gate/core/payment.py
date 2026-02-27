@@ -142,7 +142,6 @@ class PaymentHandler:
     def _init_svm(self, name: str, cfg: NetworkConfig) -> None:
         """Initialize an SVM network (Solana)."""
 
-
         signer = SolanaSigner(
             private_key=cfg.facilitator_key,
             rpc_url=cfg.rpc_url,
@@ -248,9 +247,7 @@ class PaymentHandler:
         """Extract the PAYMENT-SIGNATURE header from a request."""
         return request.headers.get("payment-signature")
 
-    async def verify(
-        self, payment_signature: str, price: Decimal
-    ) -> tuple[bool, str, str]:
+    async def verify(self, payment_signature: str, price: Decimal) -> tuple[bool, str, str]:
         """Verify a payment signature on the correct network.
 
         Args:
@@ -342,7 +339,6 @@ class PaymentHandler:
                         gas_label = "ETH"
                 elif ns.config.type == "svm" and ns.svm_signer:
                     try:
-
                         tx_sig = SolSignature.from_string(result.transaction)
                         tx_resp = await ns.svm_signer.get_transaction_async(
                             tx_sig,

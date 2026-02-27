@@ -55,9 +55,7 @@ def save_images(images: list, label: str) -> list[Path]:
     return saved
 
 
-async def save_from_urls(
-    urls: list[str], label: str, http_client: httpx.AsyncClient
-) -> list[Path]:
+async def save_from_urls(urls: list[str], label: str, http_client: httpx.AsyncClient) -> list[Path]:
     """Download and save media files from URLs to tests/e2e/output/.
 
     Returns list of saved file paths.

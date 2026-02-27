@@ -1,4 +1,5 @@
 """Unit tests for payment handling."""
+
 import json
 from decimal import Decimal
 

@@ -1,4 +1,5 @@
 """Shared fixtures and helpers for E2E tests."""
+
 import os
 import subprocess
 import tempfile
@@ -85,7 +86,6 @@ class BaseChain:
     """Helper for interacting with Base (EVM) on-chain state."""
 
     def __init__(self):
-
 
         cfg = load_config()
         self.base_cfg = cfg.payment.networks["base"]

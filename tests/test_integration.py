@@ -3,6 +3,7 @@
 Uses respx to mock WaveSpeed and facilitator APIs,
 and httpx.AsyncClient with FastAPI's TestClient for request testing.
 """
+
 import asyncio
 import os
 import time
@@ -68,9 +69,7 @@ providers:
 def client(config_file):
     """Create a test client with mocked config path."""
     with patch("x402gate.app.load_config") as mock_load:
-
         mock_load.return_value = real_load(config_file)
-
 
         with TestClient(app) as c:
             yield c
@@ -241,11 +240,8 @@ class TestPrepaidFlow:
     def test_balance_after_deposit(self, client):
         """GET /v1/balance after manual deposit shows correct balance."""
 
-
         reset()
-        asyncio.get_event_loop().run_until_complete(
-            deposit("TestPubKey", Decimal("5.00"))
-        )
+        asyncio.get_event_loop().run_until_complete(deposit("TestPubKey", Decimal("5.00")))
 
         response = client.get("/v1/balance/TestPubKey")
         assert response.status_code == 200
@@ -256,14 +252,10 @@ class TestPrepaidFlow:
     def test_prepaid_request_deducts_balance(self, client):
         """POST with prepaid headers deducts base_price from balance."""
 
-
-
         reset()
         kp = Keypair()
         pubkey_str = str(kp.pubkey())
-        asyncio.get_event_loop().run_until_complete(
-            deposit(pubkey_str, Decimal("1.00"))
-        )
+        asyncio.get_event_loop().run_until_complete(deposit(pubkey_str, Decimal("1.00")))
 
         # Mock WaveSpeed pricing + submit
         respx.post("https://api.wavespeed.ai/api/v3/model/pricing").mock(
@@ -296,14 +288,10 @@ class TestPrepaidFlow:
     def test_prepaid_insufficient_balance(self, client):
         """POST with prepaid headers and insufficient balance returns 402."""
 
-
-
         reset()
         kp = Keypair()
         pubkey_str = str(kp.pubkey())
-        asyncio.get_event_loop().run_until_complete(
-            deposit(pubkey_str, Decimal("0.001"))
-        )
+        asyncio.get_event_loop().run_until_complete(deposit(pubkey_str, Decimal("0.001")))
 
         respx.post("https://api.wavespeed.ai/api/v3/model/pricing").mock(
             return_value=httpx.Response(200, json={"data": {"unit_price": 0.003}})
@@ -331,8 +319,6 @@ class TestPrepaidFlow:
     def test_prepaid_invalid_signature(self, client):
         """POST with invalid prepaid signature returns 401."""
 
-
-
         reset()
         kp = Keypair()
 
@@ -357,8 +343,6 @@ class TestPrepaidFlow:
     def test_prepaid_expired_timestamp(self, client):
         """POST with expired timestamp returns 401."""
 
-
-
         reset()
         kp = Keypair()
         old_ts = int(time.time()) - 120  # 2 minutes ago
@@ -381,4 +365,3 @@ class TestPrepaidFlow:
 
         assert response.status_code == 401
         reset()
-

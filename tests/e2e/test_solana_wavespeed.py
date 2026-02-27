@@ -1,4 +1,5 @@
 """E2E test: Solana (SVM) payment → WaveSpeed generation."""
+
 import os
 import subprocess
 import time
@@ -22,8 +23,6 @@ async def test_solana_wavespeed(gateway_process):
     if os.environ.get("SOLANA_FACILITATOR_PRIVATE_KEY") == "FILL_ME":
         pytest.skip("SOLANA_FACILITATOR_PRIVATE_KEY not configured yet")
 
-
-
     cfg = load_config()
     sol_cfg = cfg.payment.networks["solana"]
     client = SolanaClient(sol_cfg.rpc_url)
@@ -40,7 +39,6 @@ async def test_solana_wavespeed(gateway_process):
 
     def get_spl_balance(owner_str: str) -> int:
         """Get USDC (SPL token) balance for a Solana address."""
-
 
         owner = Pk.from_string(owner_str)
         # Derive Associated Token Account (ATA)
