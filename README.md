@@ -100,6 +100,27 @@ If the provider rejects a request (e.g. invalid parameters), the gateway returns
 
 > **Note:** Payment is settled **only** on success (HTTP 200). On any error, the payment is not settled and no USDC is transferred.
 
+### Prepaid Mode
+
+For high-frequency usage, you can top-up a prepaid balance and skip on-chain transactions per request:
+
+```
+Client                    x402gate
+  │                          │
+  ├─ POST /v1/topup (402) ───►  ← pay once (Solana USDC)
+  ├─ POST /v1/topup + sig ──►  ← balance credited
+  │                          │
+  ├─ POST /v1/openrouter/... ►  ← Ed25519 signature (no blockchain tx)
+  │  X-PREPAID-PUBKEY         │  ← deduct base_price from balance
+  │  X-PREPAID-SIGNATURE      │
+  │  X-PREPAID-TIMESTAMP      │
+  │◄─── 200 + result ────────┤
+```
+
+Commission and gas are charged **once at top-up**. Subsequent requests deduct only the provider's base cost.
+
+> **⚠️ Warning:** Prepaid balances are stored in memory only and are lost on server restart. Max top-up: $10. See [docs/prepaid.md](docs/prepaid.md) for full details.
+
 ### Service Discovery
 
 The root endpoint `GET /` uses content negotiation:
@@ -192,6 +213,7 @@ All settings are in `config.yaml`. Secrets use `${ENV_VAR}` interpolation:
 | `gateway.gas_surcharge` | `0.001` | Fixed gas surcharge ($0.001) added on top of commission |
 | `gateway.default_max_tokens` | `1024` | Default `max_tokens` when client omits it (for token-based providers) |
 | `gateway.price_cache_ttl` | `60` | Price cache TTL in seconds |
+| `gateway.max_prepaid_topup` | `10.0` | Maximum single top-up amount in USD |
 | `payment.networks.base` | — | Base Mainnet (EVM) config |
 | `payment.networks.solana` | — | Solana Mainnet (SVM) config |
 | `providers.wavespeed.poll_timeout` | `300` | Max wait for AI result (seconds) |
@@ -221,6 +243,7 @@ Individual tests:
 | `test_solana_openrouter` | OpenRouter | Solana | LLM chat |
 | `test_solana_wavespeed` | WaveSpeed | Solana | Image generation |
 | `test_blockrun_passthrough` | BlockRun | Base | Passthrough proxy |
+| `test_prepaid_openrouter` | OpenRouter | Solana | Prepaid mode (top-up + 2 calls) |
 
 Requires `BASE_E2ETEST_PRIVATE_KEY` and/or `SOLANA_E2ETEST_PRIVATE_KEY` in `.env`.
 
@@ -236,6 +259,7 @@ See [docs/add-provider.md](docs/add-provider.md) for a step-by-step guide.
 ## Documentation
 
 - [Architecture](docs/architecture.md) — how x402gate works under the hood
+- [Prepaid Mode](docs/prepaid.md) — top-up and pay without on-chain transactions
 - [Deployment](docs/deployment.md) — Railway, Docker, VPS guides
 - [Configuration](docs/configuration.md) — all config options
 - [Tungsten](docs/tungsten.md) — Tungsten image generation provider

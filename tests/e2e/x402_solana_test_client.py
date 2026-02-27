@@ -9,31 +9,32 @@ This client simulates a user paying with Solana USDC:
 Usage:
     SOLANA_E2ETEST_PRIVATE_KEY=... python tests/e2e/x402_solana_test_client.py
 """
-
 import asyncio
+import base64
 import logging
 import os
 import sys
-from datetime import datetime
+import traceback
 from pathlib import Path
 
 import httpx
+import yaml
 from solders.keypair import Keypair
 from x402 import PaymentRequired, x402Client
 from x402.mechanisms.svm.exact.client import ExactSvmScheme
 from x402.mechanisms.svm.signers import KeypairSigner
 
+from helpers import save_from_urls
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("x402-solana-client")
 
-OUTPUT_DIR = Path(__file__).parent / "output"
 CONFIG_PATH = Path(__file__).parent.parent.parent / "config.yaml"
 
 
 def _load_example_request() -> tuple[str, dict]:
     """Load model path and request body from config.yaml."""
-    import yaml
 
     with open(CONFIG_PATH) as f:
         cfg = yaml.safe_load(f)
@@ -103,14 +104,12 @@ async def run_client():
         logger.info("Signing Solana payment...")
         try:
             payment_payload = await x402_client.create_payment_payload(payment_required)
-            import base64
 
             signature = base64.b64encode(
                 payment_payload.model_dump_json(by_alias=True).encode()
             ).decode()
         except Exception as e:
             logger.error("Failed to sign payment: %s", e)
-            import traceback
 
             traceback.print_exc()
             sys.exit(1)
@@ -131,14 +130,7 @@ async def run_client():
             # Download generated image
             outputs = result.get("data", result).get("outputs", [])
             if outputs:
-                OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-                ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                for _i, url in enumerate(outputs):
-                    ext = Path(url.split("?")[0]).suffix or ".jpeg"
-                    img_path = OUTPUT_DIR / f"solana_{ts}{ext}"
-                    img_resp = await http_client.get(url)
-                    img_path.write_bytes(img_resp.content)
-                    logger.info("Saved image: %s", img_path)
+                await save_from_urls(outputs, "solana_wavespeed", http_client)
         else:
             logger.error("Failed: %d %s", response.status_code, response.text)
             sys.exit(1)

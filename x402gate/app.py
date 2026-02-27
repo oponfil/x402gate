@@ -6,12 +6,15 @@ Defines the API routes and wires up providers, pricing, and payment handling.
 from __future__ import annotations
 
 import asyncio
+import base64
 import importlib.metadata
+import json
 import logging
 import os
 import pathlib
 import time
 from contextlib import asynccontextmanager
+from decimal import Decimal
 from typing import Any
 
 import httpx
@@ -20,6 +23,14 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from x402gate.core.config import AppConfig, load_config
 from x402gate.core.payment import PaymentHandler
+from x402gate.core.prepaid import (
+    build_signing_message,
+    deduct,
+    deposit,
+    get_balance,
+    validate_timestamp,
+    verify_wallet_signature,
+)
 from x402gate.core.pricing import PriceCache, apply_commission
 from x402gate.core.proxy import TaskTimeoutError
 from x402gate.providers.base import BaseProvider, ProviderError
@@ -221,8 +232,6 @@ async def service_info(request: Request) -> Response:
                 f" &mdash; <code>/v1/{name}/...</code>{docs_link}</li>\n"
             )
         # Build curl examples from provider configs
-        import json as _json
-
         examples_html = ""
         for name, pcfg in config.providers.items():
             for ex_field in sorted(f for f in pcfg.model_fields if f.startswith("example_request")):
@@ -231,7 +240,7 @@ async def service_info(request: Request) -> Response:
                     continue
                 model = ex.get("model", "MODEL")
                 body = ex.get("body", {})
-                body_json = _json.dumps(body, ensure_ascii=False)
+                body_json = json.dumps(body, ensure_ascii=False)
                 path = f"/v1/{name}/{model}"
                 examples_html += f"""
     <h4>{name} &mdash; <code>{model}</code></h4>
@@ -303,8 +312,6 @@ async def ai_plugin_manifest() -> dict[str, Any]:
         for ex_field in sorted(f for f in pcfg.model_fields if f.startswith("example_request")):
             ex = getattr(pcfg, ex_field, None)
             if ex:
-                import json
-
                 model = ex.get("model", "MODEL_PATH")
                 body = ex.get("body", {})
                 hint += f". Example: POST /v1/{name}/{model} with body {json.dumps(body)}"
@@ -343,6 +350,87 @@ async def ai_plugin_manifest() -> dict[str, Any]:
 async def health_check() -> dict[str, str]:
     """Health check endpoint for deployment monitoring."""
     return {"status": "ok"}
+
+
+@app.post("/v1/topup")
+async def topup(request: Request) -> Response:
+    """Top up prepaid balance via x402 payment.
+
+    The client sends a standard x402 PAYMENT-SIGNATURE for the desired
+    top-up amount. Gateway verifies, settles, deducts commission + gas,
+    and credits the remainder to the sender's prepaid balance.
+    """
+    payment_sig = payment_handler.extract_payment_signature(request)
+    if not payment_sig:
+        # Return 402 with a suggested top-up amount ($0.10)
+        return payment_handler.create_payment_required(Decimal("0.100000"))
+
+    # Parse the requested top-up amount from the payment payload
+    try:
+        payload_dict = json.loads(base64.b64decode(payment_sig))
+        accepted = payload_dict.get("accepted", {})
+        raw_amount = int(accepted.get("amount", 0))
+        topup_amount = Decimal(str(raw_amount)) / Decimal("1000000")  # USDC 6 decimals
+    except Exception:
+        return _error_response(400, "Invalid payment payload")
+
+    if topup_amount <= 0:
+        return _error_response(400, "Top-up amount must be positive")
+
+    max_topup = Decimal(str(config.gateway.max_prepaid_topup))
+    if topup_amount > max_topup:
+        return _error_response(400, f"Top-up amount exceeds maximum (${max_topup})")
+
+    # Verify payment
+    is_valid, payment_network, payer = await payment_handler.verify(
+        payment_sig, topup_amount
+    )
+    if not is_valid or not payer:
+        return _error_response(402, "Payment verification failed")
+
+    # Calculate net credit: topup_amount minus commission and gas
+    commission = topup_amount * Decimal(str(config.gateway.commission))
+    gas_fee = Decimal(str(config.gateway.gas_surcharge))
+    net_credit = topup_amount - commission - gas_fee
+    if net_credit <= 0:
+        return _error_response(400, "Top-up amount too small to cover fees")
+
+    # Credit the prepaid balance
+    new_balance = await deposit(payer, net_credit)
+
+    # Settle payment in background
+    async def _settle_topup() -> None:
+        try:
+            await payment_handler.settle(
+                payment_sig,
+                topup_amount,
+                payment_network,
+                extra_context={"provider_name": "topup", "provider_cost": 0},
+            )
+        except Exception:
+            logger.exception("Top-up settlement failed for %s", payer)
+
+    task = asyncio.create_task(_settle_topup())
+    _pending_settlements.add(task)
+    task.add_done_callback(_pending_settlements.discard)
+
+    return JSONResponse(content={
+        "pubkey": payer,
+        "credited": str(net_credit),
+        "balance": str(new_balance),
+        "warning": "Balance is stored in memory only. It will be lost on server restart.",
+    })
+
+
+@app.get("/v1/balance/{pubkey}")
+async def check_balance(pubkey: str) -> dict[str, Any]:
+    """Check prepaid balance for a wallet."""
+    balance = get_balance(pubkey)
+    return {
+        "pubkey": pubkey,
+        "balance": str(balance),
+    }
+
 
 
 # --- Provider Info ---
@@ -455,15 +543,51 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
         base_price, config.gateway.commission, config.gateway.gas_surcharge
     )
 
-    # 4. Check for payment
+    # 4. Check for payment (x402 or prepaid)
     payment_sig = payment_handler.extract_payment_signature(request)
-    if not payment_sig:
-        return payment_handler.create_payment_required(final_price)
+    prepaid_pubkey = request.headers.get("x-prepaid-pubkey")
+    prepaid_mode = False
 
-    # 5. Verify payment (auto-detects network from payload)
-    is_valid, payment_network = await payment_handler.verify(payment_sig, final_price)
-    if not is_valid:
-        return _error_response(402, "Payment verification failed")
+    if payment_sig:
+        # 5a. Standard x402 payment flow
+        is_valid, payment_network, _ = await payment_handler.verify(
+            payment_sig, final_price
+        )
+        if not is_valid:
+            return _error_response(402, "Payment verification failed")
+    elif prepaid_pubkey:
+        # 5b. Prepaid balance flow
+        prepaid_sig = request.headers.get("x-prepaid-signature", "")
+        prepaid_ts = request.headers.get("x-prepaid-timestamp", "")
+
+        if not prepaid_sig or not prepaid_ts:
+            return _error_response(
+                401, "Missing X-PREPAID-SIGNATURE or X-PREPAID-TIMESTAMP header"
+            )
+
+        try:
+            ts_int = int(prepaid_ts)
+        except ValueError:
+            return _error_response(401, "Invalid X-PREPAID-TIMESTAMP")
+
+        if not validate_timestamp(ts_int):
+            return _error_response(401, "X-PREPAID-TIMESTAMP expired or too far in the future")
+
+        msg = build_signing_message(f"{provider_name}/{path}", ts_int)
+        if not verify_wallet_signature(prepaid_pubkey, prepaid_sig, msg):
+            return _error_response(401, "Invalid prepaid signature")
+
+        # Check balance against base_price (no commission — already paid at top-up)
+        current_balance = get_balance(prepaid_pubkey)
+        if current_balance < base_price:
+            return _error_response(
+                402,
+                f"Insufficient prepaid balance: ${current_balance} < ${base_price}",
+                balance=str(current_balance),
+            )
+        prepaid_mode = True
+    else:
+        return payment_handler.create_payment_required(final_price)
 
     # 6. Forward request to provider
     t_gen_start = time.monotonic()
@@ -513,6 +637,29 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
     if actual_base_price is None:
         actual_base_price = base_price  # fallback to estimate
 
+    if prepaid_mode:
+        # Prepaid: deduct actual cost from balance (no settlement needed)
+        deducted = await deduct(prepaid_pubkey, actual_base_price)
+        remaining = get_balance(prepaid_pubkey)
+        if not deducted:
+            logger.error(
+                "Prepaid deduction failed for %s (tried $%s, had $%s)",
+                prepaid_pubkey[:12] + "…",
+                actual_base_price,
+                remaining,
+            )
+        else:
+            t_client = time.monotonic() - t_start
+            logger.info(
+                "Prepaid %s: -$%s from %s (remaining: $%s, %.1fs)",
+                provider_name,
+                actual_base_price,
+                prepaid_pubkey[:12] + "…",
+                remaining,
+                t_client,
+            )
+        return JSONResponse(content={"data": output})
+
     # 9. Settle payment in background (don't block client)
     t_client = time.monotonic() - t_start
 
@@ -550,5 +697,5 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
     _pending_settlements.add(task)
     task.add_done_callback(_pending_settlements.discard)
 
-    # 9. Return result to client
+    # 10. Return result to client
     return JSONResponse(content={"data": output})

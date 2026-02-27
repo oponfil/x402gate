@@ -15,7 +15,6 @@ import base64
 import logging
 import os
 import sys
-from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -25,10 +24,11 @@ from x402 import PaymentRequired, x402Client
 from x402.mechanisms.evm.exact import ExactEvmScheme
 from x402.mechanisms.evm.signers import EthAccountSigner
 
+from helpers import save_images
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("x402-tungsten-client")
 
-OUTPUT_DIR = Path(__file__).parent / "output"
 CONFIG_PATH = Path(__file__).parent.parent.parent / "config.yaml"
 
 
@@ -103,15 +103,7 @@ async def run_client():
 
             # Save images to disk
             if images:
-                OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-                ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                for i, img in enumerate(images):
-                    b64_data = img.get("base64_png", "")
-                    if b64_data:
-                        img_bytes = base64.b64decode(b64_data)
-                        img_path = OUTPUT_DIR / f"base_tungsten_{ts}_{i}.png"
-                        img_path.write_bytes(img_bytes)
-                        logger.info("Saved image: %s (%d bytes)", img_path, len(img_bytes))
+                save_images(images, "base_tungsten")
         else:
             logger.error("Failed: %d %s", response.status_code, response.text)
             sys.exit(1)

@@ -22,6 +22,7 @@ from typing import Any
 import httpx
 
 from x402gate.core.config import ProviderConfig
+from x402gate.core.proxy import TaskTimeoutError
 from x402gate.providers.base import BaseProvider, ProviderError
 
 logger = logging.getLogger(__name__)
@@ -208,7 +209,6 @@ class TungstenProvider(BaseProvider):
             ProviderError: If the generation fails.
             TaskTimeoutError: If polling exceeds poll_timeout.
         """
-        from x402gate.core.proxy import TaskTimeoutError
 
         client = await self._get_client()
         track_url = f"{self._config.base_url.rstrip('/')}/generations/track"

@@ -1,4 +1,7 @@
 """Shared fixtures and helpers for E2E tests."""
+from eth_account import Account
+from web3 import Web3
+from x402gate.core.config import load_config
 
 import os
 import subprocess
@@ -82,10 +85,7 @@ class BaseChain:
     """Helper for interacting with Base (EVM) on-chain state."""
 
     def __init__(self):
-        from eth_account import Account
-        from web3 import Web3
 
-        from x402gate.core.config import load_config
 
         cfg = load_config()
         self.base_cfg = cfg.payment.networks["base"]

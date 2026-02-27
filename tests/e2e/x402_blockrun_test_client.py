@@ -10,6 +10,7 @@ This client tests the passthrough proxy flow:
 Usage:
     BASE_E2ETEST_PRIVATE_KEY=... python tests/e2e/x402_blockrun_test_client.py
 """
+import traceback
 
 import asyncio
 import base64
@@ -128,7 +129,6 @@ async def run_client():
             ).decode()
         except Exception as e:
             logger.error("Failed to sign payment: %s", e)
-            import traceback
 
             traceback.print_exc()
             sys.exit(1)

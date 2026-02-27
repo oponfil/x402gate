@@ -1,4 +1,5 @@
 """Unit tests for payment handling."""
+import json
 
 from decimal import Decimal
 
@@ -36,7 +37,6 @@ class TestCreatePaymentRequired:
 
     def test_response_contains_accepts(self, handler: PaymentHandler):
         """Response body contains 'accepts' with payment details."""
-        import json
 
         response = handler.create_payment_required(Decimal("0.003150"))
         body = json.loads(response.body.decode())
@@ -45,7 +45,6 @@ class TestCreatePaymentRequired:
 
     def test_payment_details_fields(self, handler: PaymentHandler):
         """Payment details contain all required fields."""
-        import json
 
         response = handler.create_payment_required(Decimal("0.003150"))
         body = json.loads(response.body.decode())
@@ -62,7 +61,6 @@ class TestCreatePaymentRequired:
 
     def test_error_message(self, handler: PaymentHandler):
         """Response contains an error message."""
-        import json
 
         response = handler.create_payment_required(Decimal("0.003150"))
         body = json.loads(response.body.decode())

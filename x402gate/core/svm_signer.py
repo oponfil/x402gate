@@ -16,10 +16,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import logging
 import threading
+import time
 
 from solana.rpc.async_api import AsyncClient
+from solana.rpc.types import TxOpts
 from solders.keypair import Keypair
 from solders.signature import Signature
 from solders.transaction import VersionedTransaction
@@ -183,7 +186,6 @@ class SolanaSigner:
         return self._run_async(self._send_async(tx_base64))
 
     async def _send_async(self, tx_base64: str) -> str:
-        from solana.rpc.types import TxOpts
 
         tx_bytes = base64.b64decode(tx_base64)
         tx = VersionedTransaction.from_bytes(tx_bytes)
@@ -206,7 +208,6 @@ class SolanaSigner:
         self._run_async(self._confirm_async(signature))
 
     async def _confirm_async(self, signature: str) -> None:
-        import time
 
         sig = Signature.from_string(signature)
         timeout = 60
@@ -268,7 +269,6 @@ class SolanaSigner:
 
     def close(self) -> None:
         """Shut down the background event loop and client."""
-        import contextlib
 
         with contextlib.suppress(Exception):
             asyncio.run_coroutine_threadsafe(self._client.close(), self._loop).result(timeout=5)

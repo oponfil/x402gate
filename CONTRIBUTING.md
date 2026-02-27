@@ -1,93 +1,52 @@
-# Contributing to x402gate
+# Coding Rules for x402gate
 
-Thank you for your interest in contributing! This guide covers everything you need to get started.
+## Imports
 
-## Getting Started
+- **All imports must be at the top of the file.** No inline/local imports inside functions, methods, or conditionals.
+- Order: stdlib → third-party → local (`x402gate.*`, `tests.*`).
+- Separate each group with a blank line.
 
-1. Fork and clone the repository
-2. Create a virtual environment:
-   ```bash
-   python -m venv .venv
-   source .venv/bin/activate  # Linux/macOS
-   .venv\Scripts\activate     # Windows
-   ```
-3. Install in development mode:
-   ```bash
-   pip install -e ".[dev]"
-   ```
-4. Copy the environment template:
-   ```bash
-   cp .env.example .env
-   ```
+## Code Style
 
-## Style Guide
+- **Python 3.11+** — use modern syntax (type hints, `match`, `|` union).
+- Keep functions focused and small.
+- Use `async/await` for all I/O-bound operations.
+- Use `Decimal` for monetary values, never `float`.
+- Thread safety: use `asyncio.Lock` for shared mutable state.
 
-### Language
+## DRY — Don't Repeat Yourself
 
-All code, comments, docstrings, commit messages, and documentation must be written in **English**.
+- **Never duplicate logic.** If the same code appears in more than one place, extract it into a shared helper function.
+- Common E2E utilities go in `tests/e2e/helpers.py`.
+- Common core logic goes in `x402gate/core/`.
 
-### Formatting & Linting
+## Testing
 
-We use [Ruff](https://docs.astral.sh/ruff/) for both formatting and linting:
+- Every new feature MUST have unit tests (`tests/test_*.py`) and integration tests (`tests/test_integration.py`).
+- E2E tests go in `tests/e2e/`.
+- Shared E2E logic goes in `tests/e2e/helpers.py` — don't duplicate.
+- Tests should be self-contained and not depend on external state.
 
-```bash
-# Format code
-ruff format .
+## Configuration
 
-# Check for lint errors
-ruff check .
+- All configurable values go in `GatewayConfig` (or related Pydantic models) in `x402gate/core/config.py`.
+- Corresponding entries must be added to `config.yaml` with comments.
+- Use `${ENV_VAR}` syntax for secrets.
 
-# Auto-fix lint errors
-ruff check --fix .
-```
+## Documentation
 
-### Code Conventions
+- Update `README.md` when adding features.
+- Detailed docs go in `docs/`.
+- Update `x402gate/templates/index.html` (landing page) when features are user-facing.
 
-- **Type hints**: Required on all function signatures
-- **Async**: Use `async/await` for all I/O operations (HTTP calls, file reads)
-- **Naming**: `snake_case` for functions and variables, `PascalCase` for classes
-- **Docstrings**: Google style on all public functions and classes
-- **Imports**: Sorted by `ruff` (stdlib → third-party → local)
+## Logging
 
-### Example
+- Use `logger.info()` for important events.
+- Keep production logs compact — no debug dumps.
+- Monetary values in logs: `$X.XXXXXXX` format.
 
-```python
-async def fetch_price(model_id: str, inputs: dict[str, Any]) -> Decimal:
-    """Fetch dynamic pricing from the provider's API.
+## Security
 
-    Args:
-        model_id: Model identifier (e.g. 'wavespeed-ai/flux-dev').
-        inputs: Request parameters to price.
-
-    Returns:
-        Base price in USD as a Decimal.
-
-    Raises:
-        ProviderError: If the pricing API call fails.
-    """
-    ...
-```
-
-## Adding a New Provider
-
-See [docs/add-provider.md](docs/add-provider.md) for a step-by-step guide on implementing a new AI service provider.
-
-## Running Tests
-
-```bash
-# Unit + integration tests
-pytest tests/ -v --ignore=tests/e2e
-
-# E2E tests (requires .env.test with real credentials)
-pytest tests/e2e/ -v -s
-```
-
-## Pull Request Checklist
-
-Before submitting a PR, please ensure:
-
-- [ ] All tests pass (`pytest tests/ -v --ignore=tests/e2e`)
-- [ ] Code is formatted (`ruff format .`)
-- [ ] No lint errors (`ruff check .`)
-- [ ] New code has type hints and docstrings
-- [ ] PR description explains the change and motivation
+- Ed25519 signatures for prepaid authentication.
+- Timestamp validation (60s window) to prevent replay attacks.
+- Never log private keys or full signatures.

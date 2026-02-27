@@ -1,4 +1,5 @@
 """Unit tests for OpenRouter provider."""
+from x402gate.providers.base import ProviderError
 
 from decimal import Decimal
 from unittest.mock import AsyncMock, patch
@@ -166,7 +167,6 @@ class TestGetPrice:
         with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
             mock_get.return_value = empty_catalog
 
-            from x402gate.providers.base import ProviderError
 
             with pytest.raises(ProviderError, match="not found"):
                 await provider.get_price("chat/completions", body)
@@ -208,7 +208,6 @@ class TestSubmit:
         with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
             mock_post.return_value = httpx.Response(status_code=429, text="Rate limit exceeded")
 
-            from x402gate.providers.base import ProviderError
 
             with pytest.raises(ProviderError):
                 await provider.submit("chat/completions", body)

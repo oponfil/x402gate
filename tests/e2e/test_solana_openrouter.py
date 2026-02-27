@@ -1,4 +1,9 @@
 """E2E test: Solana (SVM) payment → OpenRouter chat completion."""
+from solana.rpc.api import Client as SolanaClient
+from solders.keypair import Keypair
+from solders.pubkey import Pubkey
+from x402gate.core.config import load_config
+from solders.pubkey import Pubkey as Pk
 
 import os
 import subprocess
@@ -20,11 +25,7 @@ async def test_solana_openrouter(gateway_process):
     if not or_key or or_key == "placeholder":
         pytest.skip("OPENROUTER_API_KEY not set")
 
-    from solana.rpc.api import Client as SolanaClient
-    from solders.keypair import Keypair
-    from solders.pubkey import Pubkey
 
-    from x402gate.core.config import load_config
 
     cfg = load_config()
     sol_cfg = cfg.payment.networks["solana"]
@@ -37,7 +38,6 @@ async def test_solana_openrouter(gateway_process):
 
     def get_spl_balance(owner_str: str) -> int:
         """Get USDC (SPL token) balance for a Solana address."""
-        from solders.pubkey import Pubkey as Pk
 
         owner = Pk.from_string(owner_str)
         token_program = Pk.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")

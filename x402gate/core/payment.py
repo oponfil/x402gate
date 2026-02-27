@@ -15,12 +15,19 @@ import time
 from decimal import Decimal
 from typing import Any
 
+import httpx
 from fastapi import Request
 from fastapi.responses import JSONResponse
+from solders.signature import Signature as SolSignature
+from web3 import Web3
 from x402 import PaymentPayload, PaymentRequirements
+from x402.mechanisms.evm.exact.facilitator import ExactEvmScheme
+from x402.mechanisms.evm.signers import FacilitatorWeb3Signer
+from x402.mechanisms.svm.exact.facilitator import ExactSvmScheme
 
 from x402gate.core.config import NetworkConfig
 from x402gate.core.pricing import format_price_for_x402
+from x402gate.core.svm_signer import SolanaSigner
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +38,6 @@ _PRICE_TTL = 300  # 5 minutes
 
 def _fetch_prices_sync() -> dict:
     """Fetch ETH and SOL prices from CoinGecko (blocking)."""
-    import httpx
 
     r = httpx.get(
         "https://api.coingecko.com/api/v3/simple/price",
@@ -117,9 +123,6 @@ class PaymentHandler:
 
     def _init_evm(self, name: str, cfg: NetworkConfig) -> None:
         """Initialize an EVM network (Base, Ethereum, etc.)."""
-        from web3 import Web3
-        from x402.mechanisms.evm.exact.facilitator import ExactEvmScheme
-        from x402.mechanisms.evm.signers import FacilitatorWeb3Signer
 
         signer = FacilitatorWeb3Signer(
             private_key=cfg.facilitator_key,
@@ -138,9 +141,7 @@ class PaymentHandler:
 
     def _init_svm(self, name: str, cfg: NetworkConfig) -> None:
         """Initialize an SVM network (Solana)."""
-        from x402.mechanisms.svm.exact.facilitator import ExactSvmScheme
 
-        from x402gate.core.svm_signer import SolanaSigner
 
         signer = SolanaSigner(
             private_key=cfg.facilitator_key,
@@ -247,7 +248,9 @@ class PaymentHandler:
         """Extract the PAYMENT-SIGNATURE header from a request."""
         return request.headers.get("payment-signature")
 
-    async def verify(self, payment_signature: str, price: Decimal) -> tuple[bool, str]:
+    async def verify(
+        self, payment_signature: str, price: Decimal
+    ) -> tuple[bool, str, str]:
         """Verify a payment signature on the correct network.
 
         Args:
@@ -255,14 +258,14 @@ class PaymentHandler:
             price: Expected payment amount.
 
         Returns:
-            Tuple of (is_valid, network_id).
+            Tuple of (is_valid, network_id, payer_address).
         """
         try:
             network, payload_dict = self._detect_network(payment_signature)
             ns = self._schemes.get(network)
             if not ns:
                 logger.warning("Payment on unsupported network: %s", network)
-                return False, network
+                return False, network, ""
 
             payload = PaymentPayload.model_validate(payload_dict)
             requirements_dict = self._build_requirements(price, ns)
@@ -270,18 +273,19 @@ class PaymentHandler:
 
             result = await asyncio.to_thread(ns.scheme.verify, payload, requirements)
             amount_usdc = int(requirements.amount) / 1_000_000
+            payer = getattr(result, "payer", "") or ""
             logger.info(
                 "Payment verified: $%g USDC from %s on %s (valid=%s)",
                 amount_usdc,
-                result.payer,
+                payer,
                 network,
                 result.is_valid,
             )
-            return result.is_valid, network
+            return result.is_valid, network, payer
 
         except Exception:
             logger.exception("Payment verification failed")
-            return False, ""
+            return False, "", ""
 
     async def settle(
         self,
@@ -338,7 +342,6 @@ class PaymentHandler:
                         gas_label = "ETH"
                 elif ns.config.type == "svm" and ns.svm_signer:
                     try:
-                        from solders.signature import Signature as SolSignature
 
                         tx_sig = SolSignature.from_string(result.transaction)
                         tx_resp = await ns.svm_signer.get_transaction_async(

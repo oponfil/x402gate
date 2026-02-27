@@ -3,6 +3,14 @@
 Uses respx to mock WaveSpeed and facilitator APIs,
 and httpx.AsyncClient with FastAPI's TestClient for request testing.
 """
+from x402gate.core.config import load_config as real_load
+from x402gate.app import app
+import asyncio
+from x402gate.core.prepaid import deposit, reset
+import time
+from solders.keypair import Keypair
+from x402gate.core.prepaid import deposit, get_balance, reset
+from x402gate.core.prepaid import reset
 
 import os
 from unittest.mock import patch
@@ -61,11 +69,9 @@ providers:
 def client(config_file):
     """Create a test client with mocked config path."""
     with patch("x402gate.app.load_config") as mock_load:
-        from x402gate.core.config import load_config as real_load
 
         mock_load.return_value = real_load(config_file)
 
-        from x402gate.app import app
 
         with TestClient(app) as c:
             yield c
@@ -222,3 +228,153 @@ class TestBlockRunPassthrough:
         assert response.status_code == 200
         data = response.json()
         assert "blockrun" in data["providers"]
+
+
+class TestPrepaidFlow:
+    """Integration tests for prepaid balance flow."""
+
+    def test_balance_unknown_pubkey(self, client):
+        """GET /v1/balance/{pubkey} returns 0 for unknown pubkey."""
+        response = client.get("/v1/balance/UnknownPubKey123")
+        assert response.status_code == 200
+        assert response.json()["balance"] == "0"
+
+    def test_balance_after_deposit(self, client):
+        """GET /v1/balance after manual deposit shows correct balance."""
+
+
+        reset()
+        asyncio.get_event_loop().run_until_complete(deposit("TestPubKey", __import__("decimal").Decimal("5.00")))
+
+        response = client.get("/v1/balance/TestPubKey")
+        assert response.status_code == 200
+        assert response.json()["balance"] == "5.00"
+        reset()
+
+    @respx.mock
+    def test_prepaid_request_deducts_balance(self, client):
+        """POST with prepaid headers deducts base_price from balance."""
+
+
+
+        reset()
+        kp = Keypair()
+        pubkey_str = str(kp.pubkey())
+        asyncio.get_event_loop().run_until_complete(deposit(pubkey_str, __import__("decimal").Decimal("1.00")))
+
+        # Mock WaveSpeed pricing + submit
+        respx.post("https://api.wavespeed.ai/api/v3/model/pricing").mock(
+            return_value=httpx.Response(200, json={"data": {"unit_price": 0.003}})
+        )
+        respx.post("https://api.wavespeed.ai/api/v3/wavespeed-ai/flux-dev").mock(
+            return_value=httpx.Response(200, json={"data": {"output": {"images": ["base64img"]}}})
+        )
+
+        ts = int(time.time())
+        msg = f"x402gate:wavespeed/wavespeed-ai/flux-dev:{ts}".encode()
+        sig = kp.sign_message(msg)
+
+        response = client.post(
+            "/v1/wavespeed/wavespeed-ai/flux-dev",
+            json={"prompt": "a cat"},
+            headers={
+                "X-PREPAID-PUBKEY": pubkey_str,
+                "X-PREPAID-SIGNATURE": str(sig),
+                "X-PREPAID-TIMESTAMP": str(ts),
+            },
+        )
+
+        assert response.status_code == 200
+        remaining = get_balance(pubkey_str)
+        assert remaining < __import__("decimal").Decimal("1.00")
+        reset()
+
+    @respx.mock
+    def test_prepaid_insufficient_balance(self, client):
+        """POST with prepaid headers and insufficient balance returns 402."""
+
+
+
+        reset()
+        kp = Keypair()
+        pubkey_str = str(kp.pubkey())
+        # Deposit less than the expected price
+        asyncio.get_event_loop().run_until_complete(deposit(pubkey_str, __import__("decimal").Decimal("0.001")))
+
+        respx.post("https://api.wavespeed.ai/api/v3/model/pricing").mock(
+            return_value=httpx.Response(200, json={"data": {"unit_price": 0.003}})
+        )
+
+        ts = int(time.time())
+        msg = f"x402gate:wavespeed/wavespeed-ai/flux-dev:{ts}".encode()
+        sig = kp.sign_message(msg)
+
+        response = client.post(
+            "/v1/wavespeed/wavespeed-ai/flux-dev",
+            json={"prompt": "a cat"},
+            headers={
+                "X-PREPAID-PUBKEY": pubkey_str,
+                "X-PREPAID-SIGNATURE": str(sig),
+                "X-PREPAID-TIMESTAMP": str(ts),
+            },
+        )
+
+        assert response.status_code == 402
+        assert "Insufficient" in response.json()["error"]
+        reset()
+
+    @respx.mock
+    def test_prepaid_invalid_signature(self, client):
+        """POST with invalid prepaid signature returns 401."""
+
+
+
+        reset()
+        kp = Keypair()
+
+        respx.post("https://api.wavespeed.ai/api/v3/model/pricing").mock(
+            return_value=httpx.Response(200, json={"data": {"unit_price": 0.003}})
+        )
+
+        response = client.post(
+            "/v1/wavespeed/wavespeed-ai/flux-dev",
+            json={"prompt": "a cat"},
+            headers={
+                "X-PREPAID-PUBKEY": str(kp.pubkey()),
+                "X-PREPAID-SIGNATURE": "invalid_signature",
+                "X-PREPAID-TIMESTAMP": str(int(time.time())),
+            },
+        )
+
+        assert response.status_code == 401
+        reset()
+
+    @respx.mock
+    def test_prepaid_expired_timestamp(self, client):
+        """POST with expired timestamp returns 401."""
+
+
+
+        reset()
+        kp = Keypair()
+        old_ts = int(time.time()) - 120  # 2 minutes ago
+        msg = f"x402gate:wavespeed/wavespeed-ai/flux-dev:{old_ts}".encode()
+        sig = kp.sign_message(msg)
+
+        respx.post("https://api.wavespeed.ai/api/v3/model/pricing").mock(
+            return_value=httpx.Response(200, json={"data": {"unit_price": 0.003}})
+        )
+
+        response = client.post(
+            "/v1/wavespeed/wavespeed-ai/flux-dev",
+            json={"prompt": "a cat"},
+            headers={
+                "X-PREPAID-PUBKEY": str(kp.pubkey()),
+                "X-PREPAID-SIGNATURE": str(sig),
+                "X-PREPAID-TIMESTAMP": str(old_ts),
+            },
+        )
+
+        assert response.status_code == 401
+        reset()
+

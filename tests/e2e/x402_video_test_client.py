@@ -8,30 +8,30 @@ Generates a short 480p video using Wan 2.2:
 Usage:
     BASE_E2ETEST_PRIVATE_KEY=... python tests/e2e/x402_video_test_client.py
 """
-
 import asyncio
+import base64
 import logging
 import os
 import sys
-from datetime import datetime
 from pathlib import Path
 
 import httpx
+import yaml
 from eth_account import Account
 from x402 import PaymentRequired, x402Client
 from x402.mechanisms.evm.exact.client import ExactEvmScheme
 from x402.mechanisms.evm.signers import EthAccountSigner
 
+from helpers import save_from_urls
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("x402-video-client")
 
-OUTPUT_DIR = Path(__file__).parent / "output"
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "config.yaml"
 
 
 def _load_example_request() -> tuple[str, dict]:
     """Load model and body from config.yaml's wavespeed example_request_2."""
-    import yaml
 
     with open(CONFIG_PATH) as f:
         cfg = yaml.safe_load(f)
@@ -98,7 +98,6 @@ async def run_client():
         # 2. Sign payment
         logger.info("Signing payment...")
         payment_payload = await x402_client.create_payment_payload(payment_required)
-        import base64
 
         signature = base64.b64encode(
             payment_payload.model_dump_json(by_alias=True).encode()
@@ -121,14 +120,7 @@ async def run_client():
             # Download video
             outputs = data.get("outputs", [])
             if outputs:
-                OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-                ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                for url in outputs:
-                    ext = Path(url.split("?")[0]).suffix or ".mp4"
-                    vid_path = OUTPUT_DIR / f"video_{ts}{ext}"
-                    vid_resp = await http_client.get(url, timeout=60.0)
-                    vid_path.write_bytes(vid_resp.content)
-                    logger.info("Saved video: %s (%d bytes)", vid_path, len(vid_resp.content))
+                await save_from_urls(outputs, "video", http_client)
             else:
                 logger.warning("No output URLs in response: %s", data)
         else:

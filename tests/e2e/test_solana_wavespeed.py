@@ -1,4 +1,11 @@
 """E2E test: Solana (SVM) payment → WaveSpeed generation."""
+from solana.rpc.api import Client as SolanaClient
+from solders.keypair import Keypair
+from solders.pubkey import Pubkey
+from x402gate.core.config import load_config
+from x402gate.core.config import load_config as _lc
+from solders.keypair import Keypair as _Kp
+from solders.pubkey import Pubkey as Pk
 
 import os
 import subprocess
@@ -15,11 +22,7 @@ async def test_solana_wavespeed(gateway_process):
     if os.environ.get("SOLANA_FACILITATOR_PRIVATE_KEY") == "FILL_ME":
         pytest.skip("SOLANA_FACILITATOR_PRIVATE_KEY not configured yet")
 
-    from solana.rpc.api import Client as SolanaClient
-    from solders.keypair import Keypair
-    from solders.pubkey import Pubkey
 
-    from x402gate.core.config import load_config
 
     cfg = load_config()
     sol_cfg = cfg.payment.networks["solana"]
@@ -38,7 +41,6 @@ async def test_solana_wavespeed(gateway_process):
     def get_spl_balance(owner_str: str) -> int:
         """Get USDC (SPL token) balance for a Solana address."""
 
-        from solders.pubkey import Pubkey as Pk
 
         owner = Pk.from_string(owner_str)
         # Derive Associated Token Account (ATA)
@@ -58,12 +60,10 @@ async def test_solana_wavespeed(gateway_process):
         return client.get_balance(pk).value
 
     # Also track facilitator SOL for gas (facilitator pays gas, not PayTo)
-    from x402gate.core.config import load_config as _lc
 
     _cfg = _lc()
     _sol_cfg = _cfg.payment.networks["solana"]
     # Facilitator address derived from its key
-    from solders.keypair import Keypair as _Kp
 
     fac_kp = _Kp.from_base58_string(os.environ["SOLANA_FACILITATOR_PRIVATE_KEY"])
     FAC = str(fac_kp.pubkey())  # noqa: N806
