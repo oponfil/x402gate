@@ -102,6 +102,14 @@ When using prepaid balance, send these headers **instead of** `PAYMENT-SIGNATURE
 | `X-PREPAID-SIGNATURE` | Wallet signature (base58 for Solana, hex for EVM) |
 | `X-PREPAID-TIMESTAMP` | Unix timestamp (integer seconds) |
 
+### Response Header
+
+Successful prepaid responses include the remaining balance:
+
+| Header | Description |
+|--------|-------------|
+| `X-Prepaid-Balance` | Remaining prepaid balance after deduction (e.g. `0.0535824`) |
+
 ### Signing Message Format
 
 The message to sign is: `x402gate:{path}:{timestamp}` encoded as UTF-8 bytes.

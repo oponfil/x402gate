@@ -690,7 +690,10 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
                 remaining,
                 t_client,
             )
-        return JSONResponse(content={"data": output})
+        return JSONResponse(
+            content={"data": output},
+            headers={"X-Prepaid-Balance": str(remaining)},
+        )
 
     # 9. Settle payment in background (don't block client)
     t_client = time.monotonic() - t_start
