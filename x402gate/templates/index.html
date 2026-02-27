@@ -96,7 +96,7 @@
 
     <h1>x402gate</h1>
     <p class="subtitle">v{{ version }} &middot; Pay-per-request AI proxy via x402</p>
-    <p>Pay with <strong>USDC</strong> on {{ networks }} &mdash; no API keys, no subscriptions.</p>
+    <p>Pay with <strong>USDC</strong> on {{ networks | join(", ") }} &mdash; no API keys, no subscriptions.</p>
     <p style="color: #8b949e; font-size: 0.9em;">Payment overhead: <strong>Base</strong> ~2.4s &middot;
         <strong>Solana</strong> ~0.5s (on top of AI generation time)
     </p>
@@ -104,7 +104,11 @@
     <hr>
     <h3>Providers</h3>
     <ul>
-        {{ provider_list }}
+        {% for p in provider_info %}
+        <li><strong>{{ p.name }}</strong> ({{ p.type }}){% if p.description %} &mdash; {{ p.description }}{% endif %}
+            &mdash; <code>/v1/{{ p.name }}/...</code>{% if p.docs_url %} &middot; <a href="{{ p.docs_url }}">API
+                docs</a>{% endif %}</li>
+        {% endfor %}
     </ul>
     <p>Commission: <strong>{{ commission }}</strong> per request</p>
 
@@ -116,29 +120,40 @@
 
     <hr>
     <h3>Prepaid Mode</h3>
-    <p>Top-up once with USDC (Solana or Base) &rarr; make requests without on-chain transactions.</p>
+    <p>{{ prepaid.description }}</p>
     <p class="step"><strong>1.</strong> <code>POST /v1/topup</code> with USDC payment &rarr; balance credited (minus
         commission + gas)</p>
-    <p class="step"><strong>2.</strong> Sign requests with your wallet key (Ed25519 or EIP-191) &mdash; no blockchain
+    <p class="step"><strong>2.</strong> Sign requests with your wallet key ({{ prepaid.wallets | join(" or ") }})
+        &mdash; no blockchain
         fee</p>
     <p class="step"><strong>3.</strong> Only provider base cost is deducted per request</p>
     <div class="note">Balance is stored <strong>in memory only</strong> and will be lost on server restart. Top-up:
-        $0.10 &ndash; $10.
+        {{ prepaid.topup_limits.min }} &ndash; {{ prepaid.topup_limits.max }}.
         <a href="{{ base_url }}/v1/balance/YOUR_PUBKEY">Check balance</a> &middot;
-        <a href="https://github.com/oponfil/x402gate/blob/main/docs/prepaid.md">Docs</a>
+        <a href="{{ prepaid.documentation }}">Docs</a>
     </div>
 
     <hr>
     <h3>Examples</h3>
-    {{ examples }}
+    {% for ex in examples %}
+    <h4>{{ ex.provider }} &mdash; <code>{{ ex.model }}</code></h4>
+    <pre><code>curl -X POST {{ base_url }}{{ ex.path }} \
+  -H "Content-Type: application/json" \
+  -d '{{ ex.body_json }}'
+
+# Response: 402 Payment Required
+# Sign payment, then retry with PAYMENT-SIGNATURE header</code></pre>
+    {% endfor %}
+    <div class="note">Payment is settled <strong>only</strong> on success (HTTP 200). On any error, no USDC is
+        transferred.</div>
 
     <hr>
     <div class="links">
-        <a href="https://github.com/oponfil/x402gate#readme">Documentation</a>
+        <a href="{{ documentation }}">Documentation</a>
         <a href="{{ base_url }}/docs">API Reference</a>
         <a href="{{ base_url }}/v1/providers">Providers JSON</a>
         <a href="{{ base_url }}/health">Health</a>
-        <a href="https://github.com/oponfil/x402gate">Open Source</a>
+        <a href="{{ source }}">Open Source</a>
     </div>
 
 </body>

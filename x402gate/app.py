@@ -18,6 +18,7 @@ from decimal import Decimal
 from typing import Any
 
 import httpx
+import jinja2
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
@@ -189,114 +190,133 @@ app = FastAPI(
 
 @app.get("/", include_in_schema=False)
 async def service_info(request: Request) -> Response:
-    """Service manifest: HTML for browsers, JSON for AI agents."""
+    """Service manifest: HTML for browsers, JSON for AI agents.
+
+    Builds a single data dict used by both responses — no duplication.
+    """
     base_url = os.environ.get("BASE_URL", "")
     networks = list(config.payment.networks.keys())
     commission_pct = int(config.gateway.commission * 100)
     gas_fee = config.gateway.gas_surcharge
-    provider_docs = {}
+
+    # -- Build provider docs and examples (used by both JSON and HTML) --
+    provider_docs: dict[str, Any] = {}
+    provider_info: list[dict[str, Any]] = []
+    examples: list[dict[str, Any]] = []
+
     for name, pcfg in config.providers.items():
-        doc: dict[str, Any] = {
-            "endpoint_pattern": f"/v1/{name}/{{model_path}}",
-        }
+        ptype = getattr(pcfg, "type", "managed") or "managed"
+        provider_info.append(
+            {
+                "name": name,
+                "type": ptype,
+                "description": pcfg.description or "",
+                "docs_url": pcfg.docs_url or "",
+            }
+        )
+
+        doc: dict[str, Any] = {"endpoint_pattern": f"/v1/{name}/{{model_path}}"}
         if pcfg.docs_url:
             doc["api_reference"] = pcfg.docs_url
-        examples = []
+
+        ex_list = []
         for ex_field in sorted(f for f in pcfg.model_fields if f.startswith("example_request")):
             ex = getattr(pcfg, ex_field, None)
-            if ex:
-                model = ex.get("model", "MODEL_PATH")
-                examples.append(
-                    {
-                        "method": "POST",
-                        "path": f"/v1/{name}/{model}",
-                        "body": ex.get("body", {}),
-                    }
-                )
-        if len(examples) == 1:
-            doc["example_request"] = examples[0]
-        elif examples:
-            doc["example_requests"] = examples
+            if not ex:
+                continue
+            model = ex.get("model", "MODEL_PATH")
+            body = ex.get("body", {})
+            entry = {"method": "POST", "path": f"/v1/{name}/{model}", "body": body}
+            ex_list.append(entry)
+            examples.append(
+                {
+                    "provider": name,
+                    "model": model,
+                    "path": f"/v1/{name}/{model}",
+                    "body_json": json.dumps(body, ensure_ascii=False),
+                }
+            )
+        if len(ex_list) == 1:
+            doc["example_request"] = ex_list[0]
+        elif ex_list:
+            doc["example_requests"] = ex_list
         provider_docs[name] = doc
 
-    # If browser requests HTML, return a human-readable landing page
+    prepaid = {
+        "description": (
+            "Top-up a prepaid balance to skip per-request blockchain transactions. "
+            "Commission and gas are charged once at top-up. Subsequent requests "
+            "deduct only the provider's actual cost from the balance."
+        ),
+        "wallets": ["Solana (Ed25519)", "Base/EVM (EIP-191)"],
+        "topup_limits": {
+            "min": f"${config.gateway.min_prepaid_topup}",
+            "max": f"${config.gateway.max_prepaid_topup}",
+        },
+        "endpoints": {
+            "topup": f"{base_url}/v1/topup",
+            "balance": f"{base_url}/v1/balance/{{wallet_address}}",
+        },
+        "documentation": "https://github.com/oponfil/x402gate/blob/main/docs/prepaid.md",
+    }
+
+    service_data = {
+        "version": _VERSION,
+        "base_url": base_url,
+        "networks": networks,
+        "commission": f"{commission_pct}% + ${gas_fee} gas",
+        "provider_info": provider_info,
+        "provider_docs": provider_docs,
+        "prepaid": prepaid,
+        "examples": examples,
+        "source": "https://github.com/oponfil/x402gate",
+        "documentation": "https://github.com/oponfil/x402gate#readme",
+        "endpoints": {
+            "openapi": f"{base_url}/openapi.json",
+            "docs": f"{base_url}/docs",
+            "health": f"{base_url}/health",
+            "providers": f"{base_url}/v1/providers",
+            "topup": f"{base_url}/v1/topup",
+            "balance": f"{base_url}/v1/balance/{{wallet_address}}",
+            "ai_plugin": f"{base_url}/.well-known/ai-plugin.json",
+        },
+    }
+
+    # HTML for browsers — render Jinja2 template with the same data
     accept = request.headers.get("accept", "")
     if "text/html" in accept:
-        provider_list = ""
-        for name, pcfg in config.providers.items():
-            ptype = getattr(pcfg, "type", "managed") or "managed"
-            desc = f" &mdash; {pcfg.description}" if pcfg.description else ""
-            docs_link = f' &middot; <a href="{pcfg.docs_url}">API docs</a>' if pcfg.docs_url else ""
-            provider_list += (
-                f"<li><strong>{name}</strong> ({ptype}){desc}"
-                f" &mdash; <code>/v1/{name}/...</code>{docs_link}</li>\n"
-            )
-        # Build curl examples from provider configs
-        examples_html = ""
-        for name, pcfg in config.providers.items():
-            for ex_field in sorted(f for f in pcfg.model_fields if f.startswith("example_request")):
-                ex = getattr(pcfg, ex_field, None)
-                if not ex:
-                    continue
-                model = ex.get("model", "MODEL")
-                body = ex.get("body", {})
-                body_json = json.dumps(body, ensure_ascii=False)
-                path = f"/v1/{name}/{model}"
-                examples_html += f"""
-    <h4>{name} &mdash; <code>{model}</code></h4>
-    <pre><code>curl -X POST {base_url}{path} \\
-  -H "Content-Type: application/json" \\
-  -d '{body_json}'
-
-# Response: 402 Payment Required
-# Sign payment, then retry with PAYMENT-SIGNATURE header</code></pre>
-"""
-        examples_html += """
-    <div class="note">Payment is settled <strong>only</strong> on success """
-        examples_html += """(HTTP 200). On any error, no USDC is
-        transferred.</div>"""
-
         template_path = pathlib.Path(__file__).parent / "templates" / "index.html"
-        html = template_path.read_text(encoding="utf-8")
-        html = (
-            html.replace("{{ version }}", _VERSION)
-            .replace("{{ networks }}", ", ".join(networks))
-            .replace("{{ provider_list }}", provider_list)
-            .replace("{{ commission }}", f"{commission_pct}% + ${gas_fee} gas")
-            .replace("{{ base_url }}", base_url)
-            .replace("{{ examples }}", examples_html)
+        env = jinja2.Environment(
+            loader=jinja2.FileSystemLoader(template_path.parent),
+            autoescape=True,
         )
+        template = env.get_template(template_path.name)
+        html = template.render(**service_data)
         return HTMLResponse(content=html)
 
-    # Otherwise return JSON for AI agents
-    return JSONResponse(
-        content={
-            "name": "x402gate",
-            "version": _VERSION,
-            "description": (
-                "Transparent pay-per-request proxy for AI services via the x402 protocol. "
-                "Send a POST request to any provider endpoint — if no payment header is "
-                "included, a 402 response is returned with USDC payment options. "
-                "The request body format is defined by the upstream provider — "
-                "x402gate forwards it as-is. See provider_docs for API references."
-            ),
-            "payment_protocol": "x402",
-            "payment_asset": "USDC",
-            "networks": networks,
-            "providers": list(providers.keys()),
-            "commission": f"{commission_pct}% + ${gas_fee} gas per request",
-            "provider_docs": provider_docs,
-            "endpoints": {
-                "openapi": f"{base_url}/openapi.json",
-                "docs": f"{base_url}/docs",
-                "health": f"{base_url}/health",
-                "providers": f"{base_url}/v1/providers",
-                "ai_plugin": f"{base_url}/.well-known/ai-plugin.json",
-            },
-            "source": "https://github.com/oponfil/x402gate",
-            "documentation": "https://github.com/oponfil/x402gate#readme",
-        }
-    )
+    # JSON for AI agents
+    json_data = {
+        "name": "x402gate",
+        "version": _VERSION,
+        "description": (
+            "Transparent pay-per-request proxy for AI services via the x402 protocol. "
+            "Send a POST request to any provider endpoint — if no payment header is "
+            "included, a 402 response is returned with USDC payment options. "
+            "The request body format is defined by the upstream provider — "
+            "x402gate forwards it as-is. See provider_docs for API references."
+        ),
+        "payment_protocol": "x402",
+        "payment_asset": "USDC",
+        "networks": networks,
+        "providers": list(providers.keys()),
+        "commission": service_data["commission"] + " per request",
+        "provider_docs": provider_docs,
+        "prepaid": prepaid,
+        "endpoints": service_data["endpoints"],
+        "source": service_data["source"],
+        "documentation": service_data["documentation"],
+    }
+    return JSONResponse(content=json_data)
 
 
 @app.get("/.well-known/ai-plugin.json", include_in_schema=False)
