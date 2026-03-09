@@ -85,11 +85,23 @@ curl -X POST https://x402gate.io/v1/cloudconvert/convert \
 ```
 
 Supported parameters:
-- `file` — the file to convert (required, max 100 MB)
-- `output_format` — target format: `pdf`, `png`, `mp4`, `docx`, etc. (required)
+- `file` — the file to convert/optimize (required, max 100 MB)
+- `operation` — `convert` (default) or `optimize` (compress PDF/PNG/JPG)
+- `output_format` — target format: `pdf`, `png`, `mp4`, `docx`, etc. (required for convert)
 - `input_format` — source format (optional, auto-detected from filename)
 
 > **Note:** Maximum upload size is configurable via `gateway.max_upload_mb` (default: 100 MB). Files exceeding the limit receive HTTP 413.
+
+#### PDF Optimization (Compression)
+
+```bash
+curl -X POST https://x402gate.io/v1/cloudconvert/convert \
+  -F "file=@large_document.pdf" \
+  -F "operation=optimize" \
+  -F "input_format=pdf"
+
+# Response: 402 Payment Required ($0.03 + commission)
+```
 
 ### Transaction Summary
 

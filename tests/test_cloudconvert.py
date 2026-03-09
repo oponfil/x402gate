@@ -95,7 +95,7 @@ class TestSubmit:
                             }
                         },
                     },
-                    {"name": "convert-file", "status": "waiting"},
+                    {"name": "process-file", "status": "waiting"},
                     {"name": "export-file", "status": "waiting"},
                 ],
             }
@@ -216,7 +216,7 @@ class TestGetResult:
                 "status": "error",
                 "tasks": [
                     {
-                        "name": "convert-file",
+                        "name": "process-file",
                         "status": "error",
                         "code": "INPUT_TASK_FAILED",
                         "message": "The input file could not be converted",
@@ -294,7 +294,7 @@ class TestExtractError:
         job = {
             "tasks": [
                 {
-                    "name": "convert-file",
+                    "name": "process-file",
                     "status": "error",
                     "code": "SANDBOX_FILE_NOT_ALLOWED",
                     "message": "File type not allowed in sandbox",

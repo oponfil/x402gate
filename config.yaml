@@ -172,3 +172,9 @@ providers:
       body:
         input_format: "docx"
         output_format: "pdf"
+    example_request_2:
+      model: "convert"
+      content_type: "multipart"
+      body:
+        operation: "optimize"
+        input_format: "pdf"

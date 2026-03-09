@@ -1,7 +1,8 @@
 """CloudConvert file conversion provider for x402gate.
 
 Implements the BaseProvider interface for CloudConvert's REST API v2:
-- Fixed pricing ($0.03 per conversion)
+- Fixed pricing ($0.03 per operation)
+- Supported operations: convert (format conversion), optimize (file compression)
 - Job creation via POST /v2/jobs
 - File upload via multipart POST to the upload URL
 - Result polling via GET /v2/jobs/{id}
@@ -23,10 +24,11 @@ logger = logging.getLogger(__name__)
 
 
 class CloudConvertProvider(BaseProvider):
-    """CloudConvert file conversion provider.
+    """CloudConvert file conversion and optimization provider.
 
-    Converts files between 200+ formats (documents, images, video, audio).
-    Uses a fixed price per conversion since CloudConvert has no dynamic
+    Converts files between 200+ formats (documents, images, video, audio)
+    and optimizes (compresses) PDF, PNG, JPG files.
+    Uses a fixed price per operation since CloudConvert has no dynamic
     pricing API.
     """
 
@@ -54,7 +56,8 @@ class CloudConvertProvider(BaseProvider):
         """Create a CloudConvert job, upload the file, and return job info.
 
         The body should contain:
-            - output_format (str): Target format (e.g. "pdf", "png", "mp4")
+            - operation (str, optional): "convert" (default) or "optimize"
+            - output_format (str): Target format (required for convert, optional for optimize)
             - input_format (str, optional): Source format (auto-detected if omitted)
             - _file_bytes (bytes): Raw file content (injected by app.py from multipart)
             - _file_name (str): Original filename (injected by app.py from multipart)
@@ -62,11 +65,19 @@ class CloudConvertProvider(BaseProvider):
         Returns:
             Dict with "id" and "status" keys for polling.
         """
-        output_format = body.get("output_format")
-        if not output_format:
+        operation = body.get("operation", "convert")
+        if operation not in ("convert", "optimize"):
             raise ProviderError(
                 provider=self.name,
-                detail="'output_format' is required (e.g. 'pdf', 'png', 'mp4')",
+                detail=f"Unsupported operation '{operation}'. Use 'convert' or 'optimize'.",
+                status_code=400,
+            )
+
+        output_format = body.get("output_format")
+        if operation == "convert" and not output_format:
+            raise ProviderError(
+                provider=self.name,
+                detail="'output_format' is required for convert (e.g. 'pdf', 'png', 'mp4')",
                 status_code=400,
             )
 
@@ -79,15 +90,24 @@ class CloudConvertProvider(BaseProvider):
                 status_code=400,
             )
 
-        # Build convert task options
-        convert_task: dict[str, Any] = {
-            "operation": "convert",
-            "input": "upload-file",
-            "output_format": output_format,
-        }
-        input_format = body.get("input_format")
-        if input_format:
-            convert_task["input_format"] = input_format
+        # Build processing task options
+        if operation == "optimize":
+            process_task: dict[str, Any] = {
+                "operation": "optimize",
+                "input": "upload-file",
+            }
+            input_format = body.get("input_format")
+            if input_format:
+                process_task["input_format"] = input_format
+        else:
+            process_task = {
+                "operation": "convert",
+                "input": "upload-file",
+                "output_format": output_format,
+            }
+            input_format = body.get("input_format")
+            if input_format:
+                process_task["input_format"] = input_format
 
         # 1. Create CloudConvert job
         job_payload = {
@@ -95,10 +115,10 @@ class CloudConvertProvider(BaseProvider):
                 "upload-file": {
                     "operation": "import/upload",
                 },
-                "convert-file": convert_task,
+                "process-file": process_task,
                 "export-file": {
                     "operation": "export/url",
-                    "input": "convert-file",
+                    "input": "process-file",
                 },
             },
         }
@@ -184,10 +204,11 @@ class CloudConvertProvider(BaseProvider):
 
         job_id = job.get("id")
         logger.info(
-            "CloudConvert job created: %s (%s → %s)",
+            "CloudConvert job created: %s (%s, %s → %s)",
             job_id,
+            operation,
             input_format or "auto",
-            output_format,
+            output_format or "optimized",
         )
 
         return {"id": job_id, "status": "processing"}
