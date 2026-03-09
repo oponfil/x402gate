@@ -237,6 +237,7 @@ async def service_info(request: Request) -> Response:
                     "path": f"/v1/{name}/{model}",
                     "body_json": json.dumps(body, ensure_ascii=False),
                     "content_type": ex.get("content_type", "json"),
+                    "body_fields": list(body.items()),
                 }
             )
         if len(ex_list) == 1:
