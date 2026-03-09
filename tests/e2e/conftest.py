@@ -145,10 +145,16 @@ def run_script(
 
     # Use temp files to capture output (avoids pipe buffer deadlocks on Windows)
     stdout_file = tempfile.NamedTemporaryFile(  # noqa: SIM115
-        mode="w", suffix="_stdout.log", delete=False, encoding="utf-8",
+        mode="w",
+        suffix="_stdout.log",
+        delete=False,
+        encoding="utf-8",
     )
     stderr_file = tempfile.NamedTemporaryFile(  # noqa: SIM115
-        mode="w", suffix="_stderr.log", delete=False, encoding="utf-8",
+        mode="w",
+        suffix="_stderr.log",
+        delete=False,
+        encoding="utf-8",
     )
 
     proc = subprocess.Popen(
