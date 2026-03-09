@@ -1,6 +1,5 @@
 """E2E test: invalid params -> provider error -> no settlement -> client keeps money."""
 
-import os
 import time
 
 import pytest

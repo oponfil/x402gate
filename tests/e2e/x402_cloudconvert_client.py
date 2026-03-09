@@ -15,7 +15,6 @@ import base64
 import logging
 import os
 import sys
-from pathlib import Path
 
 import httpx
 from eth_account import Account
