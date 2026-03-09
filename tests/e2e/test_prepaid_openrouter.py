@@ -1,12 +1,13 @@
 """E2E test: Prepaid mode — top-up $0.10 → 2 OpenRouter + WaveSpeed + Tungsten → check balance."""
 
 import os
-import subprocess
 import time
 
 import httpx
 import pytest
 from solders.keypair import Keypair
+
+from tests.e2e.conftest import run_script
 
 
 @pytest.mark.asyncio
@@ -26,13 +27,7 @@ async def test_prepaid_openrouter(gateway_process):
     client_pubkey = str(test_keypair.pubkey())
 
     # Run the prepaid client script (top-up + 2 OpenRouter + WaveSpeed + Tungsten)
-    env = {**os.environ, "GATEWAY_URL": "http://localhost:4022"}
-    result = subprocess.run(  # noqa: ASYNC221
-        ["python", "tests/e2e/x402_prepaid_client.py"],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    result = run_script("tests/e2e/x402_prepaid_client.py", label="Prepaid")
 
     print(result.stdout)
     print(result.stderr)

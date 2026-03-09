@@ -35,6 +35,7 @@ from x402gate.core.prepaid import (
 from x402gate.core.pricing import PriceCache, apply_commission
 from x402gate.core.proxy import TaskTimeoutError
 from x402gate.providers.base import BaseProvider, ProviderError
+from x402gate.providers.cloudconvert import CloudConvertProvider
 from x402gate.providers.openrouter import OpenRouterProvider
 from x402gate.providers.tungsten import TungstenProvider
 from x402gate.providers.wavespeed import WaveSpeedProvider
@@ -66,6 +67,7 @@ PROVIDER_REGISTRY: dict[str, type[BaseProvider]] = {
     "wavespeed": WaveSpeedProvider,
     "openrouter": OpenRouterProvider,
     "tungsten": TungstenProvider,
+    "cloudconvert": CloudConvertProvider,
 }
 
 # Global state (initialized in lifespan)
@@ -234,6 +236,7 @@ async def service_info(request: Request) -> Response:
                     "model": model,
                     "path": f"/v1/{name}/{model}",
                     "body_json": json.dumps(body, ensure_ascii=False),
+                    "content_type": ex.get("content_type", "json"),
                 }
             )
         if len(ex_list) == 1:
@@ -557,11 +560,34 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
 
     t_start = time.monotonic()  # Total client wait time starts here
 
-    # 1. Parse request body
-    try:
-        body = await request.json()
-    except Exception:
-        return _error_response(400, "Invalid JSON body")
+    # 1. Parse request body (JSON or multipart/form-data for file uploads)
+    max_upload_bytes = config.gateway.max_upload_mb * 1024 * 1024
+    content_type = request.headers.get("content-type", "")
+    if "multipart/form-data" in content_type:
+        try:
+            form = await request.form()
+            body: dict[str, Any] = {}
+            for key in form:
+                value = form[key]
+                if hasattr(value, "read"):  # UploadFile
+                    file_bytes = await value.read()
+                    if len(file_bytes) > max_upload_bytes:
+                        return _error_response(
+                            413,
+                            f"File too large ({len(file_bytes) / 1024 / 1024:.1f} MB). "
+                            f"Maximum: {config.gateway.max_upload_mb} MB",
+                        )
+                    body["_file_bytes"] = file_bytes
+                    body["_file_name"] = getattr(value, "filename", "input_file")
+                else:
+                    body[key] = value
+        except Exception:
+            return _error_response(400, "Invalid multipart form data")
+    else:
+        try:
+            body = await request.json()
+        except Exception:
+            return _error_response(400, "Invalid JSON body")
 
     # 2. Fetch price (with cache)
     try:

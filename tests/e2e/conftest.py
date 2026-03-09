@@ -130,6 +130,63 @@ def base_chain():
     return BaseChain()
 
 
+def run_script(
+    script: str,
+    *,
+    label: str = "",
+    heartbeat: int = 30,
+) -> subprocess.CompletedProcess:
+    """Run a client script with heartbeat output every N seconds.
+
+    Prevents silent waits by printing elapsed time while the subprocess runs.
+    """
+    env = {**os.environ, "GATEWAY_URL": "http://localhost:4022", "PYTHONIOENCODING": "utf-8"}
+    tag = f"[{label}] " if label else ""
+
+    # Use temp files to capture output (avoids pipe buffer deadlocks on Windows)
+    stdout_file = tempfile.NamedTemporaryFile(  # noqa: SIM115
+        mode="w", suffix="_stdout.log", delete=False, encoding="utf-8",
+    )
+    stderr_file = tempfile.NamedTemporaryFile(  # noqa: SIM115
+        mode="w", suffix="_stderr.log", delete=False, encoding="utf-8",
+    )
+
+    proc = subprocess.Popen(
+        ["python", script],
+        env=env,
+        stdout=stdout_file,
+        stderr=stderr_file,
+    )
+
+    elapsed = 0
+    try:
+        while proc.poll() is None:
+            time.sleep(1)
+            elapsed += 1
+            if elapsed % heartbeat == 0:
+                print(f"{tag}⏳ Waiting... {elapsed}s elapsed", flush=True)
+    finally:
+        stdout_file.close()
+        stderr_file.close()
+
+    with open(stdout_file.name, encoding="utf-8", errors="replace") as f:
+        stdout = f.read()
+    with open(stderr_file.name, encoding="utf-8", errors="replace") as f:
+        stderr = f.read()
+    os.unlink(stdout_file.name)
+    os.unlink(stderr_file.name)
+
+    if elapsed >= heartbeat:
+        print(f"{tag}✅ Script finished after {elapsed}s (exit code {proc.returncode})", flush=True)
+
+    return subprocess.CompletedProcess(
+        args=["python", script],
+        returncode=proc.returncode,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+
 def run_e2e_client(
     script: str,
     *,
@@ -169,14 +226,7 @@ def run_e2e_client(
     print(f"PayTo  USDC: {before.payto_usdc / 1e6:.6f}")
 
     # --- Run client ---
-    env = {**os.environ, "GATEWAY_URL": "http://localhost:4022", "PYTHONIOENCODING": "utf-8"}
-    result = subprocess.run(
-        ["python", script],
-        env=env,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
+    result = run_script(script, label=label)
 
     print(result.stdout)
     print(result.stderr)

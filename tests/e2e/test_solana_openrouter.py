@@ -1,7 +1,6 @@
 """E2E test: Solana (SVM) payment → OpenRouter chat completion."""
 
 import os
-import subprocess
 import time
 
 import pytest
@@ -10,6 +9,7 @@ from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solders.pubkey import Pubkey as Pk
 
+from tests.e2e.conftest import run_script
 from x402gate.core.config import load_config
 
 
@@ -69,13 +69,7 @@ async def test_solana_openrouter(gateway_process):
     print(f"Facilitator SOL: {fac_sol_before / 1e9:.9f}")
 
     # Run the client script
-    env = {**os.environ, "GATEWAY_URL": "http://localhost:4022"}
-    result = subprocess.run(  # noqa: ASYNC221
-        ["python", "tests/e2e/x402_solana_openrouter_client.py"],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    result = run_script("tests/e2e/x402_solana_openrouter_client.py", label="Solana OpenRouter")
 
     print(result.stdout)
     print(result.stderr)

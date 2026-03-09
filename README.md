@@ -12,6 +12,7 @@ x402gate sits between your AI agent and AI service providers, adding [x402](http
 | [WaveSpeed AI](https://wavespeed.ai) | Managed | 60+ image/video models (Flux, Wan, Kling, Sora…) | `/v1/wavespeed/...` |
 | [Tungsten](https://tungsten.run) | Managed | AI image generation (SDXL, Flux, Qwen, Z-Image…) | `/v1/tungsten/...` |
 | [BlockRun](https://blockrun.ai) | Passthrough | 40+ LLMs (GPT, Claude, Gemini…) | `/v1/blockrun/...` |
+| [CloudConvert](https://cloudconvert.com) | Managed | File conversion (200+ formats) | `/v1/cloudconvert/...` |
 
 ## How It Works
 
@@ -60,6 +61,35 @@ Client                    x402gate                  BlockRun
 ```
 
 The payment goes directly to BlockRun's wallet — x402gate earns nothing but provides a unified "single window" experience.
+
+### File Conversion (CloudConvert)
+
+CloudConvert uses **multipart/form-data** for file uploads (unlike JSON-based AI providers):
+
+```bash
+# Convert DOCX to PDF
+curl -X POST https://x402gate.io/v1/cloudconvert/convert \
+  -F "file=@document.docx" \
+  -F "output_format=pdf"
+
+# Response: 402 Payment Required ($0.03 + commission)
+# Sign payment, then retry with PAYMENT-SIGNATURE header
+
+curl -X POST https://x402gate.io/v1/cloudconvert/convert \
+  -F "file=@document.docx" \
+  -F "output_format=pdf" \
+  -H "PAYMENT-SIGNATURE: <base64-encoded-payment>"
+
+# Response: 200 OK
+# {"url": "https://storage.cloudconvert.com/...", "filename": "document.pdf"}
+```
+
+Supported parameters:
+- `file` — the file to convert (required, max 100 MB)
+- `output_format` — target format: `pdf`, `png`, `mp4`, `docx`, etc. (required)
+- `input_format` — source format (optional, auto-detected from filename)
+
+> **Note:** Maximum upload size is configurable via `gateway.max_upload_mb` (default: 100 MB). Files exceeding the limit receive HTTP 413.
 
 ### Transaction Summary
 
@@ -174,6 +204,9 @@ OPENROUTER_API_KEY=your_key
 TUNGSTEN_JWT_TOKEN=your_jwt_cookie
 TUNGSTEN_CF_CLEARANCE=your_cf_cookie
 
+# CloudConvert (file conversion)
+CLOUDCONVERT_API_KEY=your_key
+
 # Base (EVM)
 BASE_PAY_TO_ADDRESS=0xYourWallet
 BASE_FACILITATOR_PRIVATE_KEY=your_key
@@ -218,6 +251,7 @@ All settings are in `config.yaml`. Secrets use `${ENV_VAR}` interpolation:
 | `gateway.gas_surcharge` | `0.001` | Fixed gas surcharge ($0.001) added on top of commission |
 | `gateway.default_max_tokens` | `1024` | Default `max_tokens` when client omits it (x402 mode only; skipped in prepaid) |
 | `gateway.price_cache_ttl` | `60` | Price cache TTL in seconds |
+| `gateway.max_upload_mb` | `100` | Maximum file upload size in MB (all in RAM) |
 | `gateway.max_prepaid_topup` | `10.0` | Maximum single top-up amount in USD |
 | `gateway.min_prepaid_topup` | `0.10` | Minimum single top-up amount in USD |
 | `payment.networks.base` | — | Base Mainnet (EVM) config |
@@ -251,6 +285,7 @@ Individual tests:
 | `test_blockrun_passthrough` | BlockRun | Base | Passthrough proxy |
 | `test_prepaid_openrouter` | Mixed | Solana | Prepaid mode (Solana wallet) |
 | `test_prepaid_base` | Mixed | Base | Prepaid mode (EVM wallet) |
+| `test_base_cloudconvert` | CloudConvert | Base | File conversion (HTML → PDF) |
 
 Requires `BASE_E2ETEST_PRIVATE_KEY` and/or `SOLANA_E2ETEST_PRIVATE_KEY` in `.env`.
 

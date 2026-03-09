@@ -100,3 +100,29 @@ Create `tests/test_your_provider.py` with mocked API responses.
 - **Synchronous providers**: If your provider returns results immediately (no polling), return the result from `submit()` and have `get_result()` raise `NotImplementedError`
 - **Custom pricing**: If your provider doesn't have a pricing API, you can hardcode prices in `get_price()` or read them from config
 - **Error mapping**: Map provider-specific error codes to `ProviderError` with appropriate HTTP status codes
+
+## Multipart/File Upload Providers
+
+Some providers (e.g. CloudConvert) accept files instead of JSON. For these:
+
+1. **In `submit()`**, read file bytes from `body["_file_bytes"]` and filename from `body["_file_name"]` — these are injected by `app.py` when the client sends `multipart/form-data`
+
+2. **In `config.yaml`**, set `content_type: "multipart"` in `example_request` so the landing page renders a curl with `-F` flags:
+
+```yaml
+  example_request:
+    model: "convert"
+    content_type: "multipart"
+    body:
+      output_format: "pdf"
+```
+
+3. **Client sends** `multipart/form-data` instead of JSON:
+
+```bash
+curl -X POST https://x402gate.io/v1/cloudconvert/convert \
+  -F "file=@document.docx" \
+  -F "output_format=pdf"
+```
+
+See `x402gate/providers/cloudconvert.py` for a complete example.

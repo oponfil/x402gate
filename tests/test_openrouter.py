@@ -87,7 +87,7 @@ class TestGetPrice:
         body = {
             "model": "openai/gpt-4o-mini",
             "messages": [{"role": "user", "content": "What is quantum computing?"}],
-            "max_tokens": 100,
+            "max_tokens": 100,  # below default 1024 → will be raised to 1024
         }
 
         with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
@@ -98,11 +98,10 @@ class TestGetPrice:
         assert price > Decimal("0")
 
         # Verify: ~6 input tokens (25 chars / 4) × $0.00000015
-        #        + 100 output tokens × $0.0000006
-        # = ~$0.0000609
+        #        + 1024 output tokens × $0.0000006 (max_tokens raised to default)
         expected_input_tokens = max(len("What is quantum computing?") // 4, 1)
         expected = Decimal(expected_input_tokens) * Decimal("0.00000015") + Decimal(
-            "100"
+            "1024"
         ) * Decimal("0.0000006")
         assert price == expected
 
@@ -170,6 +169,23 @@ class TestGetPrice:
             with pytest.raises(ProviderError, match="not found"):
                 await provider.get_price("chat/completions", body)
 
+    @pytest.mark.asyncio
+    async def test_null_max_tokens_uses_default(self, provider, model_info_response):
+        """max_tokens: null (JSON null) should not crash, uses default."""
+        body = {
+            "model": "openai/gpt-4o-mini",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "max_tokens": None,  # JSON null
+        }
+
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = model_info_response
+            price = await provider.get_price("chat/completions", body)
+
+        # Should use default_max_tokens (1024), same as omitting the key
+        expected = Decimal("1") * Decimal("0.00000015") + Decimal("1024") * Decimal("0.0000006")
+        assert price == expected
+
 
 class TestSubmit:
     """Tests for OpenRouterProvider.submit()."""
@@ -229,6 +245,23 @@ class TestSubmit:
         # by checking the response structure
         assert "data" not in result  # No "data" wrapper
         assert "choices" in result  # Direct OpenAI format
+
+    @pytest.mark.asyncio
+    async def test_null_max_tokens_enforced(self, provider, chat_completion_response):
+        """submit() with max_tokens=None should enforce default minimum."""
+        body = {
+            "model": "openai/gpt-4o-mini",
+            "messages": [{"role": "user", "content": "Hello!"}],
+            "max_tokens": None,  # JSON null
+        }
+
+        with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = chat_completion_response
+            await provider.submit("chat/completions", body)
+
+        # Should have injected max_tokens=1024
+        sent_body = mock_post.call_args.kwargs["json"]
+        assert sent_body["max_tokens"] == 1024
 
 
 class TestGetResult:

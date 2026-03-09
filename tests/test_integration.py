@@ -23,6 +23,7 @@ from x402gate.core.prepaid import deposit, get_balance, reset
 # Set env vars before importing the app
 os.environ.setdefault("WAVESPEED_API_KEY", "test-key-12345")
 os.environ.setdefault("BASE_PAY_TO_ADDRESS", "0x1234567890abcdef1234567890abcdef12345678")
+os.environ.setdefault("CLOUDCONVERT_API_KEY", "test-cc-key")
 
 
 @pytest.fixture
@@ -36,6 +37,7 @@ gateway:
   commission: 0.04
   gas_surcharge: 0.001
   price_cache_ttl: 0
+  max_upload_mb: 1  # 1 MB limit for testing
 
 payment:
   networks:
@@ -61,6 +63,13 @@ providers:
     type: passthrough
     enabled: true
     base_url: "https://blockrun.ai/api"
+  cloudconvert:
+    enabled: true
+    base_url: "https://api.cloudconvert.com/v2"
+    api_key: "test-cc-key"
+    fixed_price_usd: 0.03
+    poll_interval: 0
+    poll_timeout: 10
 """)
     return config
 
@@ -365,3 +374,31 @@ class TestPrepaidFlow:
 
         assert response.status_code == 401
         reset()
+
+
+class TestCloudConvertUploadLimit:
+    """Integration tests for file upload size limit."""
+
+    def test_oversized_file_returns_413(self, client):
+        """File exceeding max_upload_mb returns 413."""
+        # 1 MB limit in test config, send 1.5 MB
+        big_file = b"x" * (1_500_000)
+        response = client.post(
+            "/v1/cloudconvert/convert",
+            files={"file": ("big.bin", big_file)},
+            data={"output_format": "pdf"},
+        )
+        assert response.status_code == 413
+        assert "too large" in response.json()["error"].lower()
+
+    @respx.mock
+    def test_small_file_accepted(self, client):
+        """File within limit proceeds to 402 (payment required)."""
+        small_file = b"x" * 1000  # 1 KB — well within 1 MB limit
+        response = client.post(
+            "/v1/cloudconvert/convert",
+            files={"file": ("small.txt", small_file)},
+            data={"output_format": "pdf"},
+        )
+        # Should get 402 (no payment), NOT 413
+        assert response.status_code == 402

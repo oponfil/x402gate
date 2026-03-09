@@ -137,12 +137,24 @@
     <h3>Examples</h3>
     {% for ex in examples %}
     <h4>{{ ex.provider }} &mdash; <code>{{ ex.model }}</code></h4>
+    {% if ex.content_type == "multipart" %}
+    <pre><code>curl -X POST {{ base_url }}{{ ex.path }} \
+  -F "file=@document.docx" \
+  -F "output_format=pdf"
+
+# Response: 402 Payment Required
+# Sign payment, then retry with PAYMENT-SIGNATURE header</code></pre>
+    <p style="color: #8b949e; font-size: 0.85em;">Max upload: <strong>100 MB</strong>. Supported formats:
+        <a href="https://cloudconvert.com/formats">200+ types</a>.
+    </p>
+    {% else %}
     <pre><code>curl -X POST {{ base_url }}{{ ex.path }} \
   -H "Content-Type: application/json" \
   -d '{{ ex.body_json }}'
 
 # Response: 402 Payment Required
 # Sign payment, then retry with PAYMENT-SIGNATURE header</code></pre>
+    {% endif %}
     {% endfor %}
     <div class="note">Payment is settled <strong>only</strong> on success (HTTP 200). On any error, no USDC is
         transferred.</div>

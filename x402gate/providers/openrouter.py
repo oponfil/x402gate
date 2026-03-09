@@ -161,7 +161,11 @@ class OpenRouterProvider(BaseProvider):
                 estimated_input_tokens += max_results * self._web_search_tokens_per_result
                 web_search_cost = Decimal(max_results) * self._web_search_cost_per_result
 
-        max_tokens = inputs.get("max_tokens", self._default_max_tokens)
+        raw_max = inputs.get("max_tokens")
+        max_tokens = max(
+            raw_max if isinstance(raw_max, int) else self._default_max_tokens,
+            self._default_max_tokens,
+        )
 
         # Reasoning tokens are a subset of completion tokens and
         # capped by max_tokens, so the estimate is simply:
@@ -212,12 +216,16 @@ class OpenRouterProvider(BaseProvider):
         # fall back to a large provider default (which would cost more
         # than our estimate).  In prepaid mode, skip this — we charge
         # actual usage, so let the model respond fully.
-        if not prepaid and "max_tokens" not in body:
-            body = {**body, "max_tokens": self._default_max_tokens}
-            logger.info(
-                "Injected max_tokens=%d (default)",
-                self._default_max_tokens,
-            )
+        if not prepaid:
+            raw_max = body.get("max_tokens")
+            user_max = raw_max if isinstance(raw_max, int) else 0
+            if user_max < self._default_max_tokens:
+                body = {**body, "max_tokens": self._default_max_tokens}
+                logger.info(
+                    "max_tokens %s -> %d (enforced minimum)",
+                    raw_max,
+                    self._default_max_tokens,
+                )
 
         # Inject default max_results into web search plugins so
         # actual usage matches our cost estimate.

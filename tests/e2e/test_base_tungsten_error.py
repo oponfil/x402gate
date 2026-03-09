@@ -1,10 +1,11 @@
 """E2E test: invalid model UUID → Tungsten error → no settlement → client keeps money."""
 
 import os
-import subprocess
 import time
 
 import pytest
+
+from tests.e2e.conftest import run_script
 
 
 @pytest.mark.asyncio
@@ -14,13 +15,7 @@ async def test_tungsten_bad_model_no_settlement(gateway_process, base_chain):
     print(f"\n=== [Base] Client USDC BEFORE: {client_before / 1e6:.6f} ===")
 
     # Run the bad-model client script
-    env = {**os.environ, "GATEWAY_URL": "http://localhost:4022"}
-    result = subprocess.run(  # noqa: ASYNC221
-        ["python", "tests/e2e/x402_tungsten_client_bad_model.py"],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    result = run_script("tests/e2e/x402_tungsten_client_bad_model.py", label="Tungsten Error")
 
     print(result.stdout)
     print(result.stderr)
