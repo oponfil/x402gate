@@ -173,7 +173,7 @@ providers:
         input_format: "docx"
         output_format: "pdf"
     example_request_2:
-      model: "convert"
+      model: "optimize"
       content_type: "multipart"
       body:
         operation: "optimize"
