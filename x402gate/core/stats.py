@@ -186,14 +186,10 @@ def get_stats() -> dict[str, Any]:
             effective_status = "unknown"
 
         avg_latency_s = (
-            round(ps.total_latency_s / ps.total_requests, 1)
-            if ps.total_requests > 0
-            else 0
+            round(ps.total_latency_s / ps.total_requests, 1) if ps.total_requests > 0 else 0
         )
         success_rate = (
-            round(ps.success_count / ps.total_requests * 100, 1)
-            if ps.total_requests > 0
-            else 0
+            round(ps.success_count / ps.total_requests * 100, 1) if ps.total_requests > 0 else 0
         )
 
         provider_data[name] = {
@@ -213,9 +209,7 @@ def get_stats() -> dict[str, Any]:
         }
 
     total_requests = sum(ps.total_requests for ps in _stats.providers.values())
-    total_revenue = sum(
-        ps.total_revenue_usd for ps in _stats.providers.values()
-    )
+    total_revenue = sum(ps.total_revenue_usd for ps in _stats.providers.values())
     total_cost = sum(ps.total_cost_usd for ps in _stats.providers.values())
 
     # Network settlement stats
@@ -227,9 +221,7 @@ def get_stats() -> dict[str, Any]:
             else 0
         )
         avg_gas_usd = (
-            ns.total_gas_cost_usd / ns.total_settlements
-            if ns.total_settlements > 0
-            else 0.0
+            ns.total_gas_cost_usd / ns.total_settlements if ns.total_settlements > 0 else 0.0
         )
         network_data[net_name] = {
             "total_settlements": ns.total_settlements,

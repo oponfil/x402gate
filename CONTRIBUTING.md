@@ -22,14 +22,21 @@
 
 ## Workflow
 
-1. **Code review** — run `ruff check` and `ruff format --check`. Fix all found issues. Report results to the user in chat (what was found, what was fixed).
-2. **Tests** — run unit tests (`pytest tests/test_*.py`) and relevant E2E tests.
-3. **Commit** — only after review and tests pass.
+**All 3 steps must pass before committing.** Do not skip any step.
+
+1. **Lint** — `ruff check`. Fix all issues.
+2. **Format** — `ruff format --check`. If fails → run `ruff format` to fix, then re-check.
+3. **Tests** — unit tests (`pytest tests/ --ignore=tests/e2e`). E2E tests require a live server.
+4. **Commit** — only after all checks pass.
 
 ```bash
-python -m ruff check x402gate/ tests/
-python -m ruff format --check x402gate/ tests/
-python -m pytest tests/ -v --timeout=30
+# 1. Lint
+ruff check x402gate/ tests/
+# 2. Format (--check first, then fix if needed)
+ruff format --check x402gate/ tests/
+# 3. Unit + integration tests
+python -m pytest tests/ -v --timeout=30 --ignore=tests/e2e
+# 4. Commit
 git add -A && git commit -m "feat: description"
 ```
 

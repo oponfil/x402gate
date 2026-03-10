@@ -569,7 +569,9 @@ async def _passthrough_proxy(provider_name: str, path: str, request: Request) ->
     latency = time.monotonic() - t_start
     success = resp.status_code < 400
     stats.record_request(
-        provider_name, latency, success,
+        provider_name,
+        latency,
+        success,
         error_msg=resp.text[:200] if not success else None,
     )
 

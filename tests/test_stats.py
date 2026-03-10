@@ -79,9 +79,8 @@ class TestProviderStatus:
         record_request("test_provider", 0.1, True)
         # Manually set last_status_at to stale
         from x402gate.core.stats import _stats
-        _stats.providers["test_provider"].last_status_at = (
-            time.time() - STALE_THRESHOLD - 1
-        )
+
+        _stats.providers["test_provider"].last_status_at = time.time() - STALE_THRESHOLD - 1
         s = get_stats()
         assert s["providers"]["test_provider"]["status"] == "unknown"
 
@@ -132,6 +131,7 @@ class TestLogs:
 
     def test_logs_capped_at_max(self):
         from x402gate.core.stats import _stats
+
         for i in range(MAX_LOG_ENTRIES + 500):
             _stats.logs.append({"ts": time.time(), "level": "INFO", "message": f"msg {i}"})
         assert len(_stats.logs) == MAX_LOG_ENTRIES
@@ -141,6 +141,7 @@ class TestLogs:
 
     def test_get_logs_returns_newest_first(self):
         from x402gate.core.stats import _stats
+
         _stats.logs.append({"ts": 1.0, "level": "INFO", "message": "first"})
         _stats.logs.append({"ts": 2.0, "level": "INFO", "message": "second"})
         logs = get_logs()
@@ -149,6 +150,7 @@ class TestLogs:
 
     def test_get_logs_respects_limit(self):
         from x402gate.core.stats import _stats
+
         for i in range(10):
             _stats.logs.append({"ts": float(i), "level": "INFO", "message": f"msg {i}"})
         logs = get_logs(limit=3)
@@ -180,9 +182,17 @@ class TestGetStats:
         s = get_stats()
         p = s["providers"]["openrouter"]
         expected_keys = {
-            "status", "total_requests", "success_count", "error_count",
-            "success_rate", "avg_latency_s", "revenue_usd", "cost_usd",
-            "profit_usd", "last_error", "last_activity_ago_s",
+            "status",
+            "total_requests",
+            "success_count",
+            "error_count",
+            "success_rate",
+            "avg_latency_s",
+            "revenue_usd",
+            "cost_usd",
+            "profit_usd",
+            "last_error",
+            "last_activity_ago_s",
         }
         assert expected_keys.issubset(set(p.keys()))
 
