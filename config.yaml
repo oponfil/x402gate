@@ -178,3 +178,14 @@ providers:
       body:
         operation: "optimize"
         input_format: "pdf"
+  socialdownload:
+    enabled: true
+    base_url: "https://social-download-all-in-one.p.rapidapi.com"
+    api_key: "${RAPIDAPI_KEY}"
+    fixed_price_usd: 0.005
+    description: "Download media from social networks (YouTube, TikTok, Instagram, Twitter/X, VK…)"
+    docs_url: "https://github.com/oponfil/x402gate/blob/main/docs/socialdownload.md"
+    example_request:
+      model: "download"
+      body:
+        url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ"

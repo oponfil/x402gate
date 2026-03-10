@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import importlib.metadata
 import json
 import logging
 import os
@@ -22,6 +21,7 @@ import jinja2
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
+from x402gate import __version__
 from x402gate.core.config import AppConfig, load_config
 from x402gate.core.payment import PaymentHandler
 from x402gate.core.prepaid import (
@@ -37,6 +37,7 @@ from x402gate.core.proxy import TaskTimeoutError
 from x402gate.providers.base import BaseProvider, ProviderError
 from x402gate.providers.cloudconvert import CloudConvertProvider
 from x402gate.providers.openrouter import OpenRouterProvider
+from x402gate.providers.socialdownload import SocialDownloadProvider
 from x402gate.providers.tungsten import TungstenProvider
 from x402gate.providers.wavespeed import WaveSpeedProvider
 
@@ -68,6 +69,7 @@ PROVIDER_REGISTRY: dict[str, type[BaseProvider]] = {
     "openrouter": OpenRouterProvider,
     "tungsten": TungstenProvider,
     "cloudconvert": CloudConvertProvider,
+    "socialdownload": SocialDownloadProvider,
 }
 
 # Global state (initialized in lifespan)
@@ -177,12 +179,10 @@ async def lifespan(app: FastAPI):
     logger.info("x402gate shut down")
 
 
-_VERSION = importlib.metadata.version("x402gate")
-
 app = FastAPI(
     title="x402gate",
     description="Transparent x402 payment proxy for AI services",
-    version=_VERSION,
+    version=__version__,
     lifespan=lifespan,
 )
 
@@ -265,7 +265,7 @@ async def service_info(request: Request) -> Response:
     }
 
     service_data = {
-        "version": _VERSION,
+        "version": __version__,
         "base_url": base_url,
         "networks": networks,
         "commission": f"{commission_pct}% + ${gas_fee} gas",
@@ -302,7 +302,7 @@ async def service_info(request: Request) -> Response:
     # JSON for AI agents
     json_data = {
         "name": "x402gate",
-        "version": _VERSION,
+        "version": __version__,
         "description": (
             "Transparent pay-per-request proxy for AI services via the x402 protocol. "
             "Send a POST request to any provider endpoint — if no payment header is "

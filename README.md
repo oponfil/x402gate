@@ -13,6 +13,7 @@ x402gate sits between your AI agent and AI service providers, adding [x402](http
 | [Tungsten](https://tungsten.run) | Managed | AI image generation (SDXL, Flux, Qwen, Z-Image…) | `/v1/tungsten/...` |
 | [BlockRun](https://blockrun.ai) | Passthrough | 40+ LLMs (GPT, Claude, Gemini…) | `/v1/blockrun/...` |
 | [CloudConvert](https://cloudconvert.com) | Managed | File conversion (200+ formats) | `/v1/cloudconvert/...` |
+| [SocialDownload](https://rapidapi.com/nguyenmanhict-MuTUtGWD7K/api/social-download-all-in-one) | Managed | Download media from social networks | `/v1/socialdownload/...` |
 
 ## How It Works
 
