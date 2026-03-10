@@ -1,7 +1,7 @@
 """Unit tests for the stats module."""
 
-from decimal import Decimal
 import time
+from decimal import Decimal
 
 from x402gate.core.stats import (
     MAX_LOG_ENTRIES,
@@ -43,7 +43,7 @@ class TestRecordRequest:
         record_request("wavespeed", 1.0, True)
         record_request("wavespeed", 3.0, True)
         s = get_stats()
-        assert s["providers"]["wavespeed"]["avg_latency_ms"] == 2000.0
+        assert s["providers"]["wavespeed"]["avg_latency_s"] == 2
 
     def test_sets_status_ok_on_success(self):
         record_request("openrouter", 0.1, True)
@@ -98,16 +98,16 @@ class TestRecordRevenue:
         record_revenue("openrouter", Decimal("0.02"), Decimal("0.015"))
         s = get_stats()
         p = s["providers"]["openrouter"]
-        assert p["revenue_usd"] == "0.03"
-        assert p["cost_usd"] == "0.023"
-        assert p["profit_usd"] == "0.007"
+        assert p["revenue_usd"] == "0.0300"
+        assert p["cost_usd"] == "0.0230"
+        assert p["profit_usd"] == "0.0070"
 
     def test_totals(self):
         record_revenue("openrouter", Decimal("0.05"), Decimal("0.03"))
         s = get_stats()
-        assert s["total_revenue_usd"] == "0.05"
-        assert s["total_cost_usd"] == "0.03"
-        assert s["total_profit_usd"] == "0.02"
+        assert s["total_revenue_usd"] == "0.0500"
+        assert s["total_cost_usd"] == "0.0300"
+        assert s["total_profit_usd"] == "0.0200"
 
 
 class TestRecordTopup:
@@ -121,7 +121,7 @@ class TestRecordTopup:
         record_topup(Decimal("2.50"))
         s = get_stats()
         assert s["total_topups"] == 2
-        assert s["total_topup_usd"] == "3.50"
+        assert s["total_topup_usd"] == "3.5000"
 
 
 class TestLogs:
@@ -137,7 +137,7 @@ class TestLogs:
         assert len(_stats.logs) == MAX_LOG_ENTRIES
         # Oldest entries should have been evicted
         logs = get_logs(limit=0)
-        assert logs[-1]["message"] == f"msg 500"
+        assert logs[-1]["message"] == "msg 500"
 
     def test_get_logs_returns_newest_first(self):
         from x402gate.core.stats import _stats
@@ -181,7 +181,7 @@ class TestGetStats:
         p = s["providers"]["openrouter"]
         expected_keys = {
             "status", "total_requests", "success_count", "error_count",
-            "success_rate", "avg_latency_ms", "revenue_usd", "cost_usd",
+            "success_rate", "avg_latency_s", "revenue_usd", "cost_usd",
             "profit_usd", "last_error", "last_activity_ago_s",
         }
         assert expected_keys.issubset(set(p.keys()))

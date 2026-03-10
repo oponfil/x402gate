@@ -10,15 +10,18 @@ All data is stored in RAM and resets on server restart.
 from __future__ import annotations
 
 import collections
+import contextlib
 import logging
 import time
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
+from x402gate.core.prepaid import get_total_balance
+
 # How long (seconds) before a provider with no requests goes "unknown"
-STALE_THRESHOLD = 1800  # 30 minutes
-MAX_LOG_ENTRIES = 5000  # Rolling log buffer size
+STALE_THRESHOLD = 3600  # 1 hour
+MAX_LOG_ENTRIES = 1000  # Rolling log buffer size
 
 
 @dataclass
@@ -37,11 +40,23 @@ class ProviderStats:
 
 
 @dataclass
+class NetworkStats:
+    """Per-blockchain-network settlement statistics."""
+
+    total_settlements: int = 0
+    total_settle_latency_s: float = 0.0
+    total_gas_cost_usd: float = 0.0
+    total_gas_cost_native: float = 0.0
+    gas_label: str = ""  # "ETH" or "SOL"
+
+
+@dataclass
 class _GlobalStats:
     """Singleton holding all gateway statistics."""
 
     started_at: float = field(default_factory=time.time)
     providers: dict[str, ProviderStats] = field(default_factory=dict)
+    networks: dict[str, NetworkStats] = field(default_factory=dict)
     total_topups: int = 0
     total_topup_usd: Decimal = Decimal("0")
     logs: collections.deque = field(
@@ -62,7 +77,7 @@ class _DashboardLogHandler(logging.Handler):
     """Captures log records from x402gate loggers into the stats log buffer."""
 
     def emit(self, record: logging.LogRecord) -> None:
-        try:
+        with contextlib.suppress(Exception):
             _stats.logs.append(
                 {
                     "ts": record.created,
@@ -70,8 +85,6 @@ class _DashboardLogHandler(logging.Handler):
                     "message": self.format(record),
                 }
             )
-        except Exception:
-            pass  # Never break the application
 
 
 def install_log_handler() -> None:
@@ -137,6 +150,28 @@ def record_topup(amount_usd: Decimal) -> None:
     _stats.total_topup_usd += amount_usd
 
 
+def record_settlement(
+    network: str,
+    settle_latency_s: float,
+    gas_cost_usd: float,
+    gas_cost_native: float,
+    gas_label: str,
+) -> None:
+    """Record a blockchain settlement for per-network statistics."""
+    ns = _stats.networks.setdefault(network, NetworkStats())
+    ns.total_settlements += 1
+    ns.total_settle_latency_s += settle_latency_s
+    ns.total_gas_cost_usd += gas_cost_usd
+    ns.total_gas_cost_native += gas_cost_native
+    if gas_label:
+        ns.gas_label = gas_label
+
+
+def _fmt(d: Decimal) -> str:
+    """Format Decimal to fixed-point with 4 decimal places."""
+    return f"{d:.4f}"
+
+
 def get_stats() -> dict[str, Any]:
     """Return a snapshot of all statistics for the dashboard."""
     now = time.time()
@@ -146,13 +181,12 @@ def get_stats() -> dict[str, Any]:
     for name, ps in _stats.providers.items():
         # Determine effective status (stale → unknown)
         effective_status = ps.last_status
-        if ps.last_status_at > 0 and (now - ps.last_status_at) > STALE_THRESHOLD:
-            effective_status = "unknown"
-        elif ps.total_requests == 0:
+        stale = ps.last_status_at > 0 and (now - ps.last_status_at) > STALE_THRESHOLD
+        if stale or ps.total_requests == 0:
             effective_status = "unknown"
 
-        avg_latency_ms = (
-            round(ps.total_latency_s / ps.total_requests * 1000, 1)
+        avg_latency_s = (
+            round(ps.total_latency_s / ps.total_requests, 1)
             if ps.total_requests > 0
             else 0
         )
@@ -168,10 +202,10 @@ def get_stats() -> dict[str, Any]:
             "success_count": ps.success_count,
             "error_count": ps.error_count,
             "success_rate": success_rate,
-            "avg_latency_ms": avg_latency_ms,
-            "revenue_usd": str(ps.total_revenue_usd),
-            "cost_usd": str(ps.total_cost_usd),
-            "profit_usd": str(ps.total_revenue_usd - ps.total_cost_usd),
+            "avg_latency_s": avg_latency_s,
+            "revenue_usd": _fmt(ps.total_revenue_usd),
+            "cost_usd": _fmt(ps.total_cost_usd),
+            "profit_usd": _fmt(ps.total_revenue_usd - ps.total_cost_usd),
             "last_error": ps.last_error,
             "last_activity_ago_s": (
                 round(now - ps.last_status_at, 0) if ps.last_status_at > 0 else None
@@ -184,19 +218,43 @@ def get_stats() -> dict[str, Any]:
     )
     total_cost = sum(ps.total_cost_usd for ps in _stats.providers.values())
 
+    # Network settlement stats
+    network_data: dict[str, Any] = {}
+    for net_name, ns in _stats.networks.items():
+        avg_settle_s = (
+            round(ns.total_settle_latency_s / ns.total_settlements, 1)
+            if ns.total_settlements > 0
+            else 0
+        )
+        avg_gas_usd = (
+            ns.total_gas_cost_usd / ns.total_settlements
+            if ns.total_settlements > 0
+            else 0.0
+        )
+        network_data[net_name] = {
+            "total_settlements": ns.total_settlements,
+            "avg_settle_latency_s": avg_settle_s,
+            "total_gas_cost_usd": round(ns.total_gas_cost_usd, 4),
+            "avg_gas_cost_usd": round(avg_gas_usd, 4),
+            "total_gas_cost_native": round(ns.total_gas_cost_native, 6),
+            "gas_label": ns.gas_label,
+        }
+
     return {
         "uptime_s": round(uptime_s, 0),
         "total_requests": total_requests,
-        "total_revenue_usd": str(total_revenue),
-        "total_cost_usd": str(total_cost),
-        "total_profit_usd": str(total_revenue - total_cost),
+        "total_revenue_usd": _fmt(total_revenue),
+        "total_cost_usd": _fmt(total_cost),
+        "total_profit_usd": _fmt(total_revenue - total_cost),
         "total_topups": _stats.total_topups,
-        "total_topup_usd": str(_stats.total_topup_usd),
+        "total_topup_usd": _fmt(_stats.total_topup_usd),
+        "total_prepaid_balance_usd": _fmt(get_total_balance()),
         "providers": provider_data,
+        "networks": network_data,
     }
 
 
-def get_logs(limit: int = 200) -> list[dict[str, Any]]:
+def get_logs(limit: int = MAX_LOG_ENTRIES) -> list[dict[str, Any]]:
     """Return the most recent log entries (newest first)."""
     all_entries = list(_stats.logs)
     if limit:
@@ -207,6 +265,7 @@ def get_logs(limit: int = 200) -> list[dict[str, Any]]:
 def reset() -> None:
     """Clear all stats (for testing)."""
     _stats.providers.clear()
+    _stats.networks.clear()
     _stats.total_topups = 0
     _stats.total_topup_usd = Decimal("0")
     _stats.logs = collections.deque(maxlen=MAX_LOG_ENTRIES)

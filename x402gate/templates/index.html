@@ -135,6 +135,7 @@
 
     <hr>
     <h3>Examples</h3>
+    {% set ns = namespace(shown_upload=false) %}
     {% for ex in examples %}
     <h4>{{ ex.provider }} &mdash; <code>{{ ex.model }}</code></h4>
     {% if ex.content_type == "multipart" %}
@@ -145,10 +146,13 @@
 {% endfor %}
 # Response: 402 Payment Required
 # Sign payment, then retry with PAYMENT-SIGNATURE header</code></pre>
+    {% if not ns.shown_upload %}
     <p style="color: #8b949e; font-size: 0.85em;">File uploads: max <strong>{{ max_upload_mb }} MB</strong>. Supported
         formats:
-        <a href="https://cloudconvert.com/formats">200+ types</a>.
+        <a href="https://cloudconvert.com/api/v2/convert#formats">200+ types</a>.
     </p>
+    {% set ns.shown_upload = true %}
+    {% endif %}
     {% else %}
     <pre><code>curl -X POST {{ base_url }}{{ ex.path }} \
   -H "Content-Type: application/json" \

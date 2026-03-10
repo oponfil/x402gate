@@ -88,6 +88,11 @@ def get_balance(pubkey: str) -> Decimal:
     return _balances.get(pubkey, Decimal("0"))
 
 
+def get_total_balance() -> Decimal:
+    """Return the sum of all active prepaid balances."""
+    return sum(_balances.values(), Decimal("0"))
+
+
 def verify_wallet_signature(
     pubkey_str: str,
     signature_str: str,

@@ -302,6 +302,16 @@
         <div class="summary-item">Cost: <strong id="sum-cost">$0</strong></div>
         <div class="summary-item">Profit: <strong id="sum-profit">$0</strong></div>
         <div class="summary-item">Top-ups: <strong id="sum-topups">0 ($0)</strong></div>
+        <div class="summary-item">Prepaid balance: <strong id="sum-balance">$0</strong></div>
+    </div>
+
+    <div class="logs-section">
+        <div class="logs-header">
+            <h3>Networks</h3>
+        </div>
+        <div class="grid" id="network-grid">
+            <!-- Network cards injected by JS -->
+        </div>
     </div>
 
     <div class="logs-section">
@@ -363,7 +373,7 @@
                         <div class="card-metrics">
                             <div class="metric">Requests<strong>${p.total_requests}</strong></div>
                             <div class="metric">Success<strong>${p.success_rate}%</strong></div>
-                            <div class="metric">Avg latency<strong>${p.avg_latency_ms} ms</strong></div>
+                            <div class="metric">Avg latency<strong>${p.avg_latency_s}s</strong></div>
                             <div class="metric">Last activity<strong>${formatAgo(p.last_activity_ago_s)}</strong></div>
                             <div class="metric">Revenue<strong>$${p.revenue_usd}</strong></div>
                             <div class="metric">Profit<strong>$${p.profit_usd}</strong></div>
@@ -378,11 +388,43 @@
             const countEl = document.getElementById('logs-count');
             countEl.textContent = `${logs.length} entries`;
 
-            container.innerHTML = logs.map(log => {
+            const sorted = logs.slice().reverse();
+
+            container.innerHTML = sorted.map(log => {
                 const d = new Date(log.ts * 1000);
-                const ts = d.toLocaleTimeString('en-GB', { hour12: false });
+                const mon = d.toLocaleString('en-US', { month: 'short' });
+                const day = d.getDate().toString().padStart(2, '0');
+                const time = d.toLocaleTimeString('en-GB', { hour12: false });
+                const ts = `${mon} ${day} ${time}`;
                 const lvl = log.level || 'INFO';
                 return `<div class="log-entry"><span class="log-ts">${ts}</span><span class="log-level log-${lvl}">${lvl}</span>${escHtml(log.message)}</div>`;
+            }).join('');
+
+            container.scrollTop = container.scrollHeight;
+        }
+
+        function renderNetworks(networks) {
+            const grid = document.getElementById('network-grid');
+            const names = Object.keys(networks).sort();
+            if (names.length === 0) {
+                grid.innerHTML = '<div style="color:#484f58;font-size:0.9em">No settlements yet</div>';
+                return;
+            }
+            grid.innerHTML = names.map(name => {
+                const n = networks[name];
+                return `
+                    <div class="card">
+                        <div class="card-header">
+                            <span class="card-name">${escHtml(name)}</span>
+                            <span class="card-type">${escHtml(n.gas_label)}</span>
+                        </div>
+                        <div class="card-metrics">
+                            <div class="metric">Settlements<strong>${n.total_settlements}</strong></div>
+                            <div class="metric">Avg settle<strong>${n.avg_settle_latency_s}s</strong></div>
+                            <div class="metric">Total gas<strong>$${n.total_gas_cost_usd}</strong></div>
+                            <div class="metric">Avg gas<strong>$${n.avg_gas_cost_usd}</strong></div>
+                        </div>
+                    </div>`;
             }).join('');
         }
 
@@ -396,7 +438,7 @@
             try {
                 const [statsResp, logsResp] = await Promise.all([
                     fetch('/v1/stats'),
-                    fetch('/v1/logs?limit=200')
+                    fetch('/v1/logs')
                 ]);
                 const stats = await statsResp.json();
                 const logs = await logsResp.json();
@@ -414,7 +456,10 @@
                 document.getElementById('sum-topups').textContent =
                     `${stats.total_topups} ($${stats.total_topup_usd})`;
 
+                document.getElementById('sum-balance').textContent = '$' + stats.total_prepaid_balance_usd;
+
                 renderProviders(stats.providers);
+                renderNetworks(stats.networks);
                 renderLogs(logs);
             } catch (e) {
                 console.error('Dashboard refresh failed:', e);

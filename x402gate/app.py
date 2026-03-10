@@ -22,6 +22,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from x402gate import __version__
+from x402gate.core import stats
 from x402gate.core.config import AppConfig, load_config
 from x402gate.core.payment import PaymentHandler
 from x402gate.core.prepaid import (
@@ -34,7 +35,6 @@ from x402gate.core.prepaid import (
 )
 from x402gate.core.pricing import PriceCache, apply_commission
 from x402gate.core.proxy import TaskTimeoutError
-from x402gate.core import stats
 from x402gate.providers.base import BaseProvider, ProviderError
 from x402gate.providers.cloudconvert import CloudConvertProvider
 from x402gate.providers.openrouter import OpenRouterProvider
@@ -495,7 +495,7 @@ async def topup(request: Request) -> Response:
     _pending_settlements.add(task)
     task.add_done_callback(_pending_settlements.discard)
 
-    stats.record_topup(net_credit)
+    stats.record_topup(topup_amount)
 
     return JSONResponse(
         content={
@@ -777,7 +777,7 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
             )
         t_prepaid = time.monotonic() - t_start
         stats.record_request(provider_name, t_prepaid, True)
-        stats.record_revenue(provider_name, actual_base_price, actual_base_price)
+        stats.record_revenue(provider_name, final_price, actual_base_price)
         return JSONResponse(
             content={"data": output},
             headers={"X-Prepaid-Balance": str(remaining)},
@@ -798,12 +798,14 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
                 "commission_rate": config.gateway.commission,
                 "gas_surcharge": config.gateway.gas_surcharge,
             }
+            t_settle_start = time.monotonic()
             settlement = await payment_handler.settle(
                 payment_sig,
                 final_price,
                 payment_network,
                 extra_context=ctx,
             )
+            settle_latency = time.monotonic() - t_settle_start
 
             if not settlement:
                 logger.error("Settlement returned None for %s — check logs above", payment_network)
@@ -818,6 +820,13 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
                     provider_name,
                     Decimal(str(settlement.get("amount_usdc", 0))),
                     actual_base_price,
+                )
+                stats.record_settlement(
+                    payment_network,
+                    settle_latency,
+                    settlement.get("gas_cost_usd", 0.0),
+                    settlement.get("gas_cost_native", 0.0),
+                    settlement.get("gas_label", ""),
                 )
         except Exception:
             logger.exception("Background settlement crashed for %s", payment_network)
