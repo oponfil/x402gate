@@ -85,7 +85,7 @@ curl -X POST https://x402gate.io/v1/cloudconvert/convert \
 ```
 
 Supported parameters:
-- `file` — the file to convert/optimize (required, max 100 MB)
+- `file` — the file to convert/optimize (required, max 200 MB)
 - `operation` — `convert` (default) or `optimize` (compress PDF/PNG/JPG)
 - `output_format` — target format: `pdf`, `png`, `mp4`, `docx`, etc. (required for convert)
 - `input_format` — source format (optional, auto-detected from filename)
@@ -263,7 +263,7 @@ All settings are in `config.yaml`. Secrets use `${ENV_VAR}` interpolation:
 | `gateway.gas_surcharge` | `0.001` | Fixed gas surcharge ($0.001) added on top of commission |
 | `gateway.default_max_tokens` | `1024` | Default `max_tokens` when client omits it (x402 mode only; skipped in prepaid) |
 | `gateway.price_cache_ttl` | `60` | Price cache TTL in seconds |
-| `gateway.max_upload_mb` | `100` | Maximum file upload size in MB (all in RAM) |
+| `gateway.max_upload_mb` | `200` | Maximum file upload size in MB (all in RAM) |
 | `gateway.max_prepaid_topup` | `10.0` | Maximum single top-up amount in USD |
 | `gateway.min_prepaid_topup` | `0.10` | Minimum single top-up amount in USD |
 | `payment.networks.base` | — | Base Mainnet (EVM) config |
