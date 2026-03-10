@@ -273,6 +273,7 @@ async def service_info(request: Request) -> Response:
         "provider_docs": provider_docs,
         "prepaid": prepaid,
         "examples": examples,
+        "max_upload_mb": config.gateway.max_upload_mb,
         "source": "https://github.com/oponfil/x402gate",
         "documentation": "https://github.com/oponfil/x402gate#readme",
         "endpoints": {

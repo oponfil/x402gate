@@ -154,7 +154,8 @@
 # Sign payment, then retry with PAYMENT-SIGNATURE header</code></pre>
     {% endif %}
     {% endfor %}
-    <p style="color: #8b949e; font-size: 0.85em;">File uploads: max <strong>200 MB</strong>. Supported formats:
+    <p style="color: #8b949e; font-size: 0.85em;">File uploads: max <strong>{{ max_upload_mb }} MB</strong>. Supported
+        formats:
         <a href="https://cloudconvert.com/formats">200+ types</a>.
     </p>
     <div class="note">Payment is settled <strong>only</strong> on success (HTTP 200). On any error, no USDC is

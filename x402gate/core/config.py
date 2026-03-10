@@ -60,7 +60,7 @@ class GatewayConfig(BaseModel):
     default_web_search_max_results: int = 3  # default max_results when client omits it
     web_search_cost_per_result: float = 0.004  # $0.004 per search result (OpenRouter Exa: $4/1000)
     price_cache_ttl: int = 60
-    max_upload_mb: int = 200  # max file upload size in MB (all in RAM, no disk)
+    max_upload_mb: int = 300  # max file upload size in MB (all in RAM, no disk)
     max_prepaid_topup: float = 10.0  # max single top-up amount in USD
     min_prepaid_topup: float = 0.10  # min single top-up amount in USD
 
