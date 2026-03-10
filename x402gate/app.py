@@ -34,6 +34,7 @@ from x402gate.core.prepaid import (
 )
 from x402gate.core.pricing import PriceCache, apply_commission
 from x402gate.core.proxy import TaskTimeoutError
+from x402gate.core import stats
 from x402gate.providers.base import BaseProvider, ProviderError
 from x402gate.providers.cloudconvert import CloudConvertProvider
 from x402gate.providers.openrouter import OpenRouterProvider
@@ -159,6 +160,10 @@ async def lifespan(app: FastAPI):
                 name=f"{name}_proxy",
             )
             logger.info("Route registered: POST /v1/%s/{{path}} (managed)", name)
+
+    # Initialize dashboard stats and log capture
+    stats.init(list(providers.keys()))
+    stats.install_log_handler()
 
     logger.info(
         "x402gate started on %s:%d with %d provider(s)",
@@ -377,6 +382,42 @@ async def health_check() -> dict[str, str]:
     return {"status": "ok"}
 
 
+# --- Dashboard ---
+
+
+@app.get("/dashboard", include_in_schema=False)
+async def dashboard() -> Response:
+    """Public dashboard with provider status, statistics, and live logs."""
+    # Build provider type map for the template
+    provider_types: dict[str, str] = {}
+    for name in providers:
+        pcfg = config.providers.get(name)
+        provider_types[name] = getattr(pcfg, "type", "managed") or "managed"
+
+    template_path = pathlib.Path(__file__).parent / "templates" / "dashboard.html"
+    env = jinja2.Environment(
+        loader=jinja2.FileSystemLoader(template_path.parent),
+        autoescape=False,  # We control the template; JS needs raw JSON
+    )
+    template = env.get_template(template_path.name)
+    html = template.render(
+        provider_types_json=json.dumps(provider_types),
+    )
+    return HTMLResponse(content=html)
+
+
+@app.get("/v1/stats")
+async def get_stats() -> dict[str, Any]:
+    """Return current gateway statistics."""
+    return stats.get_stats()
+
+
+@app.get("/v1/logs")
+async def get_logs(limit: int = 200) -> list[dict[str, Any]]:
+    """Return recent log entries (newest first)."""
+    return stats.get_logs(limit=limit)
+
+
 @app.post("/v1/topup")
 async def topup(request: Request) -> Response:
     """Top up prepaid balance via x402 payment.
@@ -454,6 +495,8 @@ async def topup(request: Request) -> Response:
     _pending_settlements.add(task)
     task.add_done_callback(_pending_settlements.discard)
 
+    stats.record_topup(net_credit)
+
     return JSONResponse(
         content={
             "pubkey": payer,
@@ -519,8 +562,16 @@ async def _passthrough_proxy(provider_name: str, path: str, request: Request) ->
         if val := request.headers.get(key):
             forward_headers[key] = val
 
+    t_start = time.monotonic()
     async with httpx.AsyncClient(timeout=120.0) as client:
         resp = await client.post(url, content=body, headers=forward_headers)
+
+    latency = time.monotonic() - t_start
+    success = resp.status_code < 400
+    stats.record_request(
+        provider_name, latency, success,
+        error_msg=resp.text[:200] if not success else None,
+    )
 
     # Filter response headers (avoid hop-by-hop headers)
     safe_headers: dict[str, str] = {}
@@ -654,6 +705,8 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
     try:
         result = await provider.submit(path, body, prepaid=prepaid_mode)
     except ProviderError as e:
+        t_err = time.monotonic() - t_start
+        stats.record_request(provider_name, t_err, False, error_msg=e.detail)
         return _error_response(e.status_code, e.detail, provider=e.provider)
 
     # 7. Determine if response is async (needs polling) or sync (ready)
@@ -675,6 +728,8 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
             output = await provider.get_result(task_id)
         except TaskTimeoutError as e:
             # Don't settle — client keeps their money
+            t_err = time.monotonic() - t_start
+            stats.record_request(provider_name, t_err, False, error_msg=f"Timeout {e.timeout}s")
             return _error_response(
                 504,
                 f"Task timed out after {e.timeout}s",
@@ -683,6 +738,8 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
             )
         except ProviderError as e:
             # Don't settle — task failed
+            t_err = time.monotonic() - t_start
+            stats.record_request(provider_name, t_err, False, error_msg=e.detail)
             return _error_response(e.status_code, e.detail, provider=e.provider)
     else:
         # Synchronous provider — use result directly
@@ -718,6 +775,9 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
                 remaining,
                 t_client,
             )
+        t_prepaid = time.monotonic() - t_start
+        stats.record_request(provider_name, t_prepaid, True)
+        stats.record_revenue(provider_name, actual_base_price, actual_base_price)
         return JSONResponse(
             content={"data": output},
             headers={"X-Prepaid-Balance": str(remaining)},
@@ -753,6 +813,12 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
                     payment_network,
                     settlement.get("error_reason", "unknown"),
                 )
+            else:
+                stats.record_revenue(
+                    provider_name,
+                    Decimal(str(settlement.get("amount_usdc", 0))),
+                    actual_base_price,
+                )
         except Exception:
             logger.exception("Background settlement crashed for %s", payment_network)
 
@@ -761,4 +827,5 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
     task.add_done_callback(_pending_settlements.discard)
 
     # 10. Return result to client
+    stats.record_request(provider_name, t_client, True)
     return JSONResponse(content={"data": output})

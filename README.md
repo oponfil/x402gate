@@ -184,6 +184,18 @@ curl -H "Accept: text/html" https://x402gate.io/
 curl https://x402gate.io/
 ```
 
+### Dashboard
+
+x402gate includes a built-in dashboard at `/dashboard` with real-time provider status, request metrics, revenue tracking, and live logs.
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /dashboard` | HTML dashboard with auto-refresh (5s) |
+| `GET /v1/stats` | JSON snapshot: uptime, per-provider metrics, revenue/cost/profit |
+| `GET /v1/logs?limit=200` | Recent log entries (newest first, default 200) |
+
+Statistics are stored **in-memory** and reset on server restart. The log buffer retains the last 5 000 entries (configurable via `MAX_LOG_ENTRIES` in `x402gate/core/stats.py`). Providers that haven't received requests in 30 minutes are marked as `unknown`.
+
 ## Supported Networks
 
 | Network | Chain ID | Token | Gas Token | Payment Overhead |

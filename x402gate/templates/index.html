@@ -145,6 +145,10 @@
 {% endfor %}
 # Response: 402 Payment Required
 # Sign payment, then retry with PAYMENT-SIGNATURE header</code></pre>
+    <p style="color: #8b949e; font-size: 0.85em;">File uploads: max <strong>{{ max_upload_mb }} MB</strong>. Supported
+        formats:
+        <a href="https://cloudconvert.com/formats">200+ types</a>.
+    </p>
     {% else %}
     <pre><code>curl -X POST {{ base_url }}{{ ex.path }} \
   -H "Content-Type: application/json" \
@@ -154,15 +158,12 @@
 # Sign payment, then retry with PAYMENT-SIGNATURE header</code></pre>
     {% endif %}
     {% endfor %}
-    <p style="color: #8b949e; font-size: 0.85em;">File uploads: max <strong>{{ max_upload_mb }} MB</strong>. Supported
-        formats:
-        <a href="https://cloudconvert.com/formats">200+ types</a>.
-    </p>
     <div class="note">Payment is settled <strong>only</strong> on success (HTTP 200). On any error, no USDC is
         transferred.</div>
 
     <hr>
     <div class="links">
+        <a href="{{ base_url }}/dashboard">Dashboard</a>
         <a href="{{ documentation }}">Documentation</a>
         <a href="{{ base_url }}/docs">API Reference</a>
         <a href="{{ base_url }}/v1/providers">Providers JSON</a>

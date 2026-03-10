@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>x402gate Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            color: #e0e0e0;
+            background: #0d1117;
+            line-height: 1.6;
+            padding: 24px;
+        }
+
+        a {
+            color: #58a6ff;
+        }
+
+        .header {
+            max-width: 1200px;
+            margin: 0 auto 24px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+
+        .header h1 {
+            font-size: 1.4em;
+        }
+
+        .header-stats {
+            display: flex;
+            gap: 24px;
+            font-size: 0.9em;
+            color: #8b949e;
+        }
+
+        .header-stats strong {
+            color: #e0e0e0;
+        }
+
+        .grid {
+            max-width: 1200px;
+            margin: 0 auto 24px;
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 16px;
+        }
+
+        .card {
+            background: #161b22;
+            border: 1px solid #21262d;
+            border-radius: 8px;
+            padding: 16px;
+        }
+
+        .card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+
+        .card-name {
+            font-weight: 600;
+            font-size: 1.05em;
+        }
+
+        .card-type {
+            font-size: 0.75em;
+            color: #8b949e;
+            background: #21262d;
+            padding: 2px 8px;
+            border-radius: 10px;
+        }
+
+        .status-dot {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            margin-right: 6px;
+            vertical-align: middle;
+        }
+
+        .status-ok {
+            background: #3fb950;
+            box-shadow: 0 0 6px #3fb95080;
+        }
+
+        .status-error {
+            background: #f85149;
+            box-shadow: 0 0 6px #f8514980;
+        }
+
+        .status-unknown {
+            background: #484f58;
+        }
+
+        .card-metrics {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            font-size: 0.85em;
+        }
+
+        .metric {
+            color: #8b949e;
+        }
+
+        .metric strong {
+            color: #e0e0e0;
+            display: block;
+        }
+
+        .card-error {
+            margin-top: 10px;
+            font-size: 0.8em;
+            color: #f85149;
+            background: #1a0e0e;
+            padding: 6px 10px;
+            border-radius: 4px;
+            border-left: 3px solid #f85149;
+            word-break: break-all;
+        }
+
+        /* Revenue summary */
+        .summary {
+            max-width: 1200px;
+            margin: 0 auto 24px;
+            background: #161b22;
+            border: 1px solid #21262d;
+            border-radius: 8px;
+            padding: 16px;
+            display: flex;
+            gap: 32px;
+            flex-wrap: wrap;
+            font-size: 0.9em;
+        }
+
+        .summary-item {
+            color: #8b949e;
+        }
+
+        .summary-item strong {
+            color: #e0e0e0;
+            font-size: 1.1em;
+        }
+
+        .profit-positive {
+            color: #3fb950 !important;
+        }
+
+        .profit-negative {
+            color: #f85149 !important;
+        }
+
+        /* Logs */
+        .logs-section {
+            max-width: 1200px;
+            margin: 0 auto 24px;
+        }
+
+        .logs-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+
+        .logs-header h3 {
+            font-size: 1em;
+            color: #c9d1d9;
+        }
+
+        .logs-count {
+            font-size: 0.8em;
+            color: #484f58;
+        }
+
+        .logs {
+            background: #0d1117;
+            border: 1px solid #21262d;
+            border-radius: 8px;
+            max-height: 400px;
+            overflow-y: auto;
+            font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+            font-size: 0.78em;
+            line-height: 1.7;
+        }
+
+        .log-entry {
+            padding: 2px 12px;
+            border-bottom: 1px solid #161b22;
+        }
+
+        .log-entry:hover {
+            background: #161b22;
+        }
+
+        .log-ts {
+            color: #484f58;
+            margin-right: 8px;
+        }
+
+        .log-level {
+            display: inline-block;
+            width: 52px;
+            text-align: center;
+            border-radius: 3px;
+            font-size: 0.85em;
+            margin-right: 6px;
+            padding: 0 4px;
+        }
+
+        .log-INFO {
+            color: #58a6ff;
+            background: #0d1d30;
+        }
+
+        .log-WARNING {
+            color: #d29922;
+            background: #1d1800;
+        }
+
+        .log-ERROR {
+            color: #f85149;
+            background: #1a0e0e;
+        }
+
+        .log-DEBUG {
+            color: #484f58;
+            background: #161b22;
+        }
+
+        .footer {
+            max-width: 1200px;
+            margin: 0 auto;
+            text-align: center;
+            color: #484f58;
+            font-size: 0.8em;
+            padding: 12px 0;
+        }
+
+        .footer a {
+            color: #58a6ff;
+            margin: 0 8px;
+        }
+
+        .refresh-indicator {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #3fb950;
+            margin-right: 6px;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+
+            0%,
+            100% {
+                opacity: 1;
+            }
+
+            50% {
+                opacity: 0.3;
+            }
+        }
+    </style>
+</head>
+
+<body>
+
+    <div class="header">
+        <h1><a href="/" style="text-decoration:none; color:#e0e0e0">x402gate</a> <span
+                style="color:#8b949e; font-weight:400">Dashboard</span></h1>
+        <div class="header-stats">
+            <span>Uptime: <strong id="uptime">—</strong></span>
+            <span>Requests: <strong id="total-requests">0</strong></span>
+            <span><span class="refresh-indicator"></span>Auto-refresh 5s</span>
+        </div>
+    </div>
+
+    <div class="grid" id="provider-grid">
+        <!-- Provider cards injected by JS -->
+    </div>
+
+    <div class="summary" id="summary">
+        <div class="summary-item">Revenue: <strong id="sum-revenue">$0</strong></div>
+        <div class="summary-item">Cost: <strong id="sum-cost">$0</strong></div>
+        <div class="summary-item">Profit: <strong id="sum-profit">$0</strong></div>
+        <div class="summary-item">Top-ups: <strong id="sum-topups">0 ($0)</strong></div>
+    </div>
+
+    <div class="logs-section">
+        <div class="logs-header">
+            <h3>Live Logs</h3>
+            <span class="logs-count" id="logs-count"></span>
+        </div>
+        <div class="logs" id="logs-container">
+            <!-- Log entries injected by JS -->
+        </div>
+    </div>
+
+    <div class="footer">
+        <a href="/">Home</a>
+        <a href="/v1/stats">Stats JSON</a>
+        <a href="/v1/logs">Logs JSON</a>
+        <a href="/health">Health</a>
+    </div>
+
+    <script>
+        const PROVIDER_TYPES = JSON.parse('{{ provider_types_json }}');
+
+        function formatUptime(seconds) {
+            const d = Math.floor(seconds / 86400);
+            const h = Math.floor((seconds % 86400) / 3600);
+            const m = Math.floor((seconds % 3600) / 60);
+            const s = Math.floor(seconds % 60);
+            if (d > 0) return `${d}d ${h}h ${m}m`;
+            if (h > 0) return `${h}h ${m}m ${s}s`;
+            return `${m}m ${s}s`;
+        }
+
+        function formatAgo(seconds) {
+            if (seconds === null || seconds === undefined) return 'never';
+            if (seconds < 60) return `${Math.floor(seconds)}s ago`;
+            if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+            return `${Math.floor(seconds / 3600)}h ago`;
+        }
+
+        function statusDot(status) {
+            return `<span class="status-dot status-${status}"></span>`;
+        }
+
+        function renderProviders(providers) {
+            const grid = document.getElementById('provider-grid');
+            const names = Object.keys(providers).sort();
+            grid.innerHTML = names.map(name => {
+                const p = providers[name];
+                const type = PROVIDER_TYPES[name] || 'managed';
+                const errHtml = p.last_error && p.status === 'error'
+                    ? `<div class="card-error">${escHtml(p.last_error)}</div>`
+                    : '';
+                return `
+                    <div class="card">
+                        <div class="card-header">
+                            <span class="card-name">${statusDot(p.status)} ${escHtml(name)}</span>
+                            <span class="card-type">${type}</span>
+                        </div>
+                        <div class="card-metrics">
+                            <div class="metric">Requests<strong>${p.total_requests}</strong></div>
+                            <div class="metric">Success<strong>${p.success_rate}%</strong></div>
+                            <div class="metric">Avg latency<strong>${p.avg_latency_ms} ms</strong></div>
+                            <div class="metric">Last activity<strong>${formatAgo(p.last_activity_ago_s)}</strong></div>
+                            <div class="metric">Revenue<strong>$${p.revenue_usd}</strong></div>
+                            <div class="metric">Profit<strong>$${p.profit_usd}</strong></div>
+                        </div>
+                        ${errHtml}
+                    </div>`;
+            }).join('');
+        }
+
+        function renderLogs(logs) {
+            const container = document.getElementById('logs-container');
+            const countEl = document.getElementById('logs-count');
+            countEl.textContent = `${logs.length} entries`;
+
+            container.innerHTML = logs.map(log => {
+                const d = new Date(log.ts * 1000);
+                const ts = d.toLocaleTimeString('en-GB', { hour12: false });
+                const lvl = log.level || 'INFO';
+                return `<div class="log-entry"><span class="log-ts">${ts}</span><span class="log-level log-${lvl}">${lvl}</span>${escHtml(log.message)}</div>`;
+            }).join('');
+        }
+
+        function escHtml(s) {
+            const div = document.createElement('div');
+            div.textContent = s;
+            return div.innerHTML;
+        }
+
+        async function refresh() {
+            try {
+                const [statsResp, logsResp] = await Promise.all([
+                    fetch('/v1/stats'),
+                    fetch('/v1/logs?limit=200')
+                ]);
+                const stats = await statsResp.json();
+                const logs = await logsResp.json();
+
+                document.getElementById('uptime').textContent = formatUptime(stats.uptime_s);
+                document.getElementById('total-requests').textContent = stats.total_requests;
+                document.getElementById('sum-revenue').textContent = '$' + stats.total_revenue_usd;
+                document.getElementById('sum-cost').textContent = '$' + stats.total_cost_usd;
+
+                const profitEl = document.getElementById('sum-profit');
+                profitEl.textContent = '$' + stats.total_profit_usd;
+                const profitNum = parseFloat(stats.total_profit_usd);
+                profitEl.className = profitNum >= 0 ? 'profit-positive' : 'profit-negative';
+
+                document.getElementById('sum-topups').textContent =
+                    `${stats.total_topups} ($${stats.total_topup_usd})`;
+
+                renderProviders(stats.providers);
+                renderLogs(logs);
+            } catch (e) {
+                console.error('Dashboard refresh failed:', e);
+            }
+        }
+
+        refresh();
+        setInterval(refresh, 5000);
+    </script>
+
+</body>
+
+</html>

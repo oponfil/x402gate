@@ -402,3 +402,39 @@ class TestCloudConvertUploadLimit:
         )
         # Should get 402 (no payment), NOT 413
         assert response.status_code == 402
+
+
+class TestDashboard:
+    """Integration tests for the dashboard endpoints."""
+
+    def test_dashboard_returns_html(self, client):
+        """GET /dashboard returns 200 with HTML content."""
+        response = client.get("/dashboard")
+        assert response.status_code == 200
+        assert "text/html" in response.headers["content-type"]
+        assert "x402gate" in response.text
+        assert "Dashboard" in response.text
+
+    def test_stats_endpoint(self, client):
+        """GET /v1/stats returns valid statistics JSON."""
+        response = client.get("/v1/stats")
+        assert response.status_code == 200
+        data = response.json()
+        assert "uptime_s" in data
+        assert "total_requests" in data
+        assert "providers" in data
+        assert "total_revenue_usd" in data
+
+    def test_logs_endpoint(self, client):
+        """GET /v1/logs returns a list of log entries."""
+        response = client.get("/v1/logs")
+        assert response.status_code == 200
+        data = response.json()
+        assert isinstance(data, list)
+
+    def test_logs_limit_param(self, client):
+        """GET /v1/logs?limit=5 respects limit parameter."""
+        response = client.get("/v1/logs?limit=5")
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) <= 5
