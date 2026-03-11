@@ -246,9 +246,9 @@ def get_stats() -> dict[str, Any]:
             "total_settlements": ns.total_settlements,
             "avg_settle_latency_s": avg_settle_s,
             "avg_overhead_s": avg_overhead_s,
-            "total_gas_cost_usd": round(ns.total_gas_cost_usd, 4),
-            "avg_gas_cost_usd": round(avg_gas_usd, 4),
-            "total_gas_cost_native": round(ns.total_gas_cost_native, 6),
+            "total_gas_cost_usd": f"{ns.total_gas_cost_usd:.4f}",
+            "avg_gas_cost_usd": f"{avg_gas_usd:.4f}",
+            "total_gas_cost_native": f"{ns.total_gas_cost_native:.6f}",
             "gas_label": ns.gas_label,
         }
 

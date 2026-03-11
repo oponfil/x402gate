@@ -39,7 +39,8 @@ async def test_prepaid_openrouter(gateway_process):
 
     # Check that the balance is positive but less than the credited amount
     async with httpx.AsyncClient() as http_client:
-        resp = await http_client.get(f"http://localhost:4022/v1/balance/{client_pubkey}")
+        gateway_url = os.environ.get("GATEWAY_URL", "http://localhost:4022")
+        resp = await http_client.get(f"{gateway_url}/v1/balance/{client_pubkey}")
         balance_data = resp.json()
 
     final_balance = float(balance_data["balance"])

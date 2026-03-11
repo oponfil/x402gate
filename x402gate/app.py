@@ -665,6 +665,7 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
             base_price = await provider.get_price(path, body)
             price_cache.set(path, body, base_price)
     except ProviderError as e:
+        stats.record_request(provider_name, 0, False, error_msg=e.detail)
         return _error_response(e.status_code, e.detail, provider=e.provider)
 
     # 3. Apply commission
@@ -719,7 +720,7 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
     try:
         result = await provider.submit(path, body, prepaid=prepaid_mode)
     except ProviderError as e:
-        t_err = time.monotonic() - t_start
+        t_err = time.monotonic() - t_gen_start
         stats.record_request(provider_name, t_err, False, error_msg=e.detail)
         return _error_response(e.status_code, e.detail, provider=e.provider)
 
@@ -742,7 +743,7 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
             output = await provider.get_result(task_id)
         except TaskTimeoutError as e:
             # Don't settle — client keeps their money
-            t_err = time.monotonic() - t_start
+            t_err = time.monotonic() - t_gen_start
             stats.record_request(provider_name, t_err, False, error_msg=f"Timeout {e.timeout}s")
             return _error_response(
                 504,
@@ -752,7 +753,7 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
             )
         except ProviderError as e:
             # Don't settle — task failed
-            t_err = time.monotonic() - t_start
+            t_err = time.monotonic() - t_gen_start
             stats.record_request(provider_name, t_err, False, error_msg=e.detail)
             return _error_response(e.status_code, e.detail, provider=e.provider)
     else:
