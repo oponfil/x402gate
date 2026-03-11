@@ -17,6 +17,7 @@ from pathlib import Path
 import httpx
 import yaml
 from eth_account import Account
+from helpers import Timings
 from x402 import PaymentRequired, x402Client
 from x402.mechanisms.evm.exact import ExactEvmScheme
 from x402.mechanisms.evm.signers import EthAccountSigner
@@ -58,14 +59,17 @@ async def run_client():
     logger.info("Client Address: %s", account.address)
     logger.info("Gateway URL: %s", gateway_url)
 
+    timings = Timings()
+
     async with httpx.AsyncClient() as http_client:
         # 1. Request without payment → expect 402
         logger.info("Sending initial request...")
-        response = await http_client.post(
-            f"{gateway_url}/v1/openrouter/chat/completions",
-            json=body,
-            timeout=15.0,
-        )
+        with timings.measure("pricing"):
+            response = await http_client.post(
+                f"{gateway_url}/v1/openrouter/chat/completions",
+                json=body,
+                timeout=15.0,
+            )
 
         if response.status_code != 402:
             logger.error("Expected 402, got %d: %s", response.status_code, response.text)
@@ -83,29 +87,32 @@ async def run_client():
 
         # 2. Sign payment (Base only)
         logger.info("Signing payment...")
-        payment_required = PaymentRequired.model_validate(payment_data)
+        with timings.measure("signing"):
+            payment_required = PaymentRequired.model_validate(payment_data)
 
-        base_accepts = [
-            a for a in payment_required.accepts if "eip155:8453" in getattr(a, "network", "")
-        ]
-        if not base_accepts:
-            logger.error("No Base payment option in 402 response")
-            sys.exit(1)
-        payment_required.accepts = base_accepts
+            base_accepts = [
+                a for a in payment_required.accepts if "eip155:8453" in getattr(a, "network", "")
+            ]
+            if not base_accepts:
+                logger.error("No Base payment option in 402 response")
+                sys.exit(1)
+            payment_required.accepts = base_accepts
 
-        payment_payload = await x402_client.create_payment_payload(payment_required)
-        signature = base64.b64encode(
-            payment_payload.model_dump_json(by_alias=True).encode()
-        ).decode()
+            payment_payload = await x402_client.create_payment_payload(payment_required)
+            signature = base64.b64encode(
+                payment_payload.model_dump_json(by_alias=True).encode()
+            ).decode()
 
         # 3. Retry with payment → expect 200 with web-sourced response
         logger.info("Retrying with payment (web search enabled)...")
-        response = await http_client.post(
-            f"{gateway_url}/v1/openrouter/chat/completions",
-            json=body,
-            headers={"PAYMENT-SIGNATURE": signature},
-            timeout=60.0,
-        )
+        with timings.measure("paid_request"):
+            response = await http_client.post(
+                f"{gateway_url}/v1/openrouter/chat/completions",
+                json=body,
+                headers={"PAYMENT-SIGNATURE": signature},
+                timeout=60.0,
+            )
+        timings.add_server_timings(response)
 
         if response.status_code != 200:
             logger.error("Failed: %d %s", response.status_code, response.text)
@@ -125,6 +132,8 @@ async def run_client():
             usage.get("total_tokens"),
         )
         logger.info("E2E test passed!")
+
+    timings.output()
 
 
 if __name__ == "__main__":

@@ -77,7 +77,9 @@ async def test_solana_wavespeed(gateway_process):
     print(f"Facilitator SOL: {fac_sol_before / 1e9:.9f}")
 
     # Run the Solana client script
+    _t_start = time.monotonic()
     result = run_script("tests/e2e/x402_solana_test_client.py", label="Solana WaveSpeed")
+    _client_wait_s = time.monotonic() - _t_start
 
     print(result.stdout)
     print(result.stderr)
@@ -104,6 +106,45 @@ async def test_solana_wavespeed(gateway_process):
     print(f"Client paid:     {client_diff / 1e6:.6f} USDC")
     print(f"PayTo received:  {payto_diff / 1e6:.6f} USDC")
     print(f"Gas spent:       {gas_spent / 1e9:.9f} SOL")
+
+    # --- Timing ---
+    from tests.e2e.conftest import _parse_generation_time, _parse_timings
+
+    combined = result.stdout + "\n" + result.stderr
+    timings = _parse_timings(result.stdout)
+    generation_s = _parse_generation_time(combined)
+    client_wait_s = _client_wait_s
+
+    print("\n=== [Solana] Timing ===")
+    if timings:
+        print(f"Pricing (402):           {timings['pricing']:.1f}s")
+        print(f"Signing:                 {timings['signing']:.1f}s")
+
+        sv = timings.get("server_verify")
+        sg = timings.get("server_generation")
+        if sv is not None and sg is not None:
+            network_overhead = timings["paid_request"] - sv - sg
+            print(f"Payment verify:          {sv:.1f}s")
+            print(f"Generation time:         {sg:.1f}s")
+            print(f"Network overhead:        {network_overhead:.1f}s")
+        elif generation_s is not None:
+            overhead = timings["paid_request"] - generation_s
+            print(f"Generation time:         {generation_s:.1f}s")
+            print(f"Payment time (overhead): {overhead:.1f}s")
+        else:
+            print(f"Paid request:            {timings['paid_request']:.1f}s")
+
+        dl = timings.get("download", 0.0)
+        if dl > 0:
+            print(f"Download:                {dl:.1f}s")
+
+        client_timings = {k: v for k, v in timings.items() if not k.startswith("server_")}
+        total_timings = sum(client_timings.values())
+        other = client_wait_s - total_timings
+        print(f"Other (subprocess):      {other:.1f}s")
+    elif generation_s is not None:
+        print(f"Generation time:         {generation_s:.1f}s")
+    print(f"Total client time:       {client_wait_s:.1f}s")
 
     # Verify amounts: client pays provider_base + commission, PayTo receives full amount
     assert client_diff > 0, f"Client should pay some USDC, paid {client_diff}"

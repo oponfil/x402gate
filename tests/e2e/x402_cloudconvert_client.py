@@ -18,7 +18,7 @@ import sys
 
 import httpx
 from eth_account import Account
-from helpers import save_from_urls
+from helpers import Timings, save_from_urls
 from x402 import PaymentRequired, x402Client
 from x402.mechanisms.evm.exact import ExactEvmScheme
 from x402.mechanisms.evm.signers import EthAccountSigner
@@ -65,14 +65,17 @@ async def run_client():
 
     url = f"{gateway_url}/v1/cloudconvert/convert"
 
+    timings = Timings()
+
     async with httpx.AsyncClient() as http_client:
         # 1. Request without payment (multipart)
         logger.info("Sending initial request (no payment)...")
-        response = await http_client.post(
-            url,
-            files={"file": (TEST_FILE_NAME, TEST_FILE_CONTENT)},
-            data={"output_format": OUTPUT_FORMAT, "input_format": "html"},
-        )
+        with timings.measure("pricing"):
+            response = await http_client.post(
+                url,
+                files={"file": (TEST_FILE_NAME, TEST_FILE_CONTENT)},
+                data={"output_format": OUTPUT_FORMAT, "input_format": "html"},
+            )
 
         if response.status_code != 402:
             logger.error("Expected 402, got %d: %s", response.status_code, response.text)
@@ -85,38 +88,44 @@ async def run_client():
 
         # 2. Sign payment
         logger.info("Signing payment...")
-        try:
-            payment_payload = await x402_client.create_payment_payload(payment_required)
-            signature = base64.b64encode(
-                payment_payload.model_dump_json(by_alias=True).encode()
-            ).decode()
-        except Exception as e:
-            logger.error("Failed to sign payment: %s", e)
-            sys.exit(1)
+        with timings.measure("signing"):
+            try:
+                payment_payload = await x402_client.create_payment_payload(payment_required)
+                signature = base64.b64encode(
+                    payment_payload.model_dump_json(by_alias=True).encode()
+                ).decode()
+            except Exception as e:
+                logger.error("Failed to sign payment: %s", e)
+                sys.exit(1)
 
         # 3. Retry with payment (multipart + signature header)
         logger.info("Retrying with payment signature...")
-        response = await http_client.post(
-            url,
-            files={"file": (TEST_FILE_NAME, TEST_FILE_CONTENT)},
-            data={"output_format": OUTPUT_FORMAT, "input_format": "html"},
-            headers={"PAYMENT-SIGNATURE": signature},
-            timeout=120.0,
-        )
+        with timings.measure("paid_request"):
+            response = await http_client.post(
+                url,
+                files={"file": (TEST_FILE_NAME, TEST_FILE_CONTENT)},
+                data={"output_format": OUTPUT_FORMAT, "input_format": "html"},
+                headers={"PAYMENT-SIGNATURE": signature},
+                timeout=120.0,
+            )
+        timings.add_server_timings(response)
 
         if response.status_code == 200:
             result = response.json()
             logger.info("Success! Result: %s", result)
 
             # Download converted file
-            data = result.get("data", result)
-            result_url = data.get("url")
-            filename = data.get("filename", "output")
-            if result_url:
-                await save_from_urls([result_url], f"cloudconvert_{filename}", http_client)
+            with timings.measure("download"):
+                data = result.get("data", result)
+                result_url = data.get("url")
+                filename = data.get("filename", "output")
+                if result_url:
+                    await save_from_urls([result_url], f"cloudconvert_{filename}", http_client)
         else:
             logger.error("Failed: %d %s", response.status_code, response.text)
             sys.exit(1)
+
+    timings.output()
 
 
 if __name__ == "__main__":

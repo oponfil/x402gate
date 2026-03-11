@@ -329,10 +329,28 @@ class CloudConvertProvider(BaseProvider):
     @staticmethod
     def _extract_error(job: dict[str, Any]) -> str:
         """Extract error message from a failed job."""
+        errors: list[str] = []
         for task in job.get("tasks", []):
             if task.get("status") == "error":
-                msg = task.get("message", "")
                 code = task.get("code", "")
-                if msg:
-                    return f"{code}: {msg}" if code else msg
-        return "Unknown error"
+                msg = task.get("message", "")
+                task_name = task.get("name", task.get("operation", ""))
+
+                # Build base error
+                base = f"{code}: {msg}" if code else msg
+
+                # Extract detailed errors from result.errors (if present)
+                result_errors = task.get("result", {})
+                if isinstance(result_errors, dict):
+                    detail_list = result_errors.get("errors", [])
+                    if detail_list:
+                        details = "; ".join(
+                            e.get("message", str(e)) if isinstance(e, dict) else str(e)
+                            for e in detail_list
+                        )
+                        base = f"{base} ({details})" if base else details
+
+                if base:
+                    errors.append(f"[{task_name}] {base}" if task_name else base)
+
+        return " | ".join(errors) if errors else "Unknown error"

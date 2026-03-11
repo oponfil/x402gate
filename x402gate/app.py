@@ -677,10 +677,13 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
     payment_sig = payment_handler.extract_payment_signature(request)
     prepaid_pubkey = request.headers.get("x-prepaid-pubkey")
     prepaid_mode = False
+    verify_s = 0.0
 
     if payment_sig:
         # 5a. Standard x402 payment flow
+        t_verify_start = time.monotonic()
         is_valid, payment_network, _ = await payment_handler.verify(payment_sig, final_price)
+        verify_s = time.monotonic() - t_verify_start
         if not is_valid:
             return _error_response(402, "Payment verification failed")
     elif prepaid_pubkey:
@@ -852,4 +855,10 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
     # 10. Return result to client
     stats.record_request(provider_name, generation_s, True)
     stats.record_overhead(payment_network, t_client - generation_s)
-    return JSONResponse(content={"data": output})
+    return JSONResponse(
+        content={"data": output},
+        headers={
+            "X-Timing-Verify": f"{verify_s:.2f}",
+            "X-Timing-Generation": f"{generation_s:.2f}",
+        },
+    )

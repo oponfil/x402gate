@@ -2,6 +2,8 @@
 
 import base64
 import logging
+import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -10,6 +12,45 @@ import httpx
 logger = logging.getLogger("x402-e2e-helpers")
 
 OUTPUT_DIR = Path(__file__).parent / "output"
+
+
+class Timings:
+    """Collect step timings and output structured TIMINGS: line.
+
+    Usage::
+
+        timings = Timings()
+        with timings.measure("pricing"):
+            response = await http_client.post(...)
+        with timings.measure("signing"):
+            payload = await x402_client.create_payment_payload(...)
+        timings.add_server_timings(response)  # parse X-Timing-* headers
+        timings.output()  # prints TIMINGS:pricing=1.07,signing=0.01,...
+    """
+
+    def __init__(self):
+        self._steps: list[tuple[str, float]] = []
+
+    @contextmanager
+    def measure(self, name: str):
+        """Context manager that records elapsed time for a named step."""
+        t0 = time.monotonic()
+        yield
+        self._steps.append((name, time.monotonic() - t0))
+
+    def add_server_timings(self, response):
+        """Parse X-Timing-Verify and X-Timing-Generation from response headers."""
+        verify = response.headers.get("x-timing-verify")
+        generation = response.headers.get("x-timing-generation")
+        if verify is not None:
+            self._steps.append(("server_verify", float(verify)))
+        if generation is not None:
+            self._steps.append(("server_generation", float(generation)))
+
+    def output(self):
+        """Print structured TIMINGS line for conftest to parse."""
+        parts = ",".join(f"{k}={v:.2f}" for k, v in self._steps)
+        print(f"TIMINGS:{parts}")
 
 
 def _timestamp() -> str:

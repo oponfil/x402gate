@@ -26,6 +26,13 @@ async def test_prepaid_openrouter(gateway_process):
     test_keypair = Keypair.from_base58_string(os.environ["SOLANA_E2ETEST_PRIVATE_KEY"])
     client_pubkey = str(test_keypair.pubkey())
 
+    # Record balance BEFORE top-up
+    gateway_url = os.environ.get("GATEWAY_URL", "http://localhost:4022")
+    async with httpx.AsyncClient() as http_client:
+        resp = await http_client.get(f"{gateway_url}/v1/balance/{client_pubkey}")
+        balance_before = float(resp.json().get("balance", 0))
+    print(f"Balance before: ${balance_before:.6f}")
+
     # Run the prepaid client script (top-up + 2 OpenRouter + WaveSpeed + Tungsten)
     result = run_script("tests/e2e/x402_prepaid_client.py", label="Prepaid")
 
@@ -37,17 +44,20 @@ async def test_prepaid_openrouter(gateway_process):
     print("Waiting for settlement to confirm on-chain...")
     time.sleep(15)  # noqa: ASYNC251
 
-    # Check that the balance is positive but less than the credited amount
+    # Check balance AFTER
     async with httpx.AsyncClient() as http_client:
-        gateway_url = os.environ.get("GATEWAY_URL", "http://localhost:4022")
         resp = await http_client.get(f"{gateway_url}/v1/balance/{client_pubkey}")
         balance_data = resp.json()
 
     final_balance = float(balance_data["balance"])
-    print(f"\nFinal prepaid balance: ${final_balance:.6f}")
+    delta = final_balance - balance_before
+    print(f"\nBalance before: ${balance_before:.6f}")
+    print(f"Balance after:  ${final_balance:.6f}")
+    print(f"Delta:          ${delta:+.6f}")
 
-    # After top-up ($0.10 minus fees ≈ $0.095) and 4 provider calls,
-    # balance should be positive but reduced
+    # Top-up adds ~$0.1046, 4 provider calls spend ~$0.02-0.03
+    # Net delta should be positive (top-up > spending) and less than top-up amount
     assert final_balance >= 0, f"Balance should be non-negative, got {final_balance}"
-    assert final_balance < 0.10, f"Balance should be less than top-up amount, got {final_balance}"
+    assert delta > 0, f"Balance should have increased (top-up > spending), got delta={delta}"
+    assert delta < 0.11, f"Delta should be less than top-up amount, got {delta}"
     print("E2E prepaid test passed!")

@@ -257,8 +257,10 @@ def run_e2e_client(
     print(f"Client USDC: {before.client_usdc / 1e6:.6f}")
     print(f"PayTo  USDC: {before.payto_usdc / 1e6:.6f}")
 
-    # --- Run client ---
+    # --- Run client (measure wall-clock time) ---
+    t_start = time.monotonic()
     result = run_script(script, label=label)
+    client_wait_s = time.monotonic() - t_start
 
     print(result.stdout)
     print(result.stderr)
@@ -281,13 +283,110 @@ def run_e2e_client(
         gas_spent=before.payto_eth - after.payto_eth,
     )
 
-    print(f"\n=== [{label}] Balances AFTER ===")
-    print(f"Client USDC: {after.client_usdc / 1e6:.6f}")
-    print(f"PayTo  USDC: {after.payto_usdc / 1e6:.6f}")
-    print(f"\n=== [{label}] Balance Changes ===")
-    print(f"Client paid:     {diff.client_paid / 1e6:.6f} USDC")
-    print(f"PayTo received:  {diff.payto_received / 1e6:.6f} USDC")
+    print(f"\n=== [{label}] Balances Changes ===")
+    print(f"Client USDC: ${after.client_usdc / 1e6:.6f}")
+    print(f"PayTo  USDC: ${after.payto_usdc / 1e6:.6f}")
+    print(f"Client paid:     ${diff.client_paid / 1e6:.6f} USDC")
+    print(f"PayTo received:  ${diff.payto_received / 1e6:.6f} USDC")
     if diff.gas_spent:
-        print(f"Gas spent:       {diff.gas_spent / 1e18:.10f} ETH")
+        gas_eth = diff.gas_spent / 1e18
+        print(f"Gas spent:       {gas_eth:.10f} ETH")
+
+    # --- Profit ---
+    gas_usd = diff.gas_spent / 1e18 * _get_eth_price()
+    revenue_usd = diff.client_paid / 1e6
+    net_profit = revenue_usd - gas_usd
+    print(f"Net profit:      ${net_profit:.6f} USDC")
+
+    # --- Timing ---
+    combined_output = result.stdout + "\n" + result.stderr
+    timings = _parse_timings(result.stdout)
+    generation_s = _parse_generation_time(combined_output)
+
+    print(f"\n=== [{label}] Timing ===")
+    if timings:
+        print(f"Pricing (402):           {timings['pricing']:.1f}s")
+        print(f"Signing:                 {timings['signing']:.1f}s")
+
+        # Prefer server-side timings (accurate, includes polling)
+        sv = timings.get("server_verify")
+        sg = timings.get("server_generation")
+        if sv is not None and sg is not None:
+            network_overhead = timings["paid_request"] - sv - sg
+            print(f"Payment verify:          {sv:.1f}s")
+            print(f"Generation time:         {sg:.1f}s")
+            print(f"Network overhead:        {network_overhead:.1f}s")
+        elif generation_s is not None:
+            overhead = timings["paid_request"] - generation_s
+            print(f"Generation time:         {generation_s:.1f}s")
+            print(f"Payment time (overhead): {overhead:.1f}s")
+        else:
+            print(f"Paid request:            {timings['paid_request']:.1f}s")
+
+        dl = timings.get("download", 0.0)
+        if dl > 0:
+            print(f"Download:                {dl:.1f}s")
+
+        # Exclude server timings from sum (they're sub-components of paid_request)
+        client_timings = {k: v for k, v in timings.items() if not k.startswith("server_")}
+        total_timings = sum(client_timings.values())
+        other = client_wait_s - total_timings
+        print(f"Other (subprocess):      {other:.1f}s")
+    elif generation_s is not None:
+        print(f"Generation time:         {generation_s:.1f}s")
+    print(f"Total client time:       {client_wait_s:.1f}s")
 
     return diff
+
+
+def _parse_timings(stdout: str) -> dict[str, float] | None:
+    """Parse structured TIMINGS: line from client script output."""
+    import re
+
+    m = re.search(r"TIMINGS:([\w=.,]+)", stdout)
+    if not m:
+        return None
+    try:
+        return {k: float(v) for k, v in (pair.split("=") for pair in m.group(1).split(","))}
+    except (ValueError, IndexError):
+        return None
+
+
+def _parse_generation_time(stdout: str) -> float | None:
+    """Try to extract generation/inference time from client script output."""
+    import re
+
+    # WaveSpeed: 'executionTime': 10495  (milliseconds)
+    m = re.search(r"'executionTime':\s*(\d+)", stdout)
+    if m:
+        return int(m.group(1)) / 1000.0
+
+    # Tungsten: "completed after 15s"
+    m = re.search(r"completed after (\d+)s", stdout)
+    if m:
+        return float(m.group(1))
+
+    # OpenRouter: "Tokens: prompt=X, completion=Y" — use total client time
+    # CloudConvert: "finished after Xs"
+    m = re.search(r"finished after (\d+)s", stdout)
+    if m:
+        return float(m.group(1))
+
+    return None
+
+
+def _get_eth_price() -> float:
+    """Get current ETH price in USD (cached for the session)."""
+    if not hasattr(_get_eth_price, "_cached"):
+        try:
+            import httpx
+
+            resp = httpx.get(
+                "https://api.coingecko.com/api/v3/simple/price",
+                params={"ids": "ethereum", "vs_currencies": "usd"},
+                timeout=5,
+            )
+            _get_eth_price._cached = resp.json()["ethereum"]["usd"]
+        except Exception:
+            _get_eth_price._cached = 2000.0  # fallback
+    return _get_eth_price._cached

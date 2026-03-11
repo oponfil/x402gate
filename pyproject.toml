@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "x402gate"
-version = "0.2.1"
+version = "0.2.2"
 description = "Transparent x402 payment proxy for AI services"
 readme = "README.md"
 license = "MIT"

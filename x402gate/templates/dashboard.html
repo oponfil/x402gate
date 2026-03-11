@@ -415,6 +415,8 @@
 
             const sorted = logs.slice().reverse();
 
+            const atBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 50;
+
             container.innerHTML = sorted.map(log => {
                 const d = new Date(log.ts * 1000);
                 const mon = d.toLocaleString('en-US', { month: 'short' });
@@ -425,7 +427,7 @@
                 return `<div class="log-entry"><span class="log-ts">${ts}</span><span class="log-level log-${lvl}">${lvl}</span>${escHtml(log.message)}</div>`;
             }).join('');
 
-            container.scrollTop = container.scrollHeight;
+            if (atBottom) container.scrollTop = container.scrollHeight;
         }
 
         const NETWORK_NAMES = {

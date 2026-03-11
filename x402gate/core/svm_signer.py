@@ -194,7 +194,7 @@ class SolanaSigner:
 
         sig = getattr(result, "value", None)
         if sig:
-            logger.info("Transaction sent: %s", sig)
+            logger.info("Transaction sent: %s", str(sig)[:16] + "...")
             return str(sig)
         raise RuntimeError(f"Transaction send failed: {result}")
 

@@ -19,7 +19,7 @@ from pathlib import Path
 import httpx
 import yaml
 from eth_account import Account
-from helpers import save_from_urls
+from helpers import Timings, save_from_urls
 from x402 import PaymentRequired, x402Client
 from x402.mechanisms.evm.exact.client import ExactEvmScheme
 from x402.mechanisms.evm.signers import EthAccountSigner
@@ -32,7 +32,6 @@ CONFIG_PATH = Path(__file__).resolve().parents[2] / "config.yaml"
 
 def _load_example_request() -> tuple[str, dict]:
     """Load model and body from config.yaml's wavespeed example_request_2."""
-
     with open(CONFIG_PATH) as f:
         cfg = yaml.safe_load(f)
     example = cfg["providers"]["wavespeed"]["example_request_2"]
@@ -48,7 +47,6 @@ async def run_client():
         logger.error("BASE_E2ETEST_PRIVATE_KEY env var not set")
         sys.exit(1)
 
-    # Initialize x402 client with EVM signer
     if not private_key.startswith("0x"):
         private_key = "0x" + private_key
     account = Account.from_key(private_key)
@@ -62,13 +60,15 @@ async def run_client():
     logger.info("Client Address: %s", signer.address)
     logger.info("Gateway URL: %s", gateway_url)
 
+    timings = Timings()
+
     async with httpx.AsyncClient() as http_client:
-        # 1. Request without payment -> 402
         logger.info("Sending initial request...")
-        response = await http_client.post(
-            f"{gateway_url}/v1/wavespeed/{model}",
-            json=body,
-        )
+        with timings.measure("pricing"):
+            response = await http_client.post(
+                f"{gateway_url}/v1/wavespeed/{model}",
+                json=body,
+            )
 
         if response.status_code != 402:
             logger.error("Expected 402, got %d: %s", response.status_code, response.text)
@@ -84,7 +84,6 @@ async def run_client():
                 int(accept.get("amount", 0)) / 1e6,
             )
 
-        # Filter to EVM (Base) only
         evm_accepts = [
             a for a in payment_data.get("accepts", []) if "eip155:" in a.get("network", "")
         ]
@@ -95,37 +94,39 @@ async def run_client():
         payment_data["accepts"] = evm_accepts
         payment_required = PaymentRequired.model_validate(payment_data)
 
-        # 2. Sign payment
         logger.info("Signing payment...")
-        payment_payload = await x402_client.create_payment_payload(payment_required)
+        with timings.measure("signing"):
+            payment_payload = await x402_client.create_payment_payload(payment_required)
+            signature = base64.b64encode(
+                payment_payload.model_dump_json(by_alias=True).encode()
+            ).decode()
 
-        signature = base64.b64encode(
-            payment_payload.model_dump_json(by_alias=True).encode()
-        ).decode()
-
-        # 3. Retry with payment (video generation can be slow)
         logger.info("Retrying with payment signature (video may take 30-120s)...")
-        response = await http_client.post(
-            f"{gateway_url}/v1/wavespeed/{model}",
-            json=body,
-            headers={"PAYMENT-SIGNATURE": signature},
-            timeout=300.0,
-        )
+        with timings.measure("paid_request"):
+            response = await http_client.post(
+                f"{gateway_url}/v1/wavespeed/{model}",
+                json=body,
+                headers={"PAYMENT-SIGNATURE": signature},
+                timeout=300.0,
+            )
+        timings.add_server_timings(response)
 
         if response.status_code == 200:
             result = response.json()
             data = result.get("data", result)
             logger.info("Success! Task ID: %s", data.get("id", "?"))
 
-            # Download video
-            outputs = data.get("outputs", [])
-            if outputs:
-                await save_from_urls(outputs, "video", http_client)
-            else:
-                logger.warning("No output URLs in response: %s", data)
+            with timings.measure("download"):
+                outputs = data.get("outputs", [])
+                if outputs:
+                    await save_from_urls(outputs, "video", http_client)
+                else:
+                    logger.warning("No output URLs in response: %s", data)
         else:
             logger.error("Failed: %d %s", response.status_code, response.text)
             sys.exit(1)
+
+    timings.output()
 
 
 if __name__ == "__main__":

@@ -20,7 +20,7 @@ from pathlib import Path
 import httpx
 import yaml
 from eth_account import Account
-from helpers import save_images
+from helpers import Timings, save_images
 from x402 import PaymentRequired, x402Client
 from x402.mechanisms.evm.exact import ExactEvmScheme
 from x402.mechanisms.evm.signers import EthAccountSigner
@@ -61,13 +61,16 @@ async def run_client():
     logger.info("Client Address: %s", account.address)
     logger.info("Gateway URL: %s", gateway_url)
 
+    timings = Timings()
+
     async with httpx.AsyncClient() as http_client:
         # 1. Request without payment → should get 402
         logger.info("Sending initial request (no payment)...")
-        response = await http_client.post(
-            f"{gateway_url}/v1/tungsten/{model_path}",
-            json=body,
-        )
+        with timings.measure("pricing"):
+            response = await http_client.post(
+                f"{gateway_url}/v1/tungsten/{model_path}",
+                json=body,
+            )
 
         if response.status_code != 402:
             logger.error("Expected 402, got %d: %s", response.status_code, response.text)
@@ -78,19 +81,22 @@ async def run_client():
         # Parse 402 and sign payment
         payment_required = PaymentRequired.model_validate(response.json())
         logger.info("Signing payment...")
-        payment_payload = await x402_client.create_payment_payload(payment_required)
-        signature = base64.b64encode(
-            payment_payload.model_dump_json(by_alias=True).encode()
-        ).decode()
+        with timings.measure("signing"):
+            payment_payload = await x402_client.create_payment_payload(payment_required)
+            signature = base64.b64encode(
+                payment_payload.model_dump_json(by_alias=True).encode()
+            ).decode()
 
         # 2. Retry with payment → should get image
         logger.info("Retrying with payment signature...")
-        response = await http_client.post(
-            f"{gateway_url}/v1/tungsten/{model_path}",
-            json=body,
-            headers={"PAYMENT-SIGNATURE": signature},
-            timeout=600.0,  # Tungsten can take a while
-        )
+        with timings.measure("paid_request"):
+            response = await http_client.post(
+                f"{gateway_url}/v1/tungsten/{model_path}",
+                json=body,
+                headers={"PAYMENT-SIGNATURE": signature},
+                timeout=600.0,  # Tungsten can take a while
+            )
+        timings.add_server_timings(response)
 
         if response.status_code == 200:
             result = response.json()
@@ -101,11 +107,14 @@ async def run_client():
             logger.info("Success! Generated %d image(s)", count)
 
             # Save images to disk
-            if images:
-                save_images(images, "base_tungsten")
+            with timings.measure("download"):
+                if images:
+                    save_images(images, "base_tungsten")
         else:
             logger.error("Failed: %d %s", response.status_code, response.text)
             sys.exit(1)
+
+    timings.output()
 
 
 if __name__ == "__main__":

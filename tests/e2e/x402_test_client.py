@@ -20,7 +20,7 @@ from pathlib import Path
 import httpx
 import yaml
 from eth_account import Account
-from helpers import save_from_urls
+from helpers import Timings, save_from_urls
 from x402 import PaymentRequired, x402Client
 from x402.mechanisms.evm.exact import ExactEvmScheme
 from x402.mechanisms.evm.signers import EthAccountSigner
@@ -65,13 +65,16 @@ async def run_client():
     logger.info("Client Address: %s", account.address)
     logger.info("Gateway URL: %s", gateway_url)
 
+    timings = Timings()
+
     async with httpx.AsyncClient() as http_client:
-        # 1. Request without payment
+        # 1. Request without payment (pricing)
         logger.info("Sending initial request...")
-        response = await http_client.post(
-            f"{gateway_url}/v1/wavespeed/{model_path}",
-            json=body,
-        )
+        with timings.measure("pricing"):
+            response = await http_client.post(
+                f"{gateway_url}/v1/wavespeed/{model_path}",
+                json=body,
+            )
 
         if response.status_code != 402:
             logger.error("Expected 402, got %d: %s", response.status_code, response.text)
@@ -84,37 +87,41 @@ async def run_client():
 
         # 2. Create payment payload (signing)
         logger.info("Signing payment...")
-        try:
-            payment_payload = await x402_client.create_payment_payload(payment_required)
-            # Serialize to JSON and base64-encode for the header
-
-            signature = base64.b64encode(
-                payment_payload.model_dump_json(by_alias=True).encode()
-            ).decode()
-        except Exception as e:
-            logger.error("Failed to sign payment: %s", e)
-            sys.exit(1)
+        with timings.measure("signing"):
+            try:
+                payment_payload = await x402_client.create_payment_payload(payment_required)
+                signature = base64.b64encode(
+                    payment_payload.model_dump_json(by_alias=True).encode()
+                ).decode()
+            except Exception as e:
+                logger.error("Failed to sign payment: %s", e)
+                sys.exit(1)
 
         # 3. Retry with payment
         logger.info("Retrying with signature...")
-        response = await http_client.post(
-            f"{gateway_url}/v1/wavespeed/{model_path}",
-            json=body,
-            headers={"PAYMENT-SIGNATURE": signature},
-            timeout=60.0,
-        )
+        with timings.measure("paid_request"):
+            response = await http_client.post(
+                f"{gateway_url}/v1/wavespeed/{model_path}",
+                json=body,
+                headers={"PAYMENT-SIGNATURE": signature},
+                timeout=60.0,
+            )
+        timings.add_server_timings(response)
 
         if response.status_code == 200:
             result = response.json()
             logger.info("Success! Result: %s", result)
 
             # Download generated image
-            outputs = result.get("data", result).get("outputs", [])
-            if outputs:
-                await save_from_urls(outputs, "base_wavespeed", http_client)
+            with timings.measure("download"):
+                outputs = result.get("data", result).get("outputs", [])
+                if outputs:
+                    await save_from_urls(outputs, "base_wavespeed", http_client)
         else:
             logger.error("Failed: %d %s", response.status_code, response.text)
             sys.exit(1)
+
+    timings.output()
 
 
 if __name__ == "__main__":

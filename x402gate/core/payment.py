@@ -274,7 +274,7 @@ class PaymentHandler:
             logger.info(
                 "Payment verified: $%g USDC from %s on %s (valid=%s)",
                 amount_usdc,
-                payer,
+                payer[:10] + "…" if payer else "",
                 network,
                 result.is_valid,
             )

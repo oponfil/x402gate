@@ -22,6 +22,7 @@ import traceback
 import httpx
 import yaml
 from eth_account import Account
+from helpers import Timings
 from x402 import PaymentRequired, x402Client
 from x402.mechanisms.evm.exact.client import ExactEvmScheme
 from x402.mechanisms.evm.signers import EthAccountSigner
@@ -82,6 +83,8 @@ async def run_client():
     logger.info("Client Address: %s", account.address)
     logger.info("Gateway URL: %s", gateway_url)
 
+    timings = Timings()
+
     async with httpx.AsyncClient() as http_client:
         # Load request from config
         model, body = _load_example_request()
@@ -89,10 +92,11 @@ async def run_client():
         # 1. Request without payment -> expect BlockRun's 402
         logger.info("Sending initial request (no payment)...")
         logger.info("Model: %s", model)
-        response = await http_client.post(
-            f"{gateway_url}/v1/blockrun/v1/chat/completions",
-            json=body,
-        )
+        with timings.measure("pricing"):
+            response = await http_client.post(
+                f"{gateway_url}/v1/blockrun/v1/chat/completions",
+                json=body,
+            )
 
         if response.status_code != 402:
             logger.error("Expected 402, got %d: %s", response.status_code, response.text)
@@ -122,25 +126,28 @@ async def run_client():
 
         # 2. Sign payment (to BlockRun's wallet, not ours)
         logger.info("Signing EVM payment to BlockRun...")
-        try:
-            payment_payload = await x402_client.create_payment_payload(payment_required)
-            signature = base64.b64encode(
-                payment_payload.model_dump_json(by_alias=True).encode()
-            ).decode()
-        except Exception as e:
-            logger.error("Failed to sign payment: %s", e)
+        with timings.measure("signing"):
+            try:
+                payment_payload = await x402_client.create_payment_payload(payment_required)
+                signature = base64.b64encode(
+                    payment_payload.model_dump_json(by_alias=True).encode()
+                ).decode()
+            except Exception as e:
+                logger.error("Failed to sign payment: %s", e)
 
-            traceback.print_exc()
-            sys.exit(1)
+                traceback.print_exc()
+                sys.exit(1)
 
         # 3. Retry with payment — gateway forwards to BlockRun
         logger.info("Retrying with payment signature (forwarded to BlockRun)...")
-        response = await http_client.post(
-            f"{gateway_url}/v1/blockrun/v1/chat/completions",
-            json=body,
-            headers={"Payment-Signature": signature},
-            timeout=60.0,
-        )
+        with timings.measure("paid_request"):
+            response = await http_client.post(
+                f"{gateway_url}/v1/blockrun/v1/chat/completions",
+                json=body,
+                headers={"Payment-Signature": signature},
+                timeout=60.0,
+            )
+        timings.add_server_timings(response)
 
         if response.status_code == 200:
             result = response.json()
@@ -159,6 +166,8 @@ async def run_client():
         else:
             logger.error("Failed: %d %s", response.status_code, response.text)
             sys.exit(1)
+
+    timings.output()
 
 
 if __name__ == "__main__":
