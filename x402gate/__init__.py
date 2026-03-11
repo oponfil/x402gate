@@ -1,3 +1,5 @@
 """x402gate - Transparent x402 payment proxy for AI services."""
 
-__version__ = "0.2.0"
+from importlib.metadata import version
+
+__version__ = version("x402gate")

@@ -278,6 +278,27 @@
                 opacity: 0.3;
             }
         }
+
+        .btn-copy {
+            background: #21262d;
+            color: #8b949e;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 4px 12px;
+            font-size: 0.78em;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+
+        .btn-copy:hover {
+            background: #30363d;
+            color: #e0e0e0;
+        }
+
+        .btn-copy.copied {
+            color: #3fb950;
+            border-color: #3fb950;
+        }
     </style>
 </head>
 
@@ -317,7 +338,10 @@
     <div class="logs-section">
         <div class="logs-header">
             <h3>Live Logs</h3>
-            <span class="logs-count" id="logs-count"></span>
+            <div style="display:flex;align-items:center;gap:10px">
+                <span class="logs-count" id="logs-count"></span>
+                <button class="btn-copy" id="copy-logs-btn" onclick="copyLogs()">Copy All</button>
+            </div>
         </div>
         <div class="logs" id="logs-container">
             <!-- Log entries injected by JS -->
@@ -384,6 +408,7 @@
         }
 
         function renderLogs(logs) {
+            _lastLogs = logs;
             const container = document.getElementById('logs-container');
             const countEl = document.getElementById('logs-count');
             countEl.textContent = `${logs.length} entries`;
@@ -432,6 +457,25 @@
             const div = document.createElement('div');
             div.textContent = s;
             return div.innerHTML;
+        }
+
+        let _lastLogs = [];
+
+        function copyLogs() {
+            const text = _lastLogs.map(log => {
+                const d = new Date(log.ts * 1000);
+                const mon = d.toLocaleString('en-US', { month: 'short' });
+                const day = d.getDate().toString().padStart(2, '0');
+                const time = d.toLocaleTimeString('en-GB', { hour12: false });
+                const lvl = log.level || 'INFO';
+                return `${mon} ${day} ${time} ${lvl} ${log.message}`;
+            }).join('\n');
+            navigator.clipboard.writeText(text).then(() => {
+                const btn = document.getElementById('copy-logs-btn');
+                btn.textContent = 'Copied!';
+                btn.classList.add('copied');
+                setTimeout(() => { btn.textContent = 'Copy All'; btn.classList.remove('copied'); }, 2000);
+            });
         }
 
         async function refresh() {

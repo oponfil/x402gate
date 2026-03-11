@@ -482,12 +482,22 @@ async def topup(request: Request) -> Response:
     # Settle payment in background
     async def _settle_topup() -> None:
         try:
-            await payment_handler.settle(
+            t_settle_start = time.monotonic()
+            settlement = await payment_handler.settle(
                 payment_sig,
                 topup_amount,
                 payment_network,
                 extra_context={"provider_name": "topup", "provider_cost": 0},
             )
+            settle_latency = time.monotonic() - t_settle_start
+            if settlement and settlement.get("success"):
+                stats.record_settlement(
+                    payment_network,
+                    settle_latency,
+                    settlement.get("gas_cost_usd", 0.0),
+                    settlement.get("gas_cost_native", 0.0),
+                    settlement.get("gas_label", ""),
+                )
         except Exception:
             logger.exception("Top-up settlement failed for %s", payer)
 

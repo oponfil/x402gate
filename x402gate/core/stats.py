@@ -20,7 +20,7 @@ from typing import Any
 from x402gate.core.prepaid import get_total_balance
 
 # How long (seconds) before a provider with no requests goes "unknown"
-STALE_THRESHOLD = 3600  # 1 hour
+STALE_THRESHOLD = 14400  # 4 hours
 MAX_LOG_ENTRIES = 1000  # Rolling log buffer size
 
 
