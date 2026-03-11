@@ -427,6 +427,7 @@ async def topup(request: Request) -> Response:
     and credits the remainder to the sender's prepaid balance.
     """
     # Parse desired top-up amount from request body (default: min_prepaid_topup)
+    t_start = time.monotonic()
     min_topup = Decimal(str(config.gateway.min_prepaid_topup))
     max_topup = Decimal(str(config.gateway.max_prepaid_topup))
 
@@ -506,6 +507,7 @@ async def topup(request: Request) -> Response:
     task.add_done_callback(_pending_settlements.discard)
 
     stats.record_topup(topup_amount)
+    stats.record_overhead(payment_network, time.monotonic() - t_start)
 
     return JSONResponse(
         content={
@@ -788,7 +790,7 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
                 t_client,
             )
         t_prepaid = time.monotonic() - t_start
-        stats.record_request(provider_name, t_prepaid, True)
+        stats.record_request(provider_name, generation_s, True)
         stats.record_revenue(provider_name, final_price, actual_base_price)
         return JSONResponse(
             content={"data": output},
@@ -848,5 +850,6 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
     task.add_done_callback(_pending_settlements.discard)
 
     # 10. Return result to client
-    stats.record_request(provider_name, t_client, True)
+    stats.record_request(provider_name, generation_s, True)
+    stats.record_overhead(payment_network, t_client - generation_s)
     return JSONResponse(content={"data": output})

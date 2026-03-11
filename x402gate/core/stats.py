@@ -48,6 +48,8 @@ class NetworkStats:
     total_gas_cost_usd: float = 0.0
     total_gas_cost_native: float = 0.0
     gas_label: str = ""  # "ETH" or "SOL"
+    total_overhead_s: float = 0.0  # sum of x402 overhead per request
+    overhead_count: int = 0
 
 
 @dataclass
@@ -167,6 +169,20 @@ def record_settlement(
         ns.gas_label = gas_label
 
 
+def record_overhead(
+    network: str,
+    overhead_s: float,
+) -> None:
+    """Record x402 protocol overhead for a request on a given network.
+
+    Overhead = client_wait_time - provider_generation_time, i.e. the
+    additional delay caused by price lookup, payment verification, etc.
+    """
+    ns = _stats.networks.setdefault(network, NetworkStats())
+    ns.total_overhead_s += overhead_s
+    ns.overhead_count += 1
+
+
 def _fmt(d: Decimal) -> str:
     """Format Decimal to fixed-point with 4 decimal places."""
     return f"{d:.4f}"
@@ -223,9 +239,15 @@ def get_stats() -> dict[str, Any]:
         avg_gas_usd = (
             ns.total_gas_cost_usd / ns.total_settlements if ns.total_settlements > 0 else 0.0
         )
+        avg_overhead_s = (
+            round(ns.total_overhead_s / ns.overhead_count, 2)
+            if ns.overhead_count > 0
+            else 0
+        )
         network_data[net_name] = {
             "total_settlements": ns.total_settlements,
             "avg_settle_latency_s": avg_settle_s,
+            "avg_overhead_s": avg_overhead_s,
             "total_gas_cost_usd": round(ns.total_gas_cost_usd, 4),
             "avg_gas_cost_usd": round(avg_gas_usd, 4),
             "total_gas_cost_native": round(ns.total_gas_cost_native, 6),

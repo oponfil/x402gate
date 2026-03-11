@@ -397,7 +397,7 @@
                         <div class="card-metrics">
                             <div class="metric">Requests<strong>${p.total_requests}</strong></div>
                             <div class="metric">Success<strong>${p.success_rate}%</strong></div>
-                            <div class="metric">Avg latency<strong>${p.avg_latency_s}s</strong></div>
+                            <div class="metric">Avg job time<strong>${p.avg_latency_s}s</strong></div>
                             <div class="metric">Last activity<strong>${formatAgo(p.last_activity_ago_s)}</strong></div>
                             <div class="metric">Revenue<strong>$${p.revenue_usd}</strong></div>
                             <div class="metric">Profit<strong>$${p.profit_usd}</strong></div>
@@ -428,6 +428,15 @@
             container.scrollTop = container.scrollHeight;
         }
 
+        const NETWORK_NAMES = {
+            'eip155:8453': 'Base',
+            'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp': 'Solana',
+        };
+
+        function networkDisplayName(key) {
+            return NETWORK_NAMES[key] || key;
+        }
+
         function renderNetworks(networks) {
             const grid = document.getElementById('network-grid');
             const names = Object.keys(networks).sort();
@@ -440,12 +449,12 @@
                 return `
                     <div class="card">
                         <div class="card-header">
-                            <span class="card-name">${escHtml(name)}</span>
+                            <span class="card-name">${escHtml(networkDisplayName(name))}</span>
                             <span class="card-type">${escHtml(n.gas_label)}</span>
                         </div>
                         <div class="card-metrics">
                             <div class="metric">Settlements<strong>${n.total_settlements}</strong></div>
-                            <div class="metric">Avg settle<strong>${n.avg_settle_latency_s}s</strong></div>
+                            <div class="metric">Avg latency<strong>${n.avg_overhead_s}s</strong></div>
                             <div class="metric">Total gas<strong>$${n.total_gas_cost_usd}</strong></div>
                             <div class="metric">Avg gas<strong>$${n.avg_gas_cost_usd}</strong></div>
                         </div>
