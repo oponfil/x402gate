@@ -413,7 +413,7 @@ async def get_stats() -> dict[str, Any]:
 
 
 @app.get("/v1/logs")
-async def get_logs(limit: int = 200) -> list[dict[str, Any]]:
+async def get_logs(limit: int = stats.MAX_LOG_ENTRIES) -> list[dict[str, Any]]:
     """Return recent log entries (newest first)."""
     return stats.get_logs(limit=limit)
 
@@ -789,7 +789,6 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
                 remaining,
                 t_client,
             )
-        t_prepaid = time.monotonic() - t_start
         stats.record_request(provider_name, generation_s, True)
         stats.record_revenue(provider_name, final_price, actual_base_price)
         return JSONResponse(

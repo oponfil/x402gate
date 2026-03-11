@@ -240,9 +240,7 @@ def get_stats() -> dict[str, Any]:
             ns.total_gas_cost_usd / ns.total_settlements if ns.total_settlements > 0 else 0.0
         )
         avg_overhead_s = (
-            round(ns.total_overhead_s / ns.overhead_count, 2)
-            if ns.overhead_count > 0
-            else 0
+            round(ns.total_overhead_s / ns.overhead_count, 2) if ns.overhead_count > 0 else 0
         )
         network_data[net_name] = {
             "total_settlements": ns.total_settlements,

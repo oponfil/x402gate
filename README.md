@@ -300,8 +300,14 @@ See [docs/configuration.md](docs/configuration.md) for full reference.
 Run end-to-end tests on mainnet (requires funded wallets):
 
 ```bash
-# Run all E2E tests
+# Run against local server (starts x402gate on port 4022 automatically)
 python -m pytest tests/e2e/ -v -s
+
+# Run against production
+python -m pytest tests/e2e/ --prod -v -s
+
+# Run against a custom gateway
+GATEWAY_URL=https://staging.example.com/ python -m pytest tests/e2e/ -v -s
 ```
 
 Individual tests:

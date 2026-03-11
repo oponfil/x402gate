@@ -353,7 +353,8 @@ class PaymentHandler:
                     except Exception as e:
                         logger.warning("SVM gas cost lookup failed: %s", e)
                         gas_cost_native = 0.000005
-                        gas_cost_usd = 0
+                        sol_price = await _get_sol_price()
+                        gas_cost_usd = gas_cost_native * sol_price if sol_price else 0
                         gas_label = "SOL"
 
                 settle_data["gas_cost_native"] = gas_cost_native

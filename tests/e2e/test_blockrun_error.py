@@ -27,6 +27,7 @@ def _load_blockrun_example():
     return ex["model"], dict(ex["body"])
 
 
+@pytest.mark.order("first")
 @pytest.mark.asyncio
 async def test_blockrun_invalid_model_error(gateway_process):
     """Send a nonexistent model to BlockRun, verify error is forwarded."""
@@ -50,6 +51,7 @@ async def test_blockrun_invalid_model_error(gateway_process):
     print(f"\nOK: BlockRun error forwarded through gateway (status={response.status_code})")
 
 
+@pytest.mark.order("first")
 @pytest.mark.asyncio
 async def test_blockrun_bad_params_error(gateway_process, base_chain):
     """Send a valid model with bad params (negative max_tokens)."""

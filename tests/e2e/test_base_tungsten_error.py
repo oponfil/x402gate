@@ -7,6 +7,7 @@ import pytest
 from tests.e2e.conftest import run_script
 
 
+@pytest.mark.order("first")
 @pytest.mark.asyncio
 async def test_tungsten_bad_model_no_settlement(gateway_process, base_chain):
     """Send non-existent model UUID to Tungsten, verify error + no money lost."""

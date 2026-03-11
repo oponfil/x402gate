@@ -38,14 +38,39 @@ def load_env():
 # Gateway server
 # ---------------------------------------------------------------------------
 
+PROD_GATEWAY_URL = "https://x402gate.io"
+
+
+def pytest_addoption(parser):
+    """Add --prod flag to run E2E tests against production."""
+    parser.addoption(
+        "--prod",
+        action="store_true",
+        default=False,
+        help=f"Run tests against production gateway ({PROD_GATEWAY_URL})",
+    )
+
 
 @pytest.fixture(scope="session")
-def gateway_process(load_env):
+def gateway_process(request, load_env):
     """Start the gateway server in a subprocess.
+
+    If ``--prod`` is passed or ``GATEWAY_URL`` is set in the environment,
+    the local server is NOT started and the tests run against the
+    external gateway.
 
     Uses a temp file for output instead of a pipe to avoid deadlocks
     on Windows when the pipe buffer fills up (only ~4KB on Windows).
     """
+    if request.config.getoption("--prod"):
+        os.environ["GATEWAY_URL"] = PROD_GATEWAY_URL
+
+    external_url = os.environ.get("GATEWAY_URL")
+    if external_url:
+        print(f"\n=== Using external gateway: {external_url} ===")
+        yield None
+        return
+
     log_file = tempfile.NamedTemporaryFile(  # noqa: SIM115
         mode="w",
         suffix="_x402gate.log",
@@ -140,7 +165,8 @@ def run_script(
 
     Prevents silent waits by printing elapsed time while the subprocess runs.
     """
-    env = {**os.environ, "GATEWAY_URL": "http://localhost:4022", "PYTHONIOENCODING": "utf-8"}
+    gateway_url = os.environ.get("GATEWAY_URL", "http://localhost:4022")
+    env = {**os.environ, "GATEWAY_URL": gateway_url, "PYTHONIOENCODING": "utf-8"}
     tag = f"[{label}] " if label else ""
 
     # Use temp files to capture output (avoids pipe buffer deadlocks on Windows)
