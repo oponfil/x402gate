@@ -512,10 +512,11 @@ async def topup(request: Request) -> Response:
     _pending_settlements.add(task)
     task.add_done_callback(_pending_settlements.discard)
 
+    stats.record_request("topup", time.monotonic() - t_start, True)
     stats.record_topup(topup_amount)
-    # Commission + gas surcharge is the gateway's revenue from the top-up.
-    # Cost to gateway is zero (no provider call), so this is pure profit.
-    stats.record_revenue("topup", commission + gas_fee, Decimal("0"))
+    # Revenue = full top-up amount, cost = net credit given to user.
+    # Profit = topup_amount - net_credit - gas = commission + gas_surcharge - gas.
+    stats.record_revenue("topup", topup_amount, net_credit)
     stats.record_overhead(payment_network, time.monotonic() - t_start)
 
     return JSONResponse(

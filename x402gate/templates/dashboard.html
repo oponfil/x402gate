@@ -323,7 +323,6 @@
         <div class="summary-item">Cost: <strong id="sum-cost">$0</strong></div>
         <div class="summary-item">Gas: <strong id="sum-gas">$0</strong></div>
         <div class="summary-item">Profit: <strong id="sum-profit">$0</strong></div>
-        <div class="summary-item">Top-ups: <strong id="sum-topups">0 ($0)</strong></div>
         <div class="summary-item">Prepaid balance: <strong id="sum-balance">$0</strong></div>
     </div>
 
@@ -385,7 +384,7 @@
             const names = Object.keys(providers).sort();
             grid.innerHTML = names.map(name => {
                 const p = providers[name];
-                const type = PROVIDER_TYPES[name] || 'managed';
+                const type = name === 'topup' ? 'system' : (PROVIDER_TYPES[name] || 'managed');
                 const errHtml = p.last_error && p.status === 'error'
                     ? `<div class="card-error">${escHtml(p.last_error)}</div>`
                     : '';
@@ -509,9 +508,6 @@
                 profitEl.textContent = '$' + stats.total_profit_usd;
                 const profitNum = parseFloat(stats.total_profit_usd);
                 profitEl.className = profitNum >= 0 ? 'profit-positive' : 'profit-negative';
-
-                document.getElementById('sum-topups').textContent =
-                    `${stats.total_topups} ($${stats.total_topup_usd})`;
 
                 document.getElementById('sum-balance').textContent = '$' + stats.total_prepaid_balance_usd;
 
