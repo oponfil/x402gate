@@ -234,6 +234,9 @@ TUNGSTEN_CF_CLEARANCE=your_cf_cookie
 # CloudConvert (file conversion)
 CLOUDCONVERT_API_KEY=your_key
 
+# RapidAPI (social media download)
+RAPIDAPI_KEY=your_key
+
 # Base (EVM)
 BASE_PAY_TO_ADDRESS=0xYourWallet
 BASE_FACILITATOR_PRIVATE_KEY=your_key
@@ -315,19 +318,41 @@ GATEWAY_URL=https://staging.example.com/ python -m pytest tests/e2e/ -v -s
 
 Individual tests:
 
+**Error & Validation Tests** (run first — no funds spent):
+
+| Test | Provider | What |
+|------|----------|------|
+| `test_tungsten_bad_model_no_settlement` | Tungsten | Invalid model → 400, no settlement |
+| `test_bad_params_no_settlement` | WaveSpeed | Bad params → 502, no settlement |
+| `test_blockrun_invalid_model_error` | BlockRun | Unknown model → 400 |
+| `test_blockrun_bad_params_error` | BlockRun | Bad params → 400, no settlement |
+| `test_cloudconvert_bad_operation_no_settlement` | CloudConvert | Unsupported op → 400, no settlement |
+| `test_error_no_settlement` | OpenRouter | Non-existent model → 404, no settlement |
+| `test_socialdownload_bad_url_no_settlement` | SocialDownload | Invalid URL → 502, no settlement |
+| `test_topup_below_minimum` | Top-up | Amount < $0.10 → rejected |
+| `test_topup_above_maximum` | Top-up | Amount > $10 → rejected |
+
+**Success Tests** (on-chain payments):
+
 | Test | Provider | Network | What |
 |------|----------|---------|------|
-| `test_base_wavespeed` | WaveSpeed | Base | Image generation |
-| `test_base_wavespeed_t2v` | WaveSpeed | Base | Video generation |
+| `test_base_cloudconvert` | CloudConvert | Base | File conversion (HTML → PDF) |
 | `test_base_openrouter` | OpenRouter | Base | LLM chat |
 | `test_base_openrouter_websearch` | OpenRouter | Base | LLM chat + web search |
+| `test_base_socialdownload` | SocialDownload | Base | Social media download |
 | `test_base_tungsten` | Tungsten | Base | Image generation |
+| `test_base_wavespeed` | WaveSpeed | Base | Image generation |
+| `test_base_wavespeed_t2v` | WaveSpeed | Base | Video generation |
 | `test_solana_openrouter` | OpenRouter | Solana | LLM chat |
 | `test_solana_wavespeed` | WaveSpeed | Solana | Image generation |
-| `test_blockrun_passthrough` | BlockRun | Base | Passthrough proxy |
-| `test_prepaid_openrouter` | Mixed | Solana | Prepaid mode (Solana wallet) |
-| `test_prepaid_base` | Mixed | Base | Prepaid mode (EVM wallet) |
-| `test_base_cloudconvert` | CloudConvert | Base | File conversion (HTML → PDF) |
+| `test_blockrun_passthrough` | BlockRun | Base | Passthrough proxy + live search |
+
+**Prepaid Tests** (top-up + multi-provider):
+
+| Test | Provider | Network | What |
+|------|----------|---------|------|
+| `test_prepaid_base` | Mixed | Base | EVM top-up + OR×2 + WaveSpeed + Tungsten |
+| `test_prepaid_openrouter` | Mixed | Solana | Solana top-up + OR×2 + WaveSpeed + Tungsten |
 
 Requires `BASE_E2ETEST_PRIVATE_KEY` and/or `SOLANA_E2ETEST_PRIVATE_KEY` in `.env`.
 

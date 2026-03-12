@@ -40,6 +40,8 @@ python -m pytest tests/ -v --timeout=30 --ignore=tests/e2e
 git add -A && git commit -m "feat: description"
 ```
 
+> **Windows note:** `&&` requires PowerShell 7+. On older PowerShell or cmd.exe, run `git add -A` and `git commit` as separate commands.
+
 ## Testing
 
 - Every new feature MUST have unit tests (`tests/test_*.py`) and integration tests (`tests/test_integration.py`).

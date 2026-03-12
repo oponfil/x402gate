@@ -71,6 +71,9 @@ from x402gate.providers.your_provider import YourProvider
 PROVIDER_REGISTRY: dict[str, type[BaseProvider]] = {
     "wavespeed": WaveSpeedProvider,
     "openrouter": OpenRouterProvider,
+    "tungsten": TungstenProvider,
+    "cloudconvert": CloudConvertProvider,
+    "socialdownload": SocialDownloadProvider,
     "your_provider": YourProvider,  # ← add this line
 }
 ```

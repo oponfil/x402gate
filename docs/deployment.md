@@ -32,8 +32,16 @@ Set these in the Railway dashboard under **Variables**:
 | Variable | Required | Description |
 |---|---|---|
 | `WAVESPEED_API_KEY` | Yes | WaveSpeed AI API key |
+| `OPENROUTER_API_KEY` | Yes | OpenRouter API key |
+| `TUNGSTEN_JWT_TOKEN` | Yes | Tungsten JWT cookie |
+| `TUNGSTEN_CF_CLEARANCE` | Yes | Tungsten Cloudflare clearance cookie |
+| `CLOUDCONVERT_API_KEY` | Yes | CloudConvert API key |
+| `RAPIDAPI_KEY` | Yes | RapidAPI key for SocialDownload |
 | `BASE_PAY_TO_ADDRESS` | Yes | EVM address for USDC payments |
-| `BASE_FACILITATOR_PRIVATE_KEY` | Yes | Private key for on-chain settlement |
+| `BASE_FACILITATOR_PRIVATE_KEY` | Yes | Private key for on-chain settlement (EVM) |
+| `SOLANA_PAY_TO_ADDRESS` | Solana | Solana wallet for USDC payments |
+| `SOLANA_FACILITATOR_PRIVATE_KEY` | Solana | Solana private key for settlement |
+| `SOLANA_RPC_URL` | Solana | Solana RPC endpoint (e.g. Helius) |
 | `PORT` | No | Server port (Railway sets this automatically) |
 
 ## Docker
@@ -44,9 +52,7 @@ Set these in the Railway dashboard under **Variables**:
 docker build -t x402gate .
 docker run -d \
   -p 4021:4021 \
-  -e WAVESPEED_API_KEY=your_key \
-  -e BASE_PAY_TO_ADDRESS=0xYourWallet \
-  -e BASE_FACILITATOR_PRIVATE_KEY=your_key \
+  --env-file .env \
   x402gate
 ```
 

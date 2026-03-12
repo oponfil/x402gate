@@ -496,6 +496,8 @@ async def topup(request: Request) -> Response:
             )
             settle_latency = time.monotonic() - t_settle_start
             if settlement and settlement.get("success"):
+                gas_cost = Decimal(str(settlement.get("gas_cost_usd", 0.0)))
+                stats.record_gas("topup", gas_cost)
                 stats.record_settlement(
                     payment_network,
                     settle_latency,
@@ -511,6 +513,9 @@ async def topup(request: Request) -> Response:
     task.add_done_callback(_pending_settlements.discard)
 
     stats.record_topup(topup_amount)
+    # Commission + gas surcharge is the gateway's revenue from the top-up.
+    # Cost to gateway is zero (no provider call), so this is pure profit.
+    stats.record_revenue("topup", commission + gas_fee, Decimal("0"))
     stats.record_overhead(payment_network, time.monotonic() - t_start)
 
     return JSONResponse(
@@ -848,6 +853,8 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
                     settlement.get("error_reason", "unknown"),
                 )
             else:
+                gas_cost = Decimal(str(settlement.get("gas_cost_usd", 0.0)))
+                stats.record_gas(provider_name, gas_cost)
                 stats.record_revenue(
                     provider_name,
                     Decimal(str(settlement.get("amount_usdc", 0))),

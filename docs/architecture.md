@@ -7,8 +7,8 @@ x402gate is a transparent payment proxy that sits between AI agents/clients and 
 ```
 ┌──────────────┐     ┌──────────────────────┐     ┌──────────────┐
 │              │     │      x402gate         │     │   Provider   │
-│  AI Agent /  │────►│                      │────►│  (WaveSpeed)  │
-│   Client     │◄────│  FastAPI + x402 flow │◄────│              │
+│  AI Agent /  │────►│                      │────►│  (WaveSpeed,  │
+│   Client     │◄────│  FastAPI + x402 flow │◄────│  OpenRouter…) │
 │              │     │                      │     │              │
 └──────────────┘     └──────────┬───────────┘     └──────────────┘
                                │
@@ -17,7 +17,7 @@ x402gate is a transparent payment proxy that sits between AI agents/clients and 
                      │  (Coinbase x402)  │
                      │                   │
                      │ Verify & Settle   │
-                     │ on Base (USDC)    │
+                     │ on Base or Solana │
                      └───────────────────┘
 ```
 
@@ -58,11 +58,16 @@ Client → POST /v1/wavespeed/{model} + PAYMENT-SIGNATURE header
 | **Config** | `x402gate/core/config.py` | Load `config.yaml`, interpolate env vars |
 | **Pricing** | `x402gate/core/pricing.py` | TTL cache, commission, USDC formatting |
 | **Payment** | `x402gate/core/payment.py` | Build 402 responses, verify/settle via facilitator |
+| **Prepaid** | `x402gate/core/prepaid.py` | In-memory prepaid balances, wallet signature verification |
+| **Stats** | `x402gate/core/stats.py` | Dashboard statistics, log capture, revenue tracking |
 | **Proxy** | `x402gate/core/proxy.py` | Forward requests, poll async tasks |
 | **Provider Base** | `x402gate/providers/base.py` | Abstract provider interface |
-| **WaveSpeed** | `x402gate/providers/wavespeed.py` | WaveSpeed AI implementation |
+| **WaveSpeed** | `x402gate/providers/wavespeed.py` | WaveSpeed AI (60+ image/video models) |
 | **OpenRouter** | `x402gate/providers/openrouter.py` | OpenRouter LLM aggregator (300+ models) |
-| **App** | `x402gate/app.py` | FastAPI routes, lifecycle |
+| **Tungsten** | `x402gate/providers/tungsten.py` | Tungsten image generation (SDXL, Flux, etc.) |
+| **CloudConvert** | `x402gate/providers/cloudconvert.py` | File conversion (200+ formats, multipart upload) |
+| **SocialDownload** | `x402gate/providers/socialdownload.py` | Social media download via RapidAPI |
+| **App** | `x402gate/app.py` | FastAPI routes, lifecycle, provider registry |
 | **Entry** | `x402gate/main.py` | Uvicorn server startup |
 
 ## Key Design Decisions

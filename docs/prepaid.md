@@ -115,7 +115,7 @@ Successful prepaid responses include the remaining balance:
 The message to sign is: `x402gate:{path}:{timestamp}` encoded as UTF-8 bytes.
 
 - `path` is the full API path after `/v1/`, e.g. `openrouter/chat/completions`
-- `timestamp` is the current Unix timestamp (must be within 60 seconds of server time)
+- `timestamp` is the current Unix timestamp (must be within `prepaid_timestamp_window` seconds of server time, default: 300s)
 
 **Solana**: sign raw bytes with `keypair.sign_message(msg)`
 **EVM**: sign with EIP-191 `personal_sign` via `eth_account.Account.sign_message(encode_defunct(msg))`

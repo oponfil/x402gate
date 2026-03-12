@@ -33,6 +33,7 @@ class ProviderStats:
     error_count: int = 0
     total_revenue_usd: Decimal = Decimal("0")
     total_cost_usd: Decimal = Decimal("0")
+    total_gas_usd: Decimal = Decimal("0")
     total_latency_s: float = 0.0  # sum, for computing average
     last_status: str = "unknown"  # "ok" | "error" | "unknown"
     last_status_at: float = 0.0  # time.time() of last request
@@ -146,6 +147,12 @@ def record_revenue(
     ps.total_cost_usd += cost_usd
 
 
+def record_gas(provider: str, gas_usd: Decimal) -> None:
+    """Record gas cost attributed to a specific provider."""
+    ps = _stats.providers.setdefault(provider, ProviderStats())
+    ps.total_gas_usd += gas_usd
+
+
 def record_topup(amount_usd: Decimal) -> None:
     """Record a prepaid top-up."""
     _stats.total_topups += 1
@@ -217,7 +224,8 @@ def get_stats() -> dict[str, Any]:
             "avg_latency_s": avg_latency_s,
             "revenue_usd": _fmt(ps.total_revenue_usd),
             "cost_usd": _fmt(ps.total_cost_usd),
-            "profit_usd": _fmt(ps.total_revenue_usd - ps.total_cost_usd),
+            "gas_usd": _fmt(ps.total_gas_usd),
+            "profit_usd": _fmt(ps.total_revenue_usd - ps.total_cost_usd - ps.total_gas_usd),
             "last_error": ps.last_error,
             "last_activity_ago_s": (
                 round(now - ps.last_status_at, 0) if ps.last_status_at > 0 else None
