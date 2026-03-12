@@ -806,7 +806,10 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
                 t_client,
             )
         stats.record_request(provider_name, generation_s, True)
-        stats.record_revenue(provider_name, final_price, actual_base_price)
+        # In prepaid mode, only actual_base_price is deducted from balance.
+        # Commission was already captured at top-up time, so per-request
+        # revenue = cost = actual_base_price (profit = 0 here).
+        stats.record_revenue(provider_name, actual_base_price, actual_base_price)
         return JSONResponse(
             content={"data": output},
             headers={"X-Prepaid-Balance": str(remaining)},

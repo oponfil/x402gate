@@ -17,6 +17,7 @@ async def test_base_openrouter(gateway_process, base_chain):
     diff = run_e2e_client(
         "tests/e2e/x402_openrouter_test_client.py",
         chain=base_chain,
+        provider_name="openrouter",
         label="Base -> OpenRouter",
     )
 

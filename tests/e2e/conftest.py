@@ -4,6 +4,7 @@ import os
 import subprocess
 import tempfile
 import time
+from decimal import Decimal
 from pathlib import Path
 from typing import NamedTuple
 
@@ -223,20 +224,24 @@ def run_e2e_client(
     script: str,
     *,
     chain: BaseChain,
+    provider_name: str = "",
     label: str = "Base",
     settle_wait: int = 10,
 ) -> BalanceDiff:
     """Run an E2E client script and return balance changes.
 
     1. Records USDC/ETH balances before
-    2. Runs the client script
-    3. Waits for settlement
-    4. Records balances after
-    5. Returns the diff
+    2. Snapshots provider cost from /v1/stats
+    3. Runs the client script
+    4. Waits for settlement
+    5. Records balances after
+    6. Computes net profit using real provider cost
+    7. Returns the diff
 
     Args:
         script: Path to the client script (relative to project root).
         chain: BaseChain instance.
+        provider_name: Provider name (e.g. "openrouter") for cost tracking.
         label: Label for log output (e.g., "Base -> OpenRouter").
         settle_wait: Seconds to wait for on-chain settlement.
 
@@ -256,6 +261,19 @@ def run_e2e_client(
     print(f"\n=== [{label}] Balances BEFORE ===")
     print(f"Client USDC: {before.client_usdc / 1e6:.6f}")
     print(f"PayTo  USDC: {before.payto_usdc / 1e6:.6f}")
+
+    # --- Snapshot provider cost BEFORE ---
+    cost_before = Decimal("0")
+    gateway_url = os.environ.get("GATEWAY_URL", "http://localhost:4022")
+    if provider_name:
+        try:
+            import httpx
+
+            stats_resp = httpx.get(f"{gateway_url}/v1/stats", timeout=5)
+            prov_stats = stats_resp.json().get("providers", {}).get(provider_name, {})
+            cost_before = Decimal(prov_stats.get("cost_usd", "0"))
+        except Exception as e:
+            print(f"[WARN] Could not fetch cost_before from /v1/stats: {e}")
 
     # --- Run client (measure wall-clock time) ---
     t_start = time.monotonic()
@@ -292,10 +310,22 @@ def run_e2e_client(
         gas_eth = diff.gas_spent / 1e18
         print(f"Gas spent:       {gas_eth:.10f} ETH")
 
-    # --- Profit ---
-    gas_usd = diff.gas_spent / 1e18 * _get_eth_price()
-    revenue_usd = diff.client_paid / 1e6
-    net_profit = revenue_usd - gas_usd
+    # --- Profit (using real provider cost from /v1/stats) ---
+    client_paid_usd = Decimal(diff.client_paid) / Decimal(1_000_000)
+    gas_usd = Decimal(diff.gas_spent) / Decimal(10**18) * Decimal(str(_get_eth_price()))
+    provider_cost = Decimal("0")
+    if provider_name:
+        try:
+            import httpx
+
+            stats_resp = httpx.get(f"{gateway_url}/v1/stats", timeout=5)
+            prov_stats = stats_resp.json().get("providers", {}).get(provider_name, {})
+            cost_after = Decimal(prov_stats.get("cost_usd", "0"))
+            provider_cost = cost_after - cost_before
+        except Exception as e:
+            print(f"[WARN] Could not fetch cost_after from /v1/stats: {e}")
+    net_profit = client_paid_usd - provider_cost - gas_usd
+    print(f"Provider cost:   ${provider_cost:.6f} USDC")
     print(f"Net profit:      ${net_profit:.6f} USDC")
 
     # --- Timing ---

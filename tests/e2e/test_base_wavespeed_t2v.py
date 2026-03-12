@@ -16,6 +16,7 @@ async def test_base_wavespeed_t2v(gateway_process, base_chain):
     diff = run_e2e_client(
         "tests/e2e/x402_video_test_client.py",
         chain=base_chain,
+        provider_name="wavespeed",
         label="Base -> WaveSpeed T2V",
     )
 

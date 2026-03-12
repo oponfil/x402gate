@@ -11,6 +11,7 @@ async def test_base_tungsten(gateway_process, base_chain):
     diff = run_e2e_client(
         "tests/e2e/x402_tungsten_client.py",
         chain=base_chain,
+        provider_name="tungsten",
         label="Base → Tungsten",
     )
 

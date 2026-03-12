@@ -22,6 +22,7 @@ async def test_error_no_settlement(gateway_process, base_chain):
     diff = run_e2e_client(
         "tests/e2e/x402_openrouter_error_client.py",
         chain=base_chain,
+        provider_name="openrouter",
         label="Base -> OpenRouter (ERROR)",
     )
 
