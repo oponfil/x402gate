@@ -303,38 +303,9 @@ def run_e2e_client(
     timings = _parse_timings(result.stdout)
     generation_s = _parse_generation_time(combined_output)
 
-    print(f"\n=== [{label}] Timing ===")
-    if timings:
-        print(f"Pricing (402):           {timings['pricing']:.1f}s")
-        print(f"Signing:                 {timings['signing']:.1f}s")
+    from tests.e2e.helpers import print_timing_summary
 
-        # Prefer server-side timings (accurate, includes polling)
-        sv = timings.get("server_verify")
-        sg = timings.get("server_generation")
-        if sv is not None and sg is not None:
-            network_overhead = timings["paid_request"] - sv - sg
-            print(f"Payment verify:          {sv:.1f}s")
-            print(f"Generation time:         {sg:.1f}s")
-            print(f"Network overhead:        {network_overhead:.1f}s")
-        elif generation_s is not None:
-            overhead = timings["paid_request"] - generation_s
-            print(f"Generation time:         {generation_s:.1f}s")
-            print(f"Payment time (overhead): {overhead:.1f}s")
-        else:
-            print(f"Paid request:            {timings['paid_request']:.1f}s")
-
-        dl = timings.get("download", 0.0)
-        if dl > 0:
-            print(f"Download:                {dl:.1f}s")
-
-        # Exclude server timings from sum (they're sub-components of paid_request)
-        client_timings = {k: v for k, v in timings.items() if not k.startswith("server_")}
-        total_timings = sum(client_timings.values())
-        other = client_wait_s - total_timings
-        print(f"Other (subprocess):      {other:.1f}s")
-    elif generation_s is not None:
-        print(f"Generation time:         {generation_s:.1f}s")
-    print(f"Total client time:       {client_wait_s:.1f}s")
+    print_timing_summary(label, timings, generation_s, client_wait_s)
 
     return diff
 

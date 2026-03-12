@@ -6,7 +6,7 @@ gateway:
   port: 4021
   commission: 0.04           # 4% markup on provider prices
   gas_surcharge: 0.001       # fixed $0.001 gas surcharge per request
-  default_max_tokens: 1024   # default max_tokens when client omits it
+  default_max_tokens: 2048   # default max_tokens when client omits it
   web_search_tokens_per_result: 2048  # estimated extra input tokens per web search result
   default_web_search_max_results: 3   # default max_results when client omits it
   web_search_cost_per_result: 0.004   # $0.004 per result (OpenRouter Exa: $4/1000)
@@ -14,6 +14,7 @@ gateway:
   max_upload_mb: 300         # max file upload size in MB (all in RAM, no disk on Railway)
   max_prepaid_topup: 10.0    # max single top-up amount in USD
   min_prepaid_topup: 0.10    # min single top-up amount in USD
+  prepaid_timestamp_window: 300  # signature validity window (seconds)
 
 payment:
   networks:

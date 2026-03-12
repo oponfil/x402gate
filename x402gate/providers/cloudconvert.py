@@ -90,6 +90,20 @@ class CloudConvertProvider(BaseProvider):
                 status_code=400,
             )
 
+        # Log file details for debugging OPEN_FAILED issues
+        ext = file_name.rsplit(".", 1)[-1] if "." in file_name else "(none)"
+        magic = file_bytes[:8] if isinstance(file_bytes, bytes) else b""
+        caller = body.get("_caller", "?")
+        logger.info(
+            "CloudConvert %s: file=%s ext=%s size=%d bytes magic=%s caller=%s",
+            operation,
+            file_name,
+            ext,
+            len(file_bytes),
+            magic[:8].hex(),
+            caller,
+        )
+
         # Build processing task options
         if operation == "optimize":
             process_task: dict[str, Any] = {

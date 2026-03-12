@@ -124,12 +124,12 @@ class TestSigningMessage:
 
     def test_validate_timestamp_expired(self):
 
-        old = int(time.time()) - 120  # 2 minutes ago
+        old = int(time.time()) - 400  # exceeds 300s window
         assert validate_timestamp(old) is False
 
     def test_validate_timestamp_future(self):
 
-        future = int(time.time()) + 120  # 2 minutes from now
+        future = int(time.time()) + 400  # exceeds 300s window
         assert validate_timestamp(future) is False
 
     def test_roundtrip_sign_verify(self):

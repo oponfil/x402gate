@@ -354,7 +354,7 @@ class TestPrepaidFlow:
 
         reset()
         kp = Keypair()
-        old_ts = int(time.time()) - 120  # 2 minutes ago
+        old_ts = int(time.time()) - 400  # exceeds 300s window
         msg = f"x402gate:wavespeed/wavespeed-ai/flux-dev:{old_ts}".encode()
         sig = kp.sign_message(msg)
 

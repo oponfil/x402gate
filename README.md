@@ -205,6 +205,8 @@ Statistics are stored **in-memory** and reset on server restart. The log buffer 
 
 Both networks are offered simultaneously — the client chooses which to pay on. Payment overhead is the additional latency added by on-chain verification and settlement (on top of the AI provider's generation time).
 
+> **Security:** Both networks verify the client's on-chain USDC balance **before** running generation. Solana uses transaction simulation; Base performs an explicit `balanceOf` RPC call. Clients with insufficient funds receive HTTP 402 — no free generation is possible.
+
 ## Quick Start
 
 ### 1. Install
@@ -274,11 +276,12 @@ All settings are in `config.yaml`. Secrets use `${ENV_VAR}` interpolation:
 |---------|---------|-------------|
 | `gateway.commission` | `0.04` | Markup rate (4%) added to provider price |
 | `gateway.gas_surcharge` | `0.001` | Fixed gas surcharge ($0.001) added on top of commission |
-| `gateway.default_max_tokens` | `1024` | Default `max_tokens` when client omits it (x402 mode only; skipped in prepaid) |
+| `gateway.default_max_tokens` | `2048` | Default `max_tokens` when client omits it (x402 mode only; skipped in prepaid) |
 | `gateway.price_cache_ttl` | `60` | Price cache TTL in seconds |
 | `gateway.max_upload_mb` | `300` | Maximum file upload size in MB (all in RAM) |
 | `gateway.max_prepaid_topup` | `10.0` | Maximum single top-up amount in USD |
 | `gateway.min_prepaid_topup` | `0.10` | Minimum single top-up amount in USD |
+| `gateway.prepaid_timestamp_window` | `300` | Signature validity window in seconds (covers large uploads) |
 | `payment.networks.base` | — | Base Mainnet (EVM) config |
 | `payment.networks.solana` | — | Solana Mainnet (SVM) config |
 | `providers.wavespeed.poll_timeout` | `300` | Max wait for AI result (seconds) |

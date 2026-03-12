@@ -25,8 +25,8 @@ logger = logging.getLogger(__name__)
 _balances: dict[str, Decimal] = {}
 _lock = asyncio.Lock()
 
-# Signature timestamp validity window (seconds)
-TIMESTAMP_WINDOW = 60
+# Signature timestamp validity window (seconds), set by init()
+_timestamp_window: int = 300  # default, overridden from config
 
 
 async def deposit(pubkey: str, amount: Decimal) -> Decimal:
@@ -172,7 +172,13 @@ def validate_timestamp(timestamp: int) -> bool:
         True if within TIMESTAMP_WINDOW seconds of current time.
     """
     now = int(time.time())
-    return abs(now - timestamp) <= TIMESTAMP_WINDOW
+    return abs(now - timestamp) <= _timestamp_window
+
+
+def init(*, timestamp_window: int = 300) -> None:
+    """Initialize prepaid module settings from config."""
+    global _timestamp_window  # noqa: PLW0603
+    _timestamp_window = timestamp_window
 
 
 def reset() -> None:

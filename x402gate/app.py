@@ -33,6 +33,9 @@ from x402gate.core.prepaid import (
     validate_timestamp,
     verify_wallet_signature,
 )
+from x402gate.core.prepaid import (
+    init as init_prepaid,
+)
 from x402gate.core.pricing import PriceCache, apply_commission
 from x402gate.core.proxy import TaskTimeoutError
 from x402gate.providers.base import BaseProvider, ProviderError
@@ -89,6 +92,7 @@ async def lifespan(app: FastAPI):
     # Load configuration
     config = load_config()
     logger.info("Configuration loaded successfully")
+    init_prepaid(timestamp_window=config.gateway.prepaid_timestamp_window)
 
     # Initialize payment handler
     payment_handler = PaymentHandler(
@@ -682,10 +686,17 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
     if payment_sig:
         # 5a. Standard x402 payment flow
         t_verify_start = time.monotonic()
-        is_valid, payment_network, _ = await payment_handler.verify(payment_sig, final_price)
-        verify_s = time.monotonic() - t_verify_start
+        is_valid, payment_network, payer = await payment_handler.verify(payment_sig, final_price)
         if not is_valid:
+            verify_s = time.monotonic() - t_verify_start
             return _error_response(402, "Payment verification failed")
+        # EVM verify() only checks signature, not balance — check on-chain
+        if payment_network.startswith("eip155:"):
+            has_funds = await payment_handler.check_evm_balance(payment_network, payer, final_price)
+            if not has_funds:
+                verify_s = time.monotonic() - t_verify_start
+                return _error_response(402, "Insufficient USDC balance")
+        verify_s = time.monotonic() - t_verify_start
     elif prepaid_pubkey:
         # 5b. Prepaid balance flow
         prepaid_sig = request.headers.get("x-prepaid-signature", "")
@@ -719,6 +730,7 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
         return payment_handler.create_payment_required(final_price)
 
     # 6. Forward request to provider
+    body["_caller"] = (prepaid_pubkey or payer or "x402")[:12]
     t_gen_start = time.monotonic()
     try:
         result = await provider.submit(path, body, prepaid=prepaid_mode)

@@ -252,12 +252,15 @@ def get_stats() -> dict[str, Any]:
             "gas_label": ns.gas_label,
         }
 
+    total_gas_usd = Decimal(str(sum(ns.total_gas_cost_usd for ns in _stats.networks.values())))
+
     return {
         "uptime_s": round(uptime_s, 0),
         "total_requests": total_requests,
         "total_revenue_usd": _fmt(total_revenue),
         "total_cost_usd": _fmt(total_cost),
-        "total_profit_usd": _fmt(total_revenue - total_cost),
+        "total_gas_usd": _fmt(total_gas_usd),
+        "total_profit_usd": _fmt(total_revenue - total_cost - total_gas_usd),
         "total_topups": _stats.total_topups,
         "total_topup_usd": _fmt(_stats.total_topup_usd),
         "total_prepaid_balance_usd": _fmt(get_total_balance()),

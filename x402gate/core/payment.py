@@ -284,6 +284,45 @@ class PaymentHandler:
             logger.exception("Payment verification failed")
             return False, "", ""
 
+    async def check_evm_balance(self, network: str, payer: str, amount: Decimal) -> bool:
+        """Check if payer has sufficient USDC balance on EVM.
+
+        EVM verify() only checks the ECDSA signature — not the on-chain balance.
+        This method prevents free generation from clients with insufficient funds.
+
+        Args:
+            network: Network ID (e.g. "eip155:8453").
+            payer: Payer EVM address (0x...).
+            amount: Required amount in USD.
+
+        Returns:
+            True if balance >= required amount, False otherwise.
+        """
+        ns = self._schemes.get(network)
+        if not ns or not ns.w3:
+            return True  # non-EVM or no w3 — skip check
+
+        try:
+            bal_sig = ns.w3.keccak(text="balanceOf(address)")[:4]
+            data = bal_sig + bytes(12) + bytes.fromhex(payer[2:])
+            raw = await asyncio.to_thread(
+                ns.w3.eth.call, {"to": ns.config.token_address, "data": data}
+            )
+            balance = int.from_bytes(raw, "big")
+            required = int(amount * 1_000_000)
+            if balance < required:
+                logger.warning(
+                    "Insufficient USDC: %s has %d, need %d",
+                    payer[:10] + "…",
+                    balance,
+                    required,
+                )
+            return balance >= required
+        except Exception:
+            logger.exception("EVM balance check failed for %s", payer[:10] + "…")
+            # Fail open — don't block on RPC errors, settle will catch it
+            return True
+
     async def settle(
         self,
         payment_signature: str,

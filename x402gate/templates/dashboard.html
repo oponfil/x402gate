@@ -321,6 +321,7 @@
     <div class="summary" id="summary">
         <div class="summary-item">Revenue: <strong id="sum-revenue">$0</strong></div>
         <div class="summary-item">Cost: <strong id="sum-cost">$0</strong></div>
+        <div class="summary-item">Gas: <strong id="sum-gas">$0</strong></div>
         <div class="summary-item">Profit: <strong id="sum-profit">$0</strong></div>
         <div class="summary-item">Top-ups: <strong id="sum-topups">0 ($0)</strong></div>
         <div class="summary-item">Prepaid balance: <strong id="sum-balance">$0</strong></div>
@@ -456,7 +457,7 @@
                         </div>
                         <div class="card-metrics">
                             <div class="metric">Settlements<strong>${n.total_settlements}</strong></div>
-                            <div class="metric">Avg payment time<strong>${n.avg_overhead_s}s</strong></div>
+                            <div class="metric">Avg overhead<strong>${n.avg_overhead_s}s</strong></div>
                             <div class="metric">Total gas<strong>$${n.total_gas_cost_usd}</strong></div>
                             <div class="metric">Avg gas<strong>$${n.avg_gas_cost_usd}</strong></div>
                         </div>
@@ -502,6 +503,7 @@
                 document.getElementById('total-requests').textContent = stats.total_requests;
                 document.getElementById('sum-revenue').textContent = '$' + stats.total_revenue_usd;
                 document.getElementById('sum-cost').textContent = '$' + stats.total_cost_usd;
+                document.getElementById('sum-gas').textContent = '$' + stats.total_gas_usd;
 
                 const profitEl = document.getElementById('sum-profit');
                 profitEl.textContent = '$' + stats.total_profit_usd;

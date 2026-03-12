@@ -39,7 +39,7 @@ The wallet type is auto-detected by address format. Both wallet types share the 
 
 ## Prepaid vs x402 (max_tokens)
 
-In **x402 mode**, the gateway injects a default `max_tokens` (1024) into OpenRouter requests when the client doesn't specify one. This caps the response size to match the pre-paid estimate.
+In **x402 mode**, the gateway injects a default `max_tokens` (2048) into OpenRouter requests when the client doesn't specify one. This caps the response size to match the pre-paid estimate.
 
 In **prepaid mode**, `max_tokens` is **not injected** — the model responds with its full capacity. You're charged **actual token usage**, so there's no need to cap output. If you want to limit tokens, include `max_tokens` in your request explicitly.
 

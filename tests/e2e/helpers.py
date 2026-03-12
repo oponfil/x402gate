@@ -115,3 +115,57 @@ async def save_from_urls(urls: list[str], label: str, http_client: httpx.AsyncCl
         logger.info("Saved media: %s (%d bytes)", fpath, len(resp.content))
 
     return saved
+
+
+def print_timing_summary(
+    label: str,
+    timings: dict | None,
+    generation_s: float | None,
+    client_wait_s: float,
+) -> None:
+    """Print standardised timing summary for E2E tests.
+
+    Args:
+        label: Test label (e.g. "Base -> WaveSpeed").
+        timings: Parsed TIMINGS dict or None.
+        generation_s: Generation time from provider log, or None.
+        client_wait_s: Total wall-clock time for client script.
+    """
+    print(f"\n=== [{label}] Timing ===")
+    if timings:
+        sv = timings.get("server_verify")
+        sg = timings.get("server_generation")
+        if sv is not None and sg is not None:
+            network_overhead = timings["paid_request"] - sv - sg
+            client_overhead = timings["pricing"] + timings["signing"]
+            server_overhead = sv + network_overhead
+            cp = timings["pricing"]
+            cs = timings["signing"]
+            print(
+                f"Client overhead:         {client_overhead:.1f}s"
+                f"  (pricing={cp:.1f} + signing={cs:.1f})"
+            )
+            print(
+                f"Server overhead:         {server_overhead:.1f}s"
+                f"  (verify={sv:.1f} + network={network_overhead:.1f})"
+            )
+            print(f"Generation time:         {sg:.1f}s")
+        elif generation_s is not None:
+            overhead = timings["paid_request"] - generation_s
+            print(f"Client overhead:         {timings['pricing'] + timings['signing']:.1f}s")
+            print(f"Server overhead:         {overhead:.1f}s")
+            print(f"Generation time:         {generation_s:.1f}s")
+        else:
+            print(f"Paid request:            {timings['paid_request']:.1f}s")
+
+        dl = timings.get("download", 0.0)
+        if dl > 0:
+            print(f"Download:                {dl:.1f}s")
+
+        client_timings = {k: v for k, v in timings.items() if not k.startswith("server_")}
+        total_timings = sum(client_timings.values())
+        other = client_wait_s - total_timings
+        print(f"Other (subprocess):      {other:.1f}s")
+    elif generation_s is not None:
+        print(f"Generation time:         {generation_s:.1f}s")
+    print(f"Total client time:       {client_wait_s:.1f}s")

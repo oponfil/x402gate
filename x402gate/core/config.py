@@ -55,7 +55,7 @@ class GatewayConfig(BaseModel):
     port: int = 4021
     commission: float = 0.04
     gas_surcharge: float = 0.001  # fixed $0.001 gas surcharge per request
-    default_max_tokens: int = 1024  # default max_tokens when client omits it
+    default_max_tokens: int = 2048  # default max_tokens when client omits it
     web_search_tokens_per_result: int = 2048  # estimated extra input tokens per web search result
     default_web_search_max_results: int = 3  # default max_results when client omits it
     web_search_cost_per_result: float = 0.004  # $0.004 per search result (OpenRouter Exa: $4/1000)
@@ -63,6 +63,7 @@ class GatewayConfig(BaseModel):
     max_upload_mb: int = 300  # max file upload size in MB (all in RAM, no disk)
     max_prepaid_topup: float = 10.0  # max single top-up amount in USD
     min_prepaid_topup: float = 0.10  # min single top-up amount in USD
+    prepaid_timestamp_window: int = 300  # signature validity window (seconds)
 
 
 class NetworkConfig(BaseModel):
