@@ -34,6 +34,7 @@ class ProviderStats:
     total_revenue_usd: Decimal = Decimal("0")
     total_cost_usd: Decimal = Decimal("0")
     total_gas_usd: Decimal = Decimal("0")
+    total_prepaid_usage_usd: Decimal = Decimal("0")
     total_latency_s: float = 0.0  # sum, for computing average
     last_status: str = "unknown"  # "ok" | "error" | "unknown"
     last_status_at: float = 0.0  # time.time() of last request
@@ -48,9 +49,11 @@ class NetworkStats:
     total_settle_latency_s: float = 0.0
     total_gas_cost_usd: float = 0.0
     total_gas_cost_native: float = 0.0
+    total_revenue_usd: Decimal = Decimal("0")
     gas_label: str = ""  # "ETH" or "SOL"
     total_overhead_s: float = 0.0  # sum of x402 overhead per request
     overhead_count: int = 0
+    last_settlement_at: float = 0.0  # time.time() of last settlement
 
 
 @dataclass
@@ -153,6 +156,23 @@ def record_gas(provider: str, gas_usd: Decimal) -> None:
     ps.total_gas_usd += gas_usd
 
 
+def record_prepaid_usage(
+    provider: str,
+    amount_usd: Decimal,
+) -> None:
+    """Record prepaid balance usage on a provider.
+
+    Adds to the provider's revenue AND cost (profit = 0) so cards
+    reflect actual throughput.  The amount is also tracked separately
+    so the bottom-line totals can exclude it from Revenue (the real
+    revenue was captured at top-up time).
+    """
+    ps = _stats.providers.setdefault(provider, ProviderStats())
+    ps.total_revenue_usd += amount_usd
+    ps.total_cost_usd += amount_usd
+    ps.total_prepaid_usage_usd += amount_usd
+
+
 def record_topup(amount_usd: Decimal) -> None:
     """Record a prepaid top-up."""
     _stats.total_topups += 1
@@ -165,6 +185,7 @@ def record_settlement(
     gas_cost_usd: float,
     gas_cost_native: float,
     gas_label: str,
+    revenue_usd: Decimal = Decimal("0"),
 ) -> None:
     """Record a blockchain settlement for per-network statistics."""
     ns = _stats.networks.setdefault(network, NetworkStats())
@@ -172,6 +193,8 @@ def record_settlement(
     ns.total_settle_latency_s += settle_latency_s
     ns.total_gas_cost_usd += gas_cost_usd
     ns.total_gas_cost_native += gas_cost_native
+    ns.total_revenue_usd += revenue_usd
+    ns.last_settlement_at = time.time()
     if gas_label:
         ns.gas_label = gas_label
 
@@ -233,8 +256,19 @@ def get_stats() -> dict[str, Any]:
         }
 
     total_requests = sum(ps.total_requests for ps in _stats.providers.values())
-    total_revenue = sum(ps.total_revenue_usd for ps in _stats.providers.values())
-    total_cost = sum(ps.total_cost_usd for ps in _stats.providers.values())
+    total_revenue = sum((ps.total_revenue_usd for ps in _stats.providers.values()), Decimal("0"))
+    total_prepaid_usage = sum(
+        (ps.total_prepaid_usage_usd for ps in _stats.providers.values()), Decimal("0")
+    )
+    # Bottom-line revenue excludes prepaid usage (real money came at top-up)
+    effective_revenue = total_revenue - total_prepaid_usage
+    # Bottom-line cost excludes topup net_credit: that money flows into
+    # prepaid balance and appears as real provider costs when spent.
+    topup_ps = _stats.providers.get("topup")
+    topup_cost = topup_ps.total_cost_usd if topup_ps else Decimal("0")
+    total_cost = (
+        sum((ps.total_cost_usd for ps in _stats.providers.values()), Decimal("0")) - topup_cost
+    )
 
     # Network settlement stats
     network_data: dict[str, Any] = {}
@@ -257,18 +291,22 @@ def get_stats() -> dict[str, Any]:
             "total_gas_cost_usd": f"{ns.total_gas_cost_usd:.4f}",
             "avg_gas_cost_usd": f"{avg_gas_usd:.4f}",
             "total_gas_cost_native": f"{ns.total_gas_cost_native:.6f}",
+            "revenue_usd": _fmt(ns.total_revenue_usd),
             "gas_label": ns.gas_label,
+            "last_activity_ago_s": (
+                round(now - ns.last_settlement_at, 0) if ns.last_settlement_at > 0 else None
+            ),
         }
 
-    total_gas_usd = Decimal(str(sum(ns.total_gas_cost_usd for ns in _stats.networks.values())))
+    total_gas_usd = sum((ps.total_gas_usd for ps in _stats.providers.values()), Decimal("0"))
 
     return {
         "uptime_s": round(uptime_s, 0),
         "total_requests": total_requests,
-        "total_revenue_usd": _fmt(total_revenue),
+        "total_revenue_usd": _fmt(effective_revenue),
         "total_cost_usd": _fmt(total_cost),
         "total_gas_usd": _fmt(total_gas_usd),
-        "total_profit_usd": _fmt(total_revenue - total_cost - total_gas_usd),
+        "total_profit_usd": _fmt(effective_revenue - total_cost - total_gas_usd),
         "total_topups": _stats.total_topups,
         "total_topup_usd": _fmt(_stats.total_topup_usd),
         "total_prepaid_balance_usd": _fmt(get_total_balance()),

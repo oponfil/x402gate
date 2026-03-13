@@ -504,6 +504,7 @@ async def topup(request: Request) -> Response:
                     settlement.get("gas_cost_usd", 0.0),
                     settlement.get("gas_cost_native", 0.0),
                     settlement.get("gas_label", ""),
+                    revenue_usd=topup_amount,
                 )
         except Exception:
             logger.exception("Top-up settlement failed for %s", payer)
@@ -515,7 +516,7 @@ async def topup(request: Request) -> Response:
     stats.record_request("topup", time.monotonic() - t_start, True)
     stats.record_topup(topup_amount)
     # Revenue = full top-up amount, cost = net credit given to user.
-    # Profit = topup_amount - net_credit - gas = commission + gas_surcharge - gas.
+    # Card shows profit as if all balance was spent (commission + gas_surcharge - gas).
     stats.record_revenue("topup", topup_amount, net_credit)
     stats.record_overhead(payment_network, time.monotonic() - t_start)
 
@@ -812,10 +813,10 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
                 t_client,
             )
         stats.record_request(provider_name, generation_s, True)
-        # In prepaid mode, only actual_base_price is deducted from balance.
-        # Commission was already captured at top-up time, so per-request
-        # revenue = cost = actual_base_price (profit = 0 here).
-        stats.record_revenue(provider_name, actual_base_price, actual_base_price)
+        # Prepaid: record usage on the provider card (revenue=cost, profit=0).
+        # Bottom-line totals will exclude the revenue part to avoid
+        # double-counting with the topup that funded this balance.
+        stats.record_prepaid_usage(provider_name, actual_base_price)
         return JSONResponse(
             content={"data": output},
             headers={"X-Prepaid-Balance": str(remaining)},
@@ -867,6 +868,7 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
                     settlement.get("gas_cost_usd", 0.0),
                     settlement.get("gas_cost_native", 0.0),
                     settlement.get("gas_label", ""),
+                    revenue_usd=Decimal(str(settlement.get("amount_usdc", 0))),
                 )
         except Exception:
             logger.exception("Background settlement crashed for %s", payment_network)

@@ -456,6 +456,8 @@
                         </div>
                         <div class="card-metrics">
                             <div class="metric">Settlements<strong>${n.total_settlements}</strong></div>
+                            <div class="metric">Last activity<strong>${formatAgo(n.last_activity_ago_s)}</strong></div>
+                            <div class="metric">Revenue<strong>$${n.revenue_usd}</strong></div>
                             <div class="metric">Avg overhead<strong>${n.avg_overhead_s}s</strong></div>
                             <div class="metric">Total gas<strong>$${n.total_gas_cost_usd}</strong></div>
                             <div class="metric">Avg gas<strong>$${n.avg_gas_cost_usd}</strong></div>
