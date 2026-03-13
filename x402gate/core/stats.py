@@ -110,12 +110,22 @@ def install_log_handler() -> None:
 # ---------------------------------------------------------------------------
 
 
-def init(provider_names: list[str]) -> None:
-    """Initialize stats for known providers (call at startup)."""
+def init(provider_names: list[str], network_names: list[str] | None = None) -> None:
+    """Initialize stats for known providers and networks (call at startup)."""
     _stats.started_at = time.time()
     for name in provider_names:
         if name not in _stats.providers:
             _stats.providers[name] = ProviderStats()
+    for net in network_names or []:
+        if net not in _stats.networks:
+            # Derive gas label from network identifier
+            if net.startswith("solana:"):
+                label = "SOL"
+            elif net.startswith("eip155:"):
+                label = "ETH"
+            else:
+                label = ""
+            _stats.networks[net] = NetworkStats(gas_label=label)
 
 
 def record_request(

@@ -442,10 +442,6 @@
         function renderNetworks(networks) {
             const grid = document.getElementById('network-grid');
             const names = Object.keys(networks).sort();
-            if (names.length === 0) {
-                grid.innerHTML = '<div style="color:#484f58;font-size:0.9em">No settlements yet</div>';
-                return;
-            }
             grid.innerHTML = names.map(name => {
                 const n = networks[name];
                 return `

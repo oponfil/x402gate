@@ -36,11 +36,12 @@ ruff check x402gate/ tests/
 ruff format --check x402gate/ tests/
 # 3. Unit + integration tests
 python -m pytest tests/ -v --timeout=30 --ignore=tests/e2e
-# 4. Commit
-git add -A && git commit -m "feat: description"
+# 4. Commit (two -m flags: title + body)
+git add -A
+git commit -m "feat: short title" -m "Detailed body explaining changes"
 ```
 
-> **Windows note:** `&&` requires PowerShell 7+. On older PowerShell or cmd.exe, run `git add -A` and `git commit` as separate commands.
+> **PowerShell note:** Do NOT use literal newlines inside a `-m` string — PowerShell may hang waiting for input that never comes. Use two separate `-m` flags instead (first = title, second = body). The `&&` operator requires PowerShell 7+; on older versions run `git add` and `git commit` as separate commands.
 
 ## Testing
 

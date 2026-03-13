@@ -166,7 +166,7 @@ async def lifespan(app: FastAPI):
             logger.info("Route registered: POST /v1/%s/{{path}} (managed)", name)
 
     # Initialize dashboard stats and log capture
-    stats.init(list(providers.keys()))
+    stats.init(list(providers.keys()), list(config.payment.networks.keys()))
     stats.install_log_handler()
 
     logger.info(
