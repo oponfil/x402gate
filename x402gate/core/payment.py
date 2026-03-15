@@ -271,13 +271,22 @@ class PaymentHandler:
             result = await asyncio.to_thread(ns.scheme.verify, payload, requirements)
             amount_usdc = int(requirements.amount) / 1_000_000
             payer = getattr(result, "payer", "") or ""
-            logger.info(
-                "Payment verified: $%g USDC from %s on %s (valid=%s)",
-                amount_usdc,
-                payer[:10] + "…" if payer else "",
-                network,
-                result.is_valid,
-            )
+            if result.is_valid:
+                logger.info(
+                    "Payment verified: $%g USDC from %s on %s (valid=True)",
+                    amount_usdc,
+                    payer[:10] + "…" if payer else "",
+                    network,
+                )
+            else:
+                logger.warning(
+                    "Payment rejected: $%g USDC from %s on %s — reason=%s: %s",
+                    amount_usdc,
+                    payer[:10] + "…" if payer else "",
+                    network,
+                    getattr(result, "invalid_reason", "unknown"),
+                    getattr(result, "invalid_message", "no details"),
+                )
             return result.is_valid, network, payer
 
         except Exception:
