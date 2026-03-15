@@ -141,6 +141,15 @@ If the provider rejects a request (e.g. invalid parameters), the gateway returns
 }
 ```
 
+**Payment rejection reasons:** When payment verification fails (e.g. insufficient USDC, stale transaction, network mismatch), the 402 response includes the specific reason:
+
+```json
+{
+  "error": "Payment verification failed: transaction_simulation_failed: Simulation failed: InstructionErrorCustom(1)",
+  "status": 402
+}
+```
+
 **Retry on 5xx:** If a provider returns a server error (502, 503, etc.), x402gate automatically retries the request up to **2 times** with exponential backoff (2s → 4s) before returning the error. This prevents payment loss during brief provider outages (e.g. CDN restarts). Timeouts are also retried. Client errors (4xx) are never retried.
 
 
@@ -205,7 +214,7 @@ Statistics are stored **in-memory** and reset on server restart. The log buffer 
 
 Both networks are offered simultaneously — the client chooses which to pay on. Payment overhead is the additional latency added by on-chain verification and settlement (on top of the AI provider's generation time).
 
-> **Security:** Both networks verify the client's on-chain USDC balance **before** running generation. Solana uses transaction simulation; Base performs an explicit `balanceOf` RPC call. Clients with insufficient funds receive HTTP 402 — no free generation is possible.
+> **Security:** Both networks verify the client's on-chain USDC balance **before** running generation. Solana uses transaction simulation; Base performs an explicit `balanceOf` RPC call. Clients with insufficient USDC receive HTTP 402 with the specific rejection reason (e.g. `transaction_simulation_failed: InstructionErrorCustom(1)` for insufficient funds on Solana, or `Insufficient USDC balance` on Base) — no free generation is possible.
 
 ## Quick Start
 
@@ -373,6 +382,15 @@ See [docs/add-provider.md](docs/add-provider.md) for a step-by-step guide.
 - [Configuration](docs/configuration.md) — all config options
 - [Tungsten](docs/tungsten.md) — Tungsten image generation provider
 - [Adding a Provider](docs/add-provider.md) — extend with new AI services
+
+## Scripts
+
+Diagnostic utilities in `scripts/`:
+
+| Script | Description |
+|--------|-------------|
+| `check_balance.py` | Check facilitator wallet SOL balance |
+| `check_usdc.py [wallet]` | Check USDC balance of any Solana wallet |
 
 ## Contributing
 

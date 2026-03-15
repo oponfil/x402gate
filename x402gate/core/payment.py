@@ -247,7 +247,7 @@ class PaymentHandler:
         """Extract the PAYMENT-SIGNATURE header from a request."""
         return request.headers.get("payment-signature")
 
-    async def verify(self, payment_signature: str, price: Decimal) -> tuple[bool, str, str]:
+    async def verify(self, payment_signature: str, price: Decimal) -> tuple[bool, str, str, str]:
         """Verify a payment signature on the correct network.
 
         Args:
@@ -255,14 +255,14 @@ class PaymentHandler:
             price: Expected payment amount.
 
         Returns:
-            Tuple of (is_valid, network_id, payer_address).
+            Tuple of (is_valid, network_id, payer_address, invalid_reason).
         """
         try:
             network, payload_dict = self._detect_network(payment_signature)
             ns = self._schemes.get(network)
             if not ns:
                 logger.warning("Payment on unsupported network: %s", network)
-                return False, network, ""
+                return False, network, "", "unsupported_network"
 
             payload = PaymentPayload.model_validate(payload_dict)
             requirements_dict = self._build_requirements(price, ns)
@@ -271,6 +271,8 @@ class PaymentHandler:
             result = await asyncio.to_thread(ns.scheme.verify, payload, requirements)
             amount_usdc = int(requirements.amount) / 1_000_000
             payer = getattr(result, "payer", "") or ""
+            invalid_reason = getattr(result, "invalid_reason", "") or ""
+            invalid_message = getattr(result, "invalid_message", "") or ""
             if result.is_valid:
                 logger.info(
                     "Payment verified: $%g USDC from %s on %s (valid=True)",
@@ -284,14 +286,15 @@ class PaymentHandler:
                     amount_usdc,
                     payer[:10] + "…" if payer else "",
                     network,
-                    getattr(result, "invalid_reason", "unknown"),
-                    getattr(result, "invalid_message", "no details"),
+                    invalid_reason,
+                    invalid_message,
                 )
-            return result.is_valid, network, payer
+            reason = f"{invalid_reason}: {invalid_message}" if invalid_message else invalid_reason
+            return result.is_valid, network, payer, reason
 
         except Exception:
             logger.exception("Payment verification failed")
-            return False, "", ""
+            return False, "", "", "internal_error"
 
     async def check_evm_balance(self, network: str, payer: str, amount: Decimal) -> bool:
         """Check if payer has sufficient USDC balance on EVM.

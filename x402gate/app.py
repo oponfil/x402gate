@@ -470,9 +470,12 @@ async def topup(request: Request) -> Response:
         return _error_response(400, "Top-up amount must be positive")
 
     # Verify payment
-    is_valid, payment_network, payer = await payment_handler.verify(payment_sig, topup_amount)
+    is_valid, payment_network, payer, reason = await payment_handler.verify(
+        payment_sig, topup_amount
+    )
     if not is_valid or not payer:
-        return _error_response(402, "Payment verification failed")
+        msg = f"Payment verification failed: {reason}" if reason else "Payment verification failed"
+        return _error_response(402, msg)
 
     # Calculate net credit: topup_amount minus commission and gas
     commission = topup_amount * Decimal(str(config.gateway.commission))
@@ -693,10 +696,17 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
     if payment_sig:
         # 5a. Standard x402 payment flow
         t_verify_start = time.monotonic()
-        is_valid, payment_network, payer = await payment_handler.verify(payment_sig, final_price)
+        is_valid, payment_network, payer, reason = await payment_handler.verify(
+            payment_sig, final_price
+        )
         if not is_valid:
             verify_s = time.monotonic() - t_verify_start
-            return _error_response(402, "Payment verification failed")
+            msg = (
+                f"Payment verification failed: {reason}"
+                if reason
+                else "Payment verification failed"
+            )
+            return _error_response(402, msg)
         # EVM verify() only checks signature, not balance — check on-chain
         if payment_network.startswith("eip155:"):
             has_funds = await payment_handler.check_evm_balance(payment_network, payer, final_price)
