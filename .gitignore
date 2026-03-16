@@ -33,3 +33,4 @@ tests/e2e/output/
 
 # Agent workflows (local only)
 .agent/
+.agents/

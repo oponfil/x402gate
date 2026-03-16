@@ -8,7 +8,7 @@ import asyncio
 import os
 import time
 from decimal import Decimal
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
@@ -438,3 +438,110 @@ class TestDashboard:
         assert response.status_code == 200
         data = response.json()
         assert len(data) <= 5
+
+
+class TestPaymentVerificationFailure:
+    """Tests that payment rejection reasons are returned in 402 response."""
+
+    @respx.mock
+    def test_managed_request_returns_rejection_reason(self, client):
+        """POST with invalid payment returns 402 with specific reason."""
+        respx.post("https://api.wavespeed.ai/api/v3/model/pricing").mock(
+            return_value=httpx.Response(200, json={"data": {"unit_price": 0.003}})
+        )
+
+        with patch("x402gate.app.payment_handler") as mock_ph:
+            mock_ph.extract_payment_signature.return_value = "fake-sig"
+            mock_ph.verify = AsyncMock(
+                return_value=(
+                    False,
+                    "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                    "AakQJK2ssd",
+                    "transaction_simulation_failed: Simulation failed: InstructionErrorCustom(1)",
+                )
+            )
+
+            response = client.post(
+                "/v1/wavespeed/wavespeed-ai/flux-dev",
+                json={"prompt": "a cat"},
+                headers={"Payment-Signature": "fake-sig"},
+            )
+
+        assert response.status_code == 402
+        error = response.json()["error"]
+        assert "transaction_simulation_failed" in error
+        assert "InstructionErrorCustom(1)" in error
+
+    def test_topup_returns_rejection_reason(self, client):
+        """POST /v1/topup with invalid payment returns 402 with reason."""
+        with patch("x402gate.app.payment_handler") as mock_ph:
+            mock_ph.extract_payment_signature.return_value = (
+                "eyJhY2NlcHRlZCI6eyJhbW91bnQiOiIxMDAwMDAwIn19"  # {"accepted":{"amount":"1000000"}}
+            )
+            mock_ph.verify = AsyncMock(
+                return_value=(
+                    False,
+                    "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp",
+                    "",
+                    "transaction_simulation_failed: insufficient funds",
+                )
+            )
+
+            response = client.post(
+                "/v1/topup",
+                json={"amount": 1.0},
+                headers={"Payment-Signature": "fake-sig"},
+            )
+
+        assert response.status_code == 402
+        error = response.json()["error"]
+        assert "transaction_simulation_failed" in error
+        assert "insufficient funds" in error
+
+    @respx.mock
+    def test_verify_error_without_reason(self, client):
+        """POST with failed verify but empty reason returns generic message."""
+        respx.post("https://api.wavespeed.ai/api/v3/model/pricing").mock(
+            return_value=httpx.Response(200, json={"data": {"unit_price": 0.003}})
+        )
+
+        with patch("x402gate.app.payment_handler") as mock_ph:
+            mock_ph.extract_payment_signature.return_value = "fake-sig"
+            mock_ph.verify = AsyncMock(return_value=(False, "eip155:8453", "", ""))
+
+            response = client.post(
+                "/v1/wavespeed/wavespeed-ai/flux-dev",
+                json={"prompt": "a cat"},
+                headers={"Payment-Signature": "fake-sig"},
+            )
+
+        assert response.status_code == 402
+        assert response.json()["error"] == "Payment verification failed"
+
+    @respx.mock
+    def test_evm_insufficient_usdc_balance(self, client):
+        """POST with valid EVM signature but insufficient USDC returns 402."""
+        respx.post("https://api.wavespeed.ai/api/v3/model/pricing").mock(
+            return_value=httpx.Response(200, json={"data": {"unit_price": 0.003}})
+        )
+
+        with patch("x402gate.app.payment_handler") as mock_ph:
+            mock_ph.extract_payment_signature.return_value = "fake-sig"
+            mock_ph.verify = AsyncMock(
+                return_value=(
+                    True,
+                    "eip155:8453",
+                    "0xPayer",
+                    "",
+                )
+            )
+            mock_ph.check_evm_balance = AsyncMock(return_value=False)
+
+            response = client.post(
+                "/v1/wavespeed/wavespeed-ai/flux-dev",
+                json={"prompt": "a cat"},
+                headers={"Payment-Signature": "fake-sig"},
+            )
+
+        assert response.status_code == 402
+        assert "Insufficient USDC balance" in response.json()["error"]
