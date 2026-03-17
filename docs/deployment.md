@@ -90,7 +90,7 @@ git clone https://github.com/oponfil/x402gate.git
 cd x402gate
 python -m venv .venv
 source .venv/bin/activate
-pip install .
+pip install -r requirements.txt
 
 # Configure
 cp .env.example .env

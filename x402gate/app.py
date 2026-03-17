@@ -21,7 +21,6 @@ import jinja2
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
-from x402gate import __version__
 from x402gate.core import stats
 from x402gate.core.config import AppConfig, load_config
 from x402gate.core.payment import PaymentHandler
@@ -194,7 +193,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="x402gate",
     description="Transparent x402 payment proxy for AI services",
-    version=__version__,
+    version="unversioned",
     lifespan=lifespan,
 )
 
@@ -277,7 +276,6 @@ async def service_info(request: Request) -> Response:
     }
 
     service_data = {
-        "version": __version__,
         "base_url": base_url,
         "networks": networks,
         "commission": f"{commission_pct}% + ${gas_fee} gas",
@@ -314,7 +312,6 @@ async def service_info(request: Request) -> Response:
     # JSON for AI agents
     json_data = {
         "name": "x402gate",
-        "version": __version__,
         "description": (
             "Transparent pay-per-request proxy for AI services via the x402 protocol. "
             "Send a POST request to any provider endpoint — if no payment header is "

@@ -40,7 +40,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: pip install -e ".[dev]"
+        run: pip install -r requirements-dev.txt
 
       - name: Run unit tests
         run: python -m pytest tests/ --ignore=tests/e2e -v

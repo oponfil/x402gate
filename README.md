@@ -223,7 +223,7 @@ Both networks are offered simultaneously — the client chooses which to pay on.
 ```bash
 git clone https://github.com/oponfil/x402gate.git
 cd x402gate
-pip install -e .
+pip install -r requirements-dev.txt
 ```
 
 ### 2. Configure
