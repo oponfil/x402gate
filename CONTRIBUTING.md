@@ -13,6 +13,7 @@
 - Use `async/await` for all I/O-bound operations.
 - Use `Decimal` for monetary values, never `float`.
 - Thread safety: use `asyncio.Lock` for shared mutable state.
+- **Docstrings** — every Python file (`.py`) must have a module-level docstring at the top (enforced via Ruff `D100`).
 
 ## DRY — Don't Repeat Yourself
 

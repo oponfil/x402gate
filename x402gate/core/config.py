@@ -63,7 +63,7 @@ class GatewayConfig(BaseModel):
     max_upload_mb: int = 300  # max file upload size in MB (all in RAM, no disk)
     max_prepaid_topup: float = 10.0  # max single top-up amount in USD
     min_prepaid_topup: float = 0.10  # min single top-up amount in USD
-    prepaid_timestamp_window: int = 300  # signature validity window (seconds)
+    prepaid_timestamp_window: int = 300  # signature validity window (seconds, checked on arrival)
 
 
 class NetworkConfig(BaseModel):
@@ -101,7 +101,7 @@ class ProviderConfig(BaseModel):
     base_url: str
     api_key: str = ""
     poll_interval: int = 2
-    poll_timeout: int = 300
+    poll_timeout: int = 600
     docs_url: str = ""  # Link to provider API documentation
     description: str = ""  # Short description shown on the landing page
     example_request: dict[str, Any] = {}  # Example request: {model, body}

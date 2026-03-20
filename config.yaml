@@ -1,4 +1,4 @@
-# x402gate configuration
+# config.yaml — x402gate configuration
 # See docs/configuration.md for details on all options.
 
 gateway:
@@ -14,7 +14,7 @@ gateway:
   max_upload_mb: 300         # max file upload size in MB (all in RAM, no disk on Railway)
   max_prepaid_topup: 10.0    # max single top-up amount in USD
   min_prepaid_topup: 0.10    # min single top-up amount in USD
-  prepaid_timestamp_window: 300  # signature validity window (seconds)
+  prepaid_timestamp_window: 300  # signature validity window (seconds, checked on arrival, not during generation)
 
 payment:
   networks:
@@ -41,6 +41,7 @@ providers:
     enabled: true
     base_url: "https://openrouter.ai/api/v1"
     api_key: "${OPENROUTER_API_KEY}"
+    poll_timeout: 600          # seconds, max wait for LLM response (10 min)
     description: "300+ LLMs (GPT, Claude, Gemini, Llama…)"
     docs_url: "https://openrouter.ai/docs"
     example_request:
@@ -70,7 +71,7 @@ providers:
     api_key: "${WAVESPEED_API_KEY}"
     description: "60+ image/video models (Flux, Wan, Kling, Sora…)"
     poll_interval: 1           # seconds, between status polls
-    poll_timeout: 300          # seconds, max wait for result (5 min)
+    poll_timeout: 600          # seconds, max wait for result (10 min)
     docs_url: "https://wavespeed.ai/docs"
     example_request:
       model: "wavespeed-ai/z-image/turbo"
@@ -109,7 +110,7 @@ providers:
     cf_clearance: "${TUNGSTEN_CF_CLEARANCE}"
     fixed_price_usd: 0.01
     poll_interval: 3
-    poll_timeout: 300
+    poll_timeout: 600
     description: "AI image generator (Stable Diffusion / Flux, LoRA support)"
     docs_url: "https://github.com/oponfil/x402gate/blob/main/docs/tungsten.md"
     example_request:
@@ -164,7 +165,7 @@ providers:
     api_key: "${CLOUDCONVERT_API_KEY}"
     fixed_price_usd: 0.03
     poll_interval: 2
-    poll_timeout: 300
+    poll_timeout: 600
     description: "File conversion service (200+ formats: documents, images, video, audio…)"
     docs_url: "https://cloudconvert.com/api/v2"
     example_request:

@@ -293,10 +293,10 @@ All settings are in `config.yaml`. Secrets use `${ENV_VAR}` interpolation:
 | `gateway.max_upload_mb` | `300` | Maximum file upload size in MB (all in RAM) |
 | `gateway.max_prepaid_topup` | `10.0` | Maximum single top-up amount in USD |
 | `gateway.min_prepaid_topup` | `0.10` | Minimum single top-up amount in USD |
-| `gateway.prepaid_timestamp_window` | `300` | Signature validity window in seconds (covers large uploads) |
+| `gateway.prepaid_timestamp_window` | `300` | Signature validity window in seconds (checked on arrival, covers large uploads) |
 | `payment.networks.base` | — | Base Mainnet (EVM) config |
 | `payment.networks.solana` | — | Solana Mainnet (SVM) config |
-| `providers.wavespeed.poll_timeout` | `300` | Max wait for AI result (seconds) |
+| `providers.wavespeed.poll_timeout` | `600` | Max wait for AI result (seconds) |
 | `providers.blockrun.type` | `passthrough` | Transparent proxy, no commission |
 | `providers.openrouter.api_key` | — | OpenRouter API key |
 

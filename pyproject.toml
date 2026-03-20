@@ -3,7 +3,7 @@ target-version = "py311"
 line-length = 100
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "N", "UP", "B", "SIM", "ASYNC"]
+select = ["E", "F", "I", "N", "UP", "B", "SIM", "ASYNC", "D100"]
 
 [tool.ruff.format]
 quote-style = "double"

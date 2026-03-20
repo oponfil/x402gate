@@ -255,7 +255,7 @@ class OpenRouterProvider(BaseProvider):
 
         for attempt in range(1 + max_retries):
             try:
-                async with httpx.AsyncClient(timeout=120.0) as client:
+                async with httpx.AsyncClient(timeout=float(self._config.poll_timeout)) as client:
                     resp = await client.post(
                         url,
                         json=body,
@@ -267,7 +267,7 @@ class OpenRouterProvider(BaseProvider):
             except httpx.TimeoutException:
                 last_error = ProviderError(
                     provider=self.name,
-                    detail="OpenRouter request timed out after 120s",
+                    detail=f"OpenRouter request timed out after {self._config.poll_timeout}s",
                     status_code=504,
                 )
                 if attempt < max_retries:

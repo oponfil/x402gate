@@ -20,7 +20,7 @@ x402gate is configured via `config.yaml` in the project root. Secrets are stored
 | `max_upload_mb` | int | `300` | Maximum file upload size in MB (all in RAM, no disk on Railway) |
 | `max_prepaid_topup` | float | `10.0` | Maximum single top-up amount in USD |
 | `min_prepaid_topup` | float | `0.10` | Minimum single top-up amount in USD |
-| `prepaid_timestamp_window` | int | `300` | Signature validity window in seconds (covers large uploads) |
+| `prepaid_timestamp_window` | int | `300` | Signature validity window in seconds (checked on arrival, covers large uploads) |
 
 ### `payment`
 
@@ -56,7 +56,7 @@ Each provider is a key under `providers`:
 | `fixed_price_usd` | float | `0.0` | Fixed price per request in USD (when provider has no pricing API) |
 | `description` | string | `""` | Short description shown on the landing page |
 | `poll_interval` | int | `2` | Seconds between async task status polls |
-| `poll_timeout` | int | `300` | Max seconds to wait for task completion |
+| `poll_timeout` | int | `600` | Max seconds to wait for task completion |
 | `docs_url` | string | `""` | Link to provider API documentation |
 | `example_request` | dict | `{}` | Example request for the landing page (`{model, body}`) |
 | `example_request_2` | dict | `{}` | Second example request (e.g. video model) |

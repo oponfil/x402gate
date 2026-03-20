@@ -91,7 +91,7 @@ providers:
     base_url: "https://api.yourprovider.com/v1"
     api_key: "${YOUR_PROVIDER_API_KEY}"
     poll_interval: 2
-    poll_timeout: 300
+    poll_timeout: 600
 ```
 
 ### 4. Write Tests
