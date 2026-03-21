@@ -165,6 +165,14 @@
             color: #f85149 !important;
         }
 
+        .color-red {
+            color: #f85149 !important;
+        }
+
+        .color-yellow {
+            color: #d29922 !important;
+        }
+
         /* Logs */
         .logs-section {
             max-width: 1200px;
@@ -279,7 +287,7 @@
             }
         }
 
-        .btn-copy {
+        .btn {
             background: #21262d;
             color: #8b949e;
             border: 1px solid #30363d;
@@ -290,14 +298,31 @@
             transition: all 0.15s;
         }
 
-        .btn-copy:hover {
+        .btn:hover {
             background: #30363d;
             color: #e0e0e0;
         }
 
-        .btn-copy.copied {
+        .btn.copied {
             color: #3fb950;
             border-color: #3fb950;
+        }
+
+        .btn.active {
+            background: #1f6feb;
+            color: #fff;
+            border-color: #1f6feb;
+        }
+
+        .log-filters {
+            display: flex;
+            gap: 6px;
+            align-items: center;
+        }
+
+        .log-filters .btn {
+            font-size: 0.72em;
+            padding: 2px 8px;
         }
     </style>
 </head>
@@ -339,8 +364,15 @@
         <div class="logs-header">
             <h3>Live Logs</h3>
             <div style="display:flex;align-items:center;gap:10px">
+                <span class="summary-item" style="font-size:0.82em">Errors: <strong id="sum-errors" class="color-red">0</strong></span>
+                <span class="summary-item" style="font-size:0.82em">Warnings: <strong id="sum-warnings" class="color-yellow">0</strong></span>
+                <div class="log-filters">
+                    <button class="btn active" data-filter="ALL" onclick="setLogFilter('ALL', this)">All</button>
+                    <button class="btn" data-filter="ERROR" onclick="setLogFilter('ERROR', this)">Errors</button>
+                    <button class="btn" data-filter="WARNING" onclick="setLogFilter('WARNING', this)">Warnings</button>
+                </div>
                 <span class="logs-count" id="logs-count"></span>
-                <button class="btn-copy" id="copy-logs-btn" onclick="copyLogs()">Copy All</button>
+                <button class="btn" id="copy-logs-btn" onclick="copyLogs()">Copy All</button>
             </div>
         </div>
         <div class="logs" id="logs-container">
@@ -411,9 +443,22 @@
             _lastLogs = logs;
             const container = document.getElementById('logs-container');
             const countEl = document.getElementById('logs-count');
-            countEl.textContent = `${logs.length} entries`;
 
-            const sorted = logs.slice().reverse();
+            // Update error/warning counters
+            const errorCount = logs.filter(l => l.level === 'ERROR').length;
+            const warnCount = logs.filter(l => l.level === 'WARNING').length;
+            document.getElementById('sum-errors').textContent = errorCount;
+            document.getElementById('sum-warnings').textContent = warnCount;
+
+            // Filter by level
+            let filtered = logs;
+            if (_logFilter !== 'ALL') {
+                filtered = logs.filter(l => l.level === _logFilter);
+            }
+
+            countEl.textContent = `${filtered.length} entries`;
+
+            const sorted = filtered.slice().reverse();
 
             const atBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 50;
 
@@ -469,9 +514,18 @@
         }
 
         let _lastLogs = [];
+        let _logFilter = 'ALL';
+
+        function setLogFilter(filter, btn) {
+            _logFilter = filter;
+            document.querySelectorAll('.log-filters .btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            renderLogs(_lastLogs);
+        }
 
         function copyLogs() {
-            const text = _lastLogs.map(log => {
+            const logs = _logFilter === 'ALL' ? _lastLogs : _lastLogs.filter(l => l.level === _logFilter);
+            const text = logs.map(log => {
                 const d = new Date(log.ts * 1000);
                 const mon = d.toLocaleString('en-US', { month: 'short' });
                 const day = d.getDate().toString().padStart(2, '0');
