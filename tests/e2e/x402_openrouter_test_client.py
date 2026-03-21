@@ -33,7 +33,7 @@ CONFIG_PATH = Path(__file__).parent.parent.parent / "config.yaml"
 
 def _load_example_request() -> tuple[str, dict]:
     """Load model and body from config.yaml's openrouter example_request."""
-    with open(CONFIG_PATH) as f:
+    with open(CONFIG_PATH, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     ex = cfg["providers"]["openrouter"]["example_request"]
     return ex["model"], dict(ex["body"])

@@ -14,6 +14,9 @@ x402gate sits between your AI agent and AI service providers, adding [x402](http
 | [BlockRun](https://blockrun.ai) | Passthrough | 40+ LLMs (GPT, Claude, Gemini…) | `/v1/blockrun/...` |
 | [CloudConvert](https://cloudconvert.com) | Managed | File conversion (200+ formats) | `/v1/cloudconvert/...` |
 | [SocialDownload](https://rapidapi.com/nguyenmanhict-MuTUtGWD7K/api/social-download-all-in-one) | Managed | Download media from social networks | `/v1/socialdownload/...` |
+| [ElevenLabs](https://elevenlabs.io) | Managed | Premium TTS (1000+ voices, Multilingual v2, Flash) | `/v1/elevenlabs/...` |
+| [MiniMax](https://www.minimax.io) | Managed | High-quality TTS with emotional expression | `/v1/minimax/...` |
+| [Fish Audio](https://fish.audio) | Managed | Uncensored TTS (Fish Speech) | `/v1/fishaudio/...` |
 
 ## How It Works
 
@@ -65,44 +68,7 @@ The payment goes directly to BlockRun's wallet — x402gate earns nothing but pr
 
 ### File Conversion (CloudConvert)
 
-CloudConvert uses **multipart/form-data** for file uploads (unlike JSON-based AI providers):
-
-```bash
-# Convert DOCX to PDF
-curl -X POST https://x402gate.io/v1/cloudconvert/convert \
-  -F "file=@document.docx" \
-  -F "output_format=pdf"
-
-# Response: 402 Payment Required ($0.03 + commission)
-# Sign payment, then retry with PAYMENT-SIGNATURE header
-
-curl -X POST https://x402gate.io/v1/cloudconvert/convert \
-  -F "file=@document.docx" \
-  -F "output_format=pdf" \
-  -H "PAYMENT-SIGNATURE: <base64-encoded-payment>"
-
-# Response: 200 OK
-# {"url": "https://storage.cloudconvert.com/...", "filename": "document.pdf"}
-```
-
-Supported parameters:
-- `file` — the file to convert/optimize (required, max 300 MB)
-- `operation` — `convert` (default) or `optimize` (compress PDF/PNG/JPG)
-- `output_format` — target format: `pdf`, `png`, `mp4`, `docx`, etc. (required for convert)
-- `input_format` — source format (optional, auto-detected from filename)
-
-> **Note:** Maximum upload size is configurable via `gateway.max_upload_mb` (default: 300 MB). Files exceeding the limit receive HTTP 413.
-
-#### PDF Optimization (Compression)
-
-```bash
-curl -X POST https://x402gate.io/v1/cloudconvert/convert \
-  -F "file=@large_document.pdf" \
-  -F "operation=optimize" \
-  -F "input_format=pdf"
-
-# Response: 402 Payment Required ($0.03 + commission)
-```
+CloudConvert uses **multipart/form-data** for file uploads. Supports 200+ formats (DOCX→PDF, PNG→JPG, etc.) and PDF optimization. See [docs/configuration.md](docs/configuration.md) for supported parameters.
 
 ### Transaction Summary
 
@@ -232,29 +198,7 @@ pip install -r requirements-dev.txt
 cp .env.example .env
 ```
 
-Edit `.env` with your values:
-
-```env
-WAVESPEED_API_KEY=your_key
-OPENROUTER_API_KEY=your_key
-TUNGSTEN_JWT_TOKEN=your_jwt_cookie
-TUNGSTEN_CF_CLEARANCE=your_cf_cookie
-
-# CloudConvert (file conversion)
-CLOUDCONVERT_API_KEY=your_key
-
-# RapidAPI (social media download)
-RAPIDAPI_KEY=your_key
-
-# Base (EVM)
-BASE_PAY_TO_ADDRESS=0xYourWallet
-BASE_FACILITATOR_PRIVATE_KEY=your_key
-
-# Solana
-SOLANA_PAY_TO_ADDRESS=YourSolanaWallet
-SOLANA_FACILITATOR_PRIVATE_KEY=your_base58_key
-SOLANA_RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY
-```
+Edit `.env` with your API keys and wallet addresses. See [`.env.example`](.env.example) for all available variables.
 
 > **Note:** Facilitator wallets need a small balance of native tokens (ETH on Base, SOL on Solana) to pay gas for settlement transactions.
 
@@ -282,31 +226,12 @@ curl -X POST https://x402gate.io/v1/{provider}/{model_path} \
 
 ## Configuration
 
-All settings are in `config.yaml`. Secrets use `${ENV_VAR}` interpolation:
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `gateway.commission` | `0.04` | Markup rate (4%) added to provider price |
-| `gateway.gas_surcharge` | `0.001` | Fixed gas surcharge ($0.001) added on top of commission |
-| `gateway.default_max_tokens` | `2048` | Default `max_tokens` when client omits it (x402 mode only; skipped in prepaid) |
-| `gateway.price_cache_ttl` | `60` | Price cache TTL in seconds |
-| `gateway.max_upload_mb` | `300` | Maximum file upload size in MB (all in RAM) |
-| `gateway.max_prepaid_topup` | `10.0` | Maximum single top-up amount in USD |
-| `gateway.min_prepaid_topup` | `0.10` | Minimum single top-up amount in USD |
-| `gateway.prepaid_timestamp_window` | `300` | Signature validity window in seconds (checked on arrival, covers large uploads) |
-| `payment.networks.base` | — | Base Mainnet (EVM) config |
-| `payment.networks.solana` | — | Solana Mainnet (SVM) config |
-| `providers.wavespeed.poll_timeout` | `600` | Max wait for AI result (seconds) |
-| `providers.blockrun.type` | `passthrough` | Transparent proxy, no commission |
-| `providers.openrouter.api_key` | — | OpenRouter API key |
-
-See [docs/configuration.md](docs/configuration.md) for full reference.
+All settings are in `config.yaml`. Secrets use `${ENV_VAR}` interpolation. See [docs/configuration.md](docs/configuration.md) for the full reference.
 
 > [!IMPORTANT]
-> **Changing a config parameter?** Update in **3 places**:
+> **Changing a config parameter?** Update in **2 places**:
 > 1. `config.yaml` — runtime value
 > 2. `x402gate/core/config.py` — default in the `GatewayConfig` / `ProviderConfig` model
-> 3. `README.md` — the configuration table above
 >
 > The landing page (`index.html`) reads all values from config automatically via Jinja2.
 
@@ -346,19 +271,14 @@ See [docs/add-provider.md](docs/add-provider.md) for a step-by-step guide.
 
 - [Architecture](docs/architecture.md) — how x402gate works under the hood
 - [Prepaid Mode](docs/prepaid.md) — top-up and pay without on-chain transactions
+- [Dashboard](docs/dashboard.md) — real-time metrics, logs, and revenue tracking
 - [Deployment](docs/deployment.md) — Railway, Docker, VPS guides
 - [Configuration](docs/configuration.md) — all config options
+- [TTS Providers](docs/tts.md) — ElevenLabs, MiniMax, Fish Audio
 - [Tungsten](docs/tungsten.md) — Tungsten image generation provider
+- [SocialDownload](docs/socialdownload.md) — download media from social networks
 - [Adding a Provider](docs/add-provider.md) — extend with new AI services
 
-## Scripts
-
-Diagnostic utilities in `scripts/`:
-
-| Script | Description |
-|--------|-------------|
-| `check_balance.py` | Check facilitator wallet SOL balance |
-| `check_usdc.py [wallet]` | Check USDC balance of any Solana wallet |
 
 ## Contributing
 

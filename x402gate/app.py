@@ -39,6 +39,9 @@ from x402gate.core.pricing import PriceCache, apply_commission
 from x402gate.core.proxy import TaskTimeoutError
 from x402gate.providers.base import BaseProvider, ProviderError
 from x402gate.providers.cloudconvert import CloudConvertProvider
+from x402gate.providers.elevenlabs import ElevenLabsProvider
+from x402gate.providers.fishaudio import FishAudioProvider
+from x402gate.providers.minimax import MinimaxProvider
 from x402gate.providers.openrouter import OpenRouterProvider
 from x402gate.providers.socialdownload import SocialDownloadProvider
 from x402gate.providers.tungsten import TungstenProvider
@@ -73,6 +76,9 @@ PROVIDER_REGISTRY: dict[str, type[BaseProvider]] = {
     "tungsten": TungstenProvider,
     "cloudconvert": CloudConvertProvider,
     "socialdownload": SocialDownloadProvider,
+    "elevenlabs": ElevenLabsProvider,
+    "minimax": MinimaxProvider,
+    "fishaudio": FishAudioProvider,
 }
 
 # Global state (initialized in lifespan)

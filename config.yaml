@@ -191,3 +191,83 @@ providers:
       model: "download"
       body:
         url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+  elevenlabs:
+    enabled: true
+    base_url: "https://api.elevenlabs.io"
+    api_key: "${ELEVENLABS_API_KEY}"
+    poll_timeout: 600
+    description: "Premium TTS with 1000+ voices (ElevenLabs v3, Flash v2.5)"
+    docs_url: "https://elevenlabs.io/docs/api-reference/text-to-speech/convert"
+    pricing:
+      per_1k_chars_standard: 0.30  # $/1k chars for standard models (v3, multilingual)
+      per_1k_chars_turbo: 0.15     # $/1k chars for turbo/flash models
+    example_request:
+      model: "21m00Tcm4TlvDq8ikWAM"
+      body:
+        text: "The quick brown fox jumps over the lazy dog. This is a test of the ElevenLabs text to speech system."
+        model_id: "eleven_v3"
+        voice_settings:
+          similarity_boost: 0.8
+          style: 0.6
+    example_request_2:
+      model: "21m00Tcm4TlvDq8ikWAM"
+      body:
+        text: "Привет! Это пример генерации речи на русском языке с помощью нейросети ElevenLabs."
+        model_id: "eleven_flash_v2_5"
+        voice_settings:
+          stability: 0.7
+          speed: 1.15
+  minimax:
+    enabled: true
+    base_url: "https://api.minimax.io"
+    api_key: "${MINIMAX_API_KEY}"
+    poll_timeout: 600
+    description: "High-quality TTS with emotional expression (MiniMax Speech 2.8 HD)"
+    docs_url: "https://www.minimaxi.com/document/T2A%20V2"
+    pricing:
+      per_1k_chars_turbo: 0.06   # $/1k chars for turbo models
+      per_1k_chars_hd: 0.10      # $/1k chars for HD models
+    example_request:
+      model: "speech-2.8-turbo"
+      body:
+        text: "Welcome to the future of AI voice synthesis. This is MiniMax speech generation."
+        model: "speech-2.8-turbo"
+        voice_setting:
+          voice_id: "English_expressive_narrator"
+    example_request_2:
+      model: "speech-2.8-hd"
+      body:
+        text: "Добро пожаловать в мир технологий искусственного интеллекта. Это генерация речи от MiniMax."
+        model: "speech-2.8-hd"
+        voice_setting:
+          voice_id: "Russian_PessimisticGirl"
+          speed: 1.2
+          pitch: -1
+        language_boost: "Russian"
+  fishaudio:
+    enabled: true
+    base_url: "https://api.fish.audio"
+    api_key: "${FISHAUDIO_API_KEY}"
+    poll_timeout: 600
+    description: "Uncensored TTS with voice cloning (Fish Audio S2 Pro)"
+    docs_url: "https://fish.audio/docs"
+    pricing:
+      per_1k_bytes: 0.015  # $/1k UTF-8 bytes
+    example_request:
+      model: "tts"
+      body:
+        text: "In a world where technology evolves at an unprecedented pace, artificial intelligence leads the way."
+        model: "s1"
+        format: "mp3"
+        reference_id: "e58b0d7efca34eb38d5c4985e378abcb"  # Adrian — steady narrator
+        prosody:
+          speed: 1.1
+    example_request_2:
+      model: "tts"
+      body:
+        text: "Искусственный интеллект открывает новые горизонты в генерации голоса. Попробуйте сами!"
+        model: "s2-pro"
+        format: "mp3"
+        reference_id: "bc8eb8dcdc184763b0a769ee03275724"  # Russian voice
+        prosody:
+          speed: 1.0

@@ -110,6 +110,7 @@ class ProviderConfig(BaseModel):
     jwt_token: str = ""
     cf_clearance: str = ""
     fixed_price_usd: float = 0.0  # Fixed price per request (when provider has no pricing API)
+    pricing: dict[str, Any] = {}  # Per-model pricing tiers (e.g. TTS providers)
 
 
 class AppConfig(BaseModel):
@@ -140,7 +141,7 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
-    with open(config_path) as f:
+    with open(config_path, encoding="utf-8") as f:
         raw = yaml.safe_load(f)
 
     interpolated = _interpolate_dict(raw)

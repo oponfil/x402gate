@@ -74,7 +74,7 @@ def save_images(images: list, label: str) -> list[Path]:
     saved = []
 
     for i, img in enumerate(images):
-        fname = f"{safe_label}_{ts}_{i + 1}.png"
+        fname = f"{ts}_{safe_label}_{i + 1}.png"
         fpath = OUTPUT_DIR / fname
         img_bytes = None
 
@@ -108,13 +108,33 @@ async def save_from_urls(urls: list[str], label: str, http_client: httpx.AsyncCl
 
     for i, url in enumerate(urls):
         ext = Path(url.split("?")[0]).suffix or ".png"
-        fpath = OUTPUT_DIR / f"{safe_label}_{ts}_{i + 1}{ext}"
+        fpath = OUTPUT_DIR / f"{ts}_{safe_label}_{i + 1}{ext}"
         resp = await http_client.get(url, timeout=60.0)
         fpath.write_bytes(resp.content)
         saved.append(fpath)
         logger.info("Saved media: %s (%d bytes)", fpath, len(resp.content))
 
     return saved
+
+
+def save_audio(audio_b64: str, label: str, content_type: str = "audio/mpeg") -> Path:
+    """Decode and save base64 audio to tests/e2e/output/.
+
+    Returns the saved file path.
+    """
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    safe_label = label.lower().replace(" ", "_").replace("#", "")
+    ts = _timestamp()
+
+    # Determine extension from content-type
+    ext_map = {"audio/mpeg": ".mp3", "audio/wav": ".wav", "audio/ogg": ".ogg"}
+    ext = ext_map.get(content_type, ".mp3")
+
+    fpath = OUTPUT_DIR / f"{ts}_{safe_label}{ext}"
+    audio_bytes = base64.b64decode(audio_b64)
+    fpath.write_bytes(audio_bytes)
+    logger.info("Saved audio: %s (%d bytes)", fpath, len(audio_bytes))
+    return fpath
 
 
 def print_timing_summary(

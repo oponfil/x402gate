@@ -32,7 +32,7 @@ CONFIG_PATH = Path(__file__).resolve().parents[2] / "config.yaml"
 
 def _load_example_request() -> tuple[str, dict]:
     """Load model and body from config.yaml's wavespeed example_request_2."""
-    with open(CONFIG_PATH) as f:
+    with open(CONFIG_PATH, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     example = cfg["providers"]["wavespeed"]["example_request_2"]
     return example["model"], example["body"]
