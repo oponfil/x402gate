@@ -57,6 +57,21 @@
             gap: 16px;
         }
 
+        .category-header {
+            grid-column: 1 / -1;
+            font-size: 0.82em;
+            color: #8b949e;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            padding: 4px 0 0;
+            border-bottom: 1px solid #21262d;
+            margin-top: 4px;
+        }
+
+        .category-header:first-child {
+            margin-top: 0;
+        }
+
         .card {
             background: #161b22;
             border: 1px solid #21262d;
@@ -431,6 +446,7 @@
 
             let html = '';
             for (const [cat, names] of Object.entries(categorized)) {
+                html += `<div class="category-header">${escHtml(cat)}</div>`;
                 html += names.map(name => {
                     const p = providers[name];
                     const type = name === 'topup' ? 'system' : (PROVIDER_TYPES[name] || 'managed');

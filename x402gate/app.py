@@ -776,8 +776,8 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
         return _error_response(e.status_code, e.detail, provider=e.provider)
 
     # 7. Determine if response is async (needs polling) or sync (ready)
-    #    - Sync providers (OpenRouter, etc.) return results directly,
-    #      often in OpenAI format with "choices" key
+    #    - Sync providers (OpenRouter, TTS, etc.) return results directly,
+    #      often in OpenAI format with "choices" or "data" (list) key
     #    - Async providers (WaveSpeed) return {"data": {"id": ..., "status": ...}}
     task_data = result.get("data", result)
     is_async = (
@@ -789,11 +789,11 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
 
     if is_async:
         task_id = task_data["id"]
-        # Async provider — poll for completion
+        # Async provider -- poll for completion
         try:
             output = await provider.get_result(task_id)
         except TaskTimeoutError as e:
-            # Don't settle — client keeps their money
+            # Don't settle -- client keeps their money
             t_err = time.monotonic() - t_gen_start
             stats.record_request(provider_name, t_err, False, error_msg=f"Timeout {e.timeout}s")
             return _error_response(
@@ -803,12 +803,12 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
                 task_id=e.task_id,
             )
         except ProviderError as e:
-            # Don't settle — task failed
+            # Don't settle -- task failed
             t_err = time.monotonic() - t_gen_start
             stats.record_request(provider_name, t_err, False, error_msg=e.detail)
             return _error_response(e.status_code, e.detail, provider=e.provider)
     else:
-        # Synchronous provider — use result directly
+        # Synchronous provider -- use extracted data for the response body.
         output = task_data
 
     generation_s = time.monotonic() - t_gen_start  # Provider processing time
@@ -816,7 +816,10 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
     # 8. Calculate actual cost (if provider supports it)
     #    x402 exact scheme requires settling the signed amount (final_price).
     #    Actual cost is used only for Transaction Summary reporting.
-    actual_base_price = await provider.calculate_actual_cost(body, output)
+    #    Pass the full `result` (not `output`) so the provider can access
+    #    top-level fields like "usage" -- for embeddings, output is a list
+    #    and would not have .get().
+    actual_base_price = await provider.calculate_actual_cost(body, result)
     if actual_base_price is None:
         actual_base_price = base_price  # fallback to estimate
 
@@ -846,8 +849,15 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
         # Bottom-line totals will exclude the revenue part to avoid
         # double-counting with the topup that funded this balance.
         stats.record_prepaid_usage(provider_name, actual_base_price)
+        # For sync providers where data was extracted from result (e.g.,
+        # embeddings), preserve top-level metadata (usage, model).
+        if not is_async and output is not result:
+            content = {k: v for k, v in result.items() if k != "data"}
+            content["data"] = output
+        else:
+            content = {"data": output}
         return JSONResponse(
-            content={"data": output},
+            content=content,
             headers={"X-Prepaid-Balance": str(remaining)},
         )
 
@@ -909,8 +919,15 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
     # 10. Return result to client
     stats.record_request(provider_name, generation_s, True)
     stats.record_overhead(payment_network, t_client - generation_s)
+    # For sync providers where data was extracted from result (e.g.,
+    # embeddings), preserve top-level metadata (usage, model).
+    if not is_async and output is not result:
+        content = {k: v for k, v in result.items() if k != "data"}
+        content["data"] = output
+    else:
+        content = {"data": output}
     return JSONResponse(
-        content={"data": output},
+        content=content,
         headers={
             "X-Timing-Verify": f"{verify_s:.2f}",
             "X-Timing-Generation": f"{generation_s:.2f}",

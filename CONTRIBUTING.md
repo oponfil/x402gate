@@ -42,7 +42,7 @@ git add -A
 git commit -m "feat: short title" -m "Detailed body explaining changes"
 ```
 
-> **PowerShell note:** Do NOT use literal newlines inside a `-m` string — PowerShell may hang waiting for input that never comes. Use two separate `-m` flags instead (first = title, second = body). The `&&` operator requires PowerShell 7+; on older versions run `git add` and `git commit` as separate commands.
+> **PowerShell note:** Do NOT use literal newlines inside a `-m` string — PowerShell may hang waiting for input that never comes. Use two separate `-m` flags instead (first = title, second = body). The `&&` operator requires PowerShell 7+; on older versions run `git add` and `git commit` as separate commands. **Do NOT use non-ASCII characters** (→, —, emoji, etc.) in `-m` strings — they can cause PowerShell to hang silently. Use only ASCII text in commit messages.
 
 ## Testing
 
