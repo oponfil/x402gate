@@ -25,12 +25,12 @@ def _interpolate_env(value: Any) -> Any:
     result = value
     for m in pattern.finditer(value):
         env_var = m.group(1)
+        # Fail fast on startup if any configured secret is missing.
+        # This keeps broken deployments from advertising providers that
+        # would only fail later on the first real request.
         env_value = os.environ.get(env_var)
         if env_value is None:
-            raise ValueError(
-                f"Environment variable '{env_var}' is required but not set. "
-                f"Add it to your .env file or export it."
-            )
+            raise ValueError(f"Environment variable '${{{env_var}}}' is required but not set")
         result = result.replace(m.group(0), env_value)
     return result
 
@@ -40,7 +40,21 @@ def _interpolate_dict(data: dict) -> dict:
     result = {}
     for key, value in data.items():
         if isinstance(value, dict):
-            result[key] = _interpolate_dict(value)
+            if key == "providers":
+                providers = {}
+                for provider_name, provider_cfg in value.items():
+                    if (
+                        isinstance(provider_cfg, dict)
+                        and provider_cfg.get("enabled", True) is False
+                    ):
+                        # Disabled providers are parsed but skipped at app startup,
+                        # so they must not require secrets to be present.
+                        providers[provider_name] = provider_cfg
+                    else:
+                        providers[provider_name] = _interpolate_dict(provider_cfg)
+                result[key] = providers
+            else:
+                result[key] = _interpolate_dict(value)
         elif isinstance(value, list):
             result[key] = [_interpolate_env(item) for item in value]
         else:
@@ -106,6 +120,7 @@ class ProviderConfig(BaseModel):
     description: str = ""  # Short description shown on the landing page
     example_request: dict[str, Any] = {}  # Example request: {model, body}
     example_request_2: dict[str, Any] = {}  # Second example: {model, body}
+    example_request_3: dict[str, Any] = {}  # Third example: {model, body}
     # Tungsten-specific: cookie-based auth (no API keys)
     jwt_token: str = ""
     cf_clearance: str = ""

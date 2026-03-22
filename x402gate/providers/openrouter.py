@@ -1,8 +1,9 @@
 """OpenRouter provider for x402gate.
 
 Implements the BaseProvider interface for OpenRouter's API:
-- Pricing via GET /api/v1/models/{model} (per-token pricing)
-- Task submission via POST /api/v1/chat/completions (synchronous)
+- Pricing via GET /api/v1/models (per-token pricing, chat + embedding models)
+- Chat completion via POST /api/v1/chat/completions (synchronous)
+- Embeddings via POST /api/v1/embeddings (synchronous)
 - No polling needed (responses are synchronous)
 """
 
@@ -27,9 +28,11 @@ _CHARS_PER_TOKEN = 4
 class OpenRouterProvider(BaseProvider):
     """OpenRouter provider implementation.
 
-    OpenRouter is an LLM aggregator with 300+ models and an OpenAI-compatible
-    API.  Pricing is per-token and varies by model.  We estimate the cost
-    upfront using the model's published pricing and the request's max_tokens.
+    OpenRouter is an LLM aggregator with 300+ chat and embedding models and
+    an OpenAI-compatible API.  Supports both chat completions and embeddings.
+    Pricing is per-token and varies by model.  We estimate the cost upfront
+    using the model's published pricing and the request's max_tokens
+    (chat) or input length (embedding).
     """
 
     def __init__(
@@ -51,8 +54,8 @@ class OpenRouterProvider(BaseProvider):
     async def _fetch_model_info(self, model_id: str) -> dict[str, Any]:
         """Fetch model info (including pricing) from OpenRouter Models API.
 
-        OpenRouter only provides a list endpoint (GET /api/v1/models), not a
-        single-model lookup.  We fetch the full catalog once and cache it.
+        On first access, fetches both the chat model catalog and the embedding
+        model catalog (?output_modalities=embeddings) into a unified cache.
 
         Args:
             model_id: Model identifier (e.g. 'openai/gpt-4o-mini').
@@ -66,35 +69,13 @@ class OpenRouterProvider(BaseProvider):
         if model_id in self._models_cache:
             return self._models_cache[model_id]
 
-        # Fetch full model catalog if cache is empty
+        # Fetch both chat and embedding models on first access.
+        # This is intentional: partial catalog state is considered invalid,
+        # so if either catalog cannot be loaded we fail fast instead of
+        # serving OpenRouter with incomplete pricing/model metadata.
         if not self._models_cache:
-            url = f"{self._config.base_url.rstrip('/')}/models"
-            try:
-                async with httpx.AsyncClient(timeout=15.0) as client:
-                    resp = await client.get(url)
-
-                if resp.status_code >= 400:
-                    raise ProviderError(
-                        provider=self.name,
-                        detail=f"OpenRouter Models API error: {resp.text}",
-                        status_code=resp.status_code,
-                    )
-
-                models_list = resp.json().get("data", [])
-                for model in models_list:
-                    mid = model.get("id", "")
-                    if mid:
-                        self._models_cache[mid] = model
-                logger.info("Cached %d models from OpenRouter", len(self._models_cache))
-
-            except ProviderError:
-                raise
-            except Exception as e:
-                raise ProviderError(
-                    provider=self.name,
-                    detail=f"Failed to fetch models list: {e}",
-                    status_code=503,
-                ) from e
+            await self._fetch_models_list()
+            await self._fetch_models_list(output_modalities="embeddings")
 
         if model_id not in self._models_cache:
             raise ProviderError(
@@ -105,20 +86,61 @@ class OpenRouterProvider(BaseProvider):
 
         return self._models_cache[model_id]
 
+    async def _fetch_models_list(self, output_modalities: str = "") -> None:
+        """Fetch models from OpenRouter and add to cache."""
+        url = f"{self._config.base_url.rstrip('/')}/models"
+        if output_modalities:
+            url += f"?output_modalities={output_modalities}"
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(url)
+
+            if resp.status_code >= 400:
+                raise ProviderError(
+                    provider=self.name,
+                    detail=f"OpenRouter Models API error: {resp.text}",
+                    status_code=resp.status_code,
+                )
+
+            models_list = resp.json().get("data", [])
+            count = 0
+            for model in models_list:
+                mid = model.get("id", "")
+                if mid and mid not in self._models_cache:
+                    self._models_cache[mid] = model
+                    count += 1
+            label = f" ({output_modalities})" if output_modalities else ""
+            logger.info(
+                "Cached %d models from OpenRouter%s (total: %d)",
+                count,
+                label,
+                len(self._models_cache),
+            )
+
+        except ProviderError:
+            raise
+        except Exception as e:
+            raise ProviderError(
+                provider=self.name,
+                detail=f"Failed to fetch models list: {e}",
+                status_code=503,
+            ) from e
+
     async def get_price(self, model_path: str, inputs: dict[str, Any]) -> Decimal:
         """Estimate maximum request cost from per-token pricing.
 
-        Fetches the model's pricing from OpenRouter and calculates:
+        For chat completions:
             estimated_cost = input_tokens × prompt_price
                            + max_tokens × completion_price
+        For embeddings:
+            estimated_cost = input_tokens × prompt_price
 
-        Input tokens are estimated from total message text length.
-        If max_tokens is not provided, uses the configured default.
+        Input tokens are estimated from total text length (messages or input).
 
         Args:
             model_path: Ignored (model is in inputs['model']).
-            inputs: Request body containing 'model', 'messages', and
-                    optionally 'max_tokens'.
+            inputs: Request body containing 'model' and either 'messages'
+                    (chat) or 'input' (embedding).
 
         Returns:
             Estimated maximum cost in USD as a Decimal.
@@ -145,6 +167,28 @@ class OpenRouterProvider(BaseProvider):
         prompt_price_dec = Decimal(str(prompt_price))
         completion_price_dec = Decimal(str(completion_price))
 
+        # Embedding requests: price based on input only (no completion tokens)
+        if "input" in inputs and "messages" not in inputs:
+            text_input = inputs.get("input", "")
+            if isinstance(text_input, list):
+                total_chars = sum(len(str(item)) for item in text_input)
+            else:
+                total_chars = len(str(text_input))
+            estimated_input_tokens = max(total_chars // _CHARS_PER_TOKEN, 1)
+
+            estimated_cost = Decimal(estimated_input_tokens) * prompt_price_dec
+            if estimated_cost < Decimal("0.000001"):
+                estimated_cost = Decimal("0.000001")
+
+            logger.info(
+                "OpenRouter price estimate for %s: $%s (~%d input tokens, embedding)",
+                model_id,
+                estimated_cost,
+                estimated_input_tokens,
+            )
+            return estimated_cost
+
+        # Chat completion requests
         # Estimate input tokens from message text
         messages = inputs.get("messages", [])
         total_chars = sum(len(str(m.get("content", ""))) for m in messages)
@@ -195,14 +239,17 @@ class OpenRouterProvider(BaseProvider):
         *,
         prepaid: bool = False,
     ) -> dict[str, Any]:
-        """Submit a chat completion request to OpenRouter.
+        """Submit a request to OpenRouter (chat completions or embeddings).
 
-        Sends the request to POST /api/v1/chat/completions.  OpenRouter
-        returns the result synchronously (no polling needed).
+        Routes to the appropriate endpoint based on path:
+        - 'chat/completions' → POST /api/v1/chat/completions
+        - 'embeddings' → POST /api/v1/embeddings
+
+        OpenRouter returns results synchronously (no polling needed).
 
         Args:
-            path: API sub-path (typically 'chat/completions').
-            body: Request body, forwarded without modification.
+            path: API sub-path ('chat/completions' or 'embeddings').
+            body: Request body, forwarded to OpenRouter.
             prepaid: If True, skip max_tokens injection (actual usage
                 will be charged post-request from prepaid balance).
 
@@ -212,11 +259,14 @@ class OpenRouterProvider(BaseProvider):
         Raises:
             ProviderError: If the request fails.
         """
+        # max_tokens and plugin injection only apply to chat completions
+        is_embedding = "embedding" in path.lower()
+
         # In x402 mode, ensure max_tokens is set so OpenRouter doesn't
         # fall back to a large provider default (which would cost more
         # than our estimate).  In prepaid mode, skip this — we charge
         # actual usage, so let the model respond fully.
-        if not prepaid:
+        if not prepaid and not is_embedding:
             raw_max = body.get("max_tokens")
             user_max = raw_max if isinstance(raw_max, int) else 0
             if user_max < self._default_max_tokens:
@@ -228,25 +278,26 @@ class OpenRouterProvider(BaseProvider):
                 )
 
         # Inject default max_results into web search plugins so
-        # actual usage matches our cost estimate.
-        plugins = body.get("plugins", [])
-        patched_plugins = []
-        plugins_changed = False
-        for plugin in plugins:
-            if (
-                isinstance(plugin, dict)
-                and plugin.get("id") == "web"
-                and "max_results" not in plugin
-            ):
-                plugin = {**plugin, "max_results": self._default_web_search_max_results}
-                plugins_changed = True
-                logger.info(
-                    "Injected plugins.web.max_results=%d (default)",
-                    self._default_web_search_max_results,
-                )
-            patched_plugins.append(plugin)
-        if plugins_changed:
-            body = {**body, "plugins": patched_plugins}
+        # actual usage matches our cost estimate (chat only).
+        if not is_embedding:
+            plugins = body.get("plugins", [])
+            patched_plugins = []
+            plugins_changed = False
+            for plugin in plugins:
+                if (
+                    isinstance(plugin, dict)
+                    and plugin.get("id") == "web"
+                    and "max_results" not in plugin
+                ):
+                    plugin = {**plugin, "max_results": self._default_web_search_max_results}
+                    plugins_changed = True
+                    logger.info(
+                        "Injected plugins.web.max_results=%d (default)",
+                        self._default_web_search_max_results,
+                    )
+                patched_plugins.append(plugin)
+            if plugins_changed:
+                body = {**body, "plugins": patched_plugins}
 
         url = f"{self._config.base_url.rstrip('/')}/{path.lstrip('/')}"
         max_retries = 2
@@ -338,8 +389,8 @@ class OpenRouterProvider(BaseProvider):
     ) -> Decimal | None:
         """Calculate actual cost from usage data in the response.
 
-        Uses real prompt_tokens and completion_tokens from the provider
-        response instead of the estimated max_tokens ceiling.
+        For chat completions, uses real prompt_tokens and completion_tokens.
+        For embeddings, uses prompt_tokens only (completion_tokens=0).
 
         Args:
             body: Original request body (used for model ID).
@@ -353,9 +404,11 @@ class OpenRouterProvider(BaseProvider):
             return None
 
         prompt_tokens = usage.get("prompt_tokens")
-        completion_tokens = usage.get("completion_tokens")
-        if prompt_tokens is None or completion_tokens is None:
+        if prompt_tokens is None:
             return None
+
+        # Embeddings have no completion_tokens — default to 0
+        completion_tokens = usage.get("completion_tokens", 0)
 
         model_id = body.get("model", "")
         try:

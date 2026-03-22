@@ -103,13 +103,20 @@
 
     <hr>
     <h3>Providers</h3>
-    <ul>
-        {% for p in provider_info %}
+    {% set cat_order = ["LLM", "Image & Video", "Text-to-Speech", "Utility", "System"] %}
+    {% for cat in cat_order %}
+    {% set members = provider_info | selectattr("category", "equalto", cat) | list %}
+    {% if members %}
+    <p style="color:#8b949e; font-size:0.8em; margin:12px 0 4px; text-transform:uppercase; letter-spacing:0.05em; border-left:3px solid #30363d; padding-left:8px;">{{ cat }}</p>
+    <ul style="margin-top:0;">
+        {% for p in members %}
         <li><strong>{{ p.name }}</strong> ({{ p.type }}){% if p.description %} &mdash; {{ p.description }}{% endif %}
             &mdash; <code>/v1/{{ p.name }}/...</code>{% if p.docs_url %} &middot; <a href="{{ p.docs_url }}">API
                 docs</a>{% endif %}</li>
         {% endfor %}
     </ul>
+    {% endif %}
+    {% endfor %}
     <p>Commission: <strong>{{ commission }}</strong> per request</p>
 
     <hr>

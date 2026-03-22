@@ -16,7 +16,7 @@ from typing import Any
 import httpx
 
 from x402gate.core.config import ProviderConfig
-from x402gate.providers.base import BaseProvider, ProviderError
+from x402gate.providers.base import BaseProvider, ProviderError, require_text
 
 logger = logging.getLogger(__name__)
 
@@ -29,10 +29,14 @@ _ONE_THOUSAND = Decimal("1000")
 
 
 def _rate_for_model(model: str) -> Decimal:
-    """Return price per 1K characters based on model name."""
-    if "hd" in model.lower():
-        return _DEFAULT_PRICE_PER_1K_HD
-    return _DEFAULT_PRICE_PER_1K_TURBO
+    """Return price per 1K characters based on model name.
+
+    Defaults to the expensive HD rate.  Only uses the cheaper turbo
+    rate when the model name explicitly contains ``turbo``.
+    """
+    if "turbo" in model.lower():
+        return _DEFAULT_PRICE_PER_1K_TURBO
+    return _DEFAULT_PRICE_PER_1K_HD
 
 
 class MinimaxProvider(BaseProvider):
@@ -60,21 +64,12 @@ class MinimaxProvider(BaseProvider):
         Returns:
             Base price in USD.
         """
-        text = inputs.get("text", "")
+        text = require_text(inputs, self.name)
         char_count = len(text)
-
-        if char_count == 0:
-            raise ProviderError(
-                provider=self.name,
-                detail="Request body must contain non-empty 'text' field",
-                status_code=400,
-            )
 
         # model from body, or from URL path (e.g. "speech-2.8-hd") — never empty
         model = inputs.get("model", model_path)
-        # Default to expensive HD rate; turbo rate only if "turbo" explicitly in model name
-        rate = self._price_turbo if "turbo" in model.lower() else self._price_hd
-        # price = character_count / 1000 * rate_per_1k_chars
+        rate = _rate_for_model(model)
         price = Decimal(char_count) / _ONE_THOUSAND * rate
 
         logger.info(
@@ -106,13 +101,7 @@ class MinimaxProvider(BaseProvider):
         Raises:
             ProviderError: On validation failure or API error.
         """
-        text = body.get("text", "")
-        if not text:
-            raise ProviderError(
-                provider=self.name,
-                detail="Request body must contain non-empty 'text' field",
-                status_code=400,
-            )
+        text = require_text(body, self.name)
 
         model = body.get("model", path)
         voice_setting = body.get("voice_setting", {})

@@ -135,12 +135,56 @@ class TestEnvInterpolation:
             del os.environ["TEST_API_KEY"]
 
     def test_missing_env_raises(self, config_with_env: Path):
-        """Missing required env vars raise ValueError."""
+        """Missing required env vars (payment) raise ValueError."""
         # Make sure the variables are NOT set
         os.environ.pop("TEST_PAY_TO", None)
         os.environ.pop("TEST_API_KEY", None)
+        # TEST_PAY_TO is in payment section → strict → ValueError
         with pytest.raises(ValueError, match="required but not set"):
             load_config(config_with_env)
+
+    def test_missing_provider_key_raises(self, config_with_env: Path):
+        """Missing provider API key raises ValueError."""
+        # Set payment vars but leave provider key unset
+        os.environ["TEST_PAY_TO"] = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        os.environ.pop("TEST_API_KEY", None)
+        try:
+            with pytest.raises(ValueError, match="required but not set"):
+                load_config(config_with_env)
+        finally:
+            del os.environ["TEST_PAY_TO"]
+
+    def test_missing_tungsten_cookie_raises(self, tmp_path: Path):
+        """Missing Tungsten auth cookies should still fail fast."""
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("""
+payment:
+  networks:
+    base:
+      type: "evm"
+      network: "eip155:8453"
+      pay_to: "${TEST_PAY_TO}"
+      token_address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+      rpc_url: "https://mainnet.base.org"
+      facilitator_key: "0x0000000000000000000000000000000000000000000000000000000000000001"
+
+providers:
+  tungsten:
+    enabled: true
+    base_url: "https://api.tungsten.run/v1"
+    jwt_token: "${TEST_TUNGSTEN_JWT}"
+    cf_clearance: "${TEST_TUNGSTEN_CF}"
+    fixed_price_usd: 0.01
+""")
+
+        os.environ["TEST_PAY_TO"] = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+        os.environ.pop("TEST_TUNGSTEN_JWT", None)
+        os.environ.pop("TEST_TUNGSTEN_CF", None)
+        try:
+            with pytest.raises(ValueError, match="required but not set"):
+                load_config(config_file)
+        finally:
+            del os.environ["TEST_PAY_TO"]
 
 
 class TestDisabledProvider:
@@ -167,3 +211,31 @@ providers:
 """)
         config = load_config(config_file)
         assert config.providers["wavespeed"].enabled is False
+
+    def test_disabled_provider_does_not_require_missing_env(self, tmp_path: Path):
+        """Disabled providers should not fail on unresolved env placeholders."""
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("""
+payment:
+  networks:
+    base:
+      type: "evm"
+      network: "eip155:8453"
+      pay_to: "0x1234567890abcdef1234567890abcdef12345678"
+      token_address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+      rpc_url: "https://mainnet.base.org"
+      facilitator_key: "0x0000000000000000000000000000000000000000000000000000000000000001"
+
+providers:
+  openrouter:
+    enabled: false
+    base_url: "https://openrouter.ai/api/v1"
+    api_key: "${MISSING_OPENROUTER_API_KEY}"
+""")
+
+        os.environ.pop("MISSING_OPENROUTER_API_KEY", None)
+
+        config = load_config(config_file)
+
+        assert config.providers["openrouter"].enabled is False
+        assert config.providers["openrouter"].api_key == "${MISSING_OPENROUTER_API_KEY}"

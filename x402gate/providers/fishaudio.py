@@ -16,7 +16,7 @@ from typing import Any
 import httpx
 
 from x402gate.core.config import ProviderConfig
-from x402gate.providers.base import BaseProvider, ProviderError
+from x402gate.providers.base import BaseProvider, ProviderError, require_text
 
 logger = logging.getLogger(__name__)
 
@@ -51,13 +51,7 @@ class FishAudioProvider(BaseProvider):
         Returns:
             Base price in USD.
         """
-        text = inputs.get("text", "")
-        if not text:
-            raise ProviderError(
-                provider=self.name,
-                detail="Request body must contain non-empty 'text' field",
-                status_code=400,
-            )
+        text = require_text(inputs, self.name)
 
         utf8_bytes = len(text.encode("utf-8"))
         price = Decimal(utf8_bytes) / _ONE_THOUSAND * self._price_per_1k
@@ -90,13 +84,7 @@ class FishAudioProvider(BaseProvider):
         Raises:
             ProviderError: On validation failure or API error.
         """
-        text = body.get("text", "")
-        if not text:
-            raise ProviderError(
-                provider=self.name,
-                detail="Request body must contain non-empty 'text' field",
-                status_code=400,
-            )
+        text = require_text(body, self.name)
 
         reference_id = body.get("reference_id", "")
         chunk_length = body.get("chunk_length", 200)

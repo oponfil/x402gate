@@ -161,10 +161,6 @@
             color: #3fb950 !important;
         }
 
-        .profit-negative {
-            color: #f85149 !important;
-        }
-
         .color-red {
             color: #f85149 !important;
         }
@@ -411,16 +407,37 @@
             return `<span class="status-dot status-${status}"></span>`;
         }
 
+        const PROVIDER_CATEGORIES = {
+            'LLM': ['openrouter', 'blockrun'],
+            'Image & Video': ['wavespeed', 'tungsten'],
+            'Text-to-Speech': ['elevenlabs', 'minimax', 'fishaudio'],
+            'Utility': ['cloudconvert', 'socialdownload'],
+        };
+
         function renderProviders(providers) {
             const grid = document.getElementById('provider-grid');
-            const names = Object.keys(providers).sort();
-            grid.innerHTML = names.map(name => {
-                const p = providers[name];
-                const type = name === 'topup' ? 'system' : (PROVIDER_TYPES[name] || 'managed');
-                const errHtml = p.last_error && p.status === 'error'
-                    ? `<div class="card-error">${escHtml(p.last_error)}</div>`
-                    : '';
-                return `
+            const allNames = Object.keys(providers);
+
+            // Build categorized output
+            const categorized = {};
+            for (const [cat, members] of Object.entries(PROVIDER_CATEGORIES)) {
+                const found = members.filter(m => allNames.includes(m));
+                if (found.length) categorized[cat] = found;
+            }
+            // Uncategorized providers (e.g. topup, future ones)
+            const known = Object.values(PROVIDER_CATEGORIES).flat();
+            const other = allNames.filter(n => !known.includes(n)).sort();
+            if (other.length) categorized['System'] = other;
+
+            let html = '';
+            for (const [cat, names] of Object.entries(categorized)) {
+                html += names.map(name => {
+                    const p = providers[name];
+                    const type = name === 'topup' ? 'system' : (PROVIDER_TYPES[name] || 'managed');
+                    const errHtml = p.last_error && p.status === 'error'
+                        ? `<div class="card-error">${escHtml(p.last_error)}</div>`
+                        : '';
+                    return `
                     <div class="card">
                         <div class="card-header">
                             <span class="card-name">${statusDot(p.status)} ${escHtml(name)}</span>
@@ -436,7 +453,9 @@
                         </div>
                         ${errHtml}
                     </div>`;
-            }).join('');
+                }).join('');
+            }
+            grid.innerHTML = html;
         }
 
         function renderLogs(logs) {
@@ -559,7 +578,7 @@
                 const profitEl = document.getElementById('sum-profit');
                 profitEl.textContent = '$' + stats.total_profit_usd;
                 const profitNum = parseFloat(stats.total_profit_usd);
-                profitEl.className = profitNum >= 0 ? 'profit-positive' : 'profit-negative';
+                profitEl.className = profitNum >= 0 ? 'profit-positive' : 'color-red';
 
                 document.getElementById('sum-balance').textContent = '$' + stats.total_prepaid_balance_usd;
 

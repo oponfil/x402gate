@@ -112,6 +112,31 @@ class BaseProvider(ABC):
         """Clean up provider resources. Override if needed."""
 
 
+def require_text(inputs: dict[str, Any], provider_name: str) -> str:
+    """Extract and validate non-empty ``text`` from request inputs.
+
+    Shared by all TTS providers to avoid duplicating the same check.
+
+    Args:
+        inputs: Request body / parameters.
+        provider_name: Provider name for error messages.
+
+    Returns:
+        The non-empty text string.
+
+    Raises:
+        ProviderError: If ``text`` is missing or empty.
+    """
+    text = inputs.get("text", "")
+    if not text:
+        raise ProviderError(
+            provider=provider_name,
+            detail="Request body must contain non-empty 'text' field",
+            status_code=400,
+        )
+    return text
+
+
 class ProviderError(Exception):
     """Raised when a provider API call fails."""
 

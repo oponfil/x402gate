@@ -201,6 +201,8 @@ cp .env.example .env
 Edit `.env` with your API keys and wallet addresses. See [`.env.example`](.env.example) for all available variables.
 
 > **Note:** Facilitator wallets need a small balance of native tokens (ETH on Base, SOL on Solana) to pay gas for settlement transactions.
+>
+> **Startup validation:** x402gate validates `${ENV_VAR}` placeholders from active config during boot and exits immediately if any required payment secret or secret for an enabled provider is missing. Disabled providers (`enabled: false`) may keep unresolved placeholders until they are enabled. A broken active config should fail the deploy, not wait until the first user request.
 
 ### 3. Run
 
@@ -226,7 +228,7 @@ curl -X POST https://x402gate.io/v1/{provider}/{model_path} \
 
 ## Configuration
 
-All settings are in `config.yaml`. Secrets use `${ENV_VAR}` interpolation. See [docs/configuration.md](docs/configuration.md) for the full reference.
+All settings are in `config.yaml`. Secrets use `${ENV_VAR}` interpolation, and missing referenced variables in active config fail startup immediately. Disabled providers may keep unresolved placeholders until enabled. See [docs/configuration.md](docs/configuration.md) for the full reference.
 
 > [!IMPORTANT]
 > **Changing a config parameter?** Update in **2 places**:

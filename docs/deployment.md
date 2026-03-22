@@ -29,6 +29,9 @@ x402gate can be deployed using Railway (recommended), Docker, or a traditional V
 
 Set these in the Railway dashboard under **Variables**:
 
+> [!IMPORTANT]
+> x402gate validates every `${ENV_VAR}` referenced by active config during startup. If a payment secret or a secret for an enabled provider is missing, the process exits and the deployment should be considered failed. Disabled providers (`enabled: false`) may keep unresolved placeholders until you turn them on.
+
 | Variable | Required | Description |
 |---|---|---|
 | `WAVESPEED_API_KEY` | Yes | WaveSpeed AI API key |

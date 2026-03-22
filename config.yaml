@@ -42,10 +42,10 @@ providers:
     base_url: "https://openrouter.ai/api/v1"
     api_key: "${OPENROUTER_API_KEY}"
     poll_timeout: 600          # seconds, max wait for LLM response (10 min)
-    description: "300+ LLMs (GPT, Claude, Gemini, Llama…)"
+    description: "300+ LLMs and embedding models (GPT, Claude, Gemini, Llama…)"
     docs_url: "https://openrouter.ai/docs"
     example_request:
-      model: "google/gemini-2.5-flash"
+      model: "chat/completions"
       body:
         model: "google/gemini-2.5-flash"
         messages:
@@ -55,7 +55,7 @@ providers:
         reasoning:
           effort: "low"
     example_request_2:
-      model: "qwen/qwen3.5-plus-02-15"
+      model: "chat/completions"
       body:
         model: "qwen/qwen3.5-plus-02-15"
         messages:
@@ -65,6 +65,11 @@ providers:
         plugins:
           - id: "web"
             max_results: 1
+    example_request_3:
+      model: "embeddings"
+      body:
+        model: "openai/text-embedding-3-small"
+        input: "Artificial intelligence is transforming the world."
   wavespeed:
     enabled: true
     base_url: "https://api.wavespeed.ai/api/v3"
@@ -223,7 +228,7 @@ providers:
     api_key: "${MINIMAX_API_KEY}"
     poll_timeout: 600
     description: "High-quality TTS with emotional expression (MiniMax Speech 2.8 HD)"
-    docs_url: "https://www.minimaxi.com/document/T2A%20V2"
+    docs_url: "https://platform.minimaxi.com/docs/guides/models-intro"
     pricing:
       per_1k_chars_turbo: 0.06   # $/1k chars for turbo models
       per_1k_chars_hd: 0.10      # $/1k chars for HD models
@@ -250,7 +255,7 @@ providers:
     api_key: "${FISHAUDIO_API_KEY}"
     poll_timeout: 600
     description: "Uncensored TTS with voice cloning (Fish Audio S2 Pro)"
-    docs_url: "https://fish.audio/docs"
+    docs_url: "https://fish.audio/developers/"
     pricing:
       per_1k_bytes: 0.015  # $/1k UTF-8 bytes
     example_request:

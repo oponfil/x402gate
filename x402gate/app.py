@@ -223,12 +223,25 @@ async def service_info(request: Request) -> Response:
     provider_info: list[dict[str, Any]] = []
     examples: list[dict[str, Any]] = []
 
+    provider_categories = {
+        "openrouter": "LLM",
+        "blockrun": "LLM",
+        "wavespeed": "Image & Video",
+        "tungsten": "Image & Video",
+        "elevenlabs": "Text-to-Speech",
+        "minimax": "Text-to-Speech",
+        "fishaudio": "Text-to-Speech",
+        "cloudconvert": "Utility",
+        "socialdownload": "Utility",
+    }
+
     for name, pcfg in config.providers.items():
         ptype = getattr(pcfg, "type", "managed") or "managed"
         provider_info.append(
             {
                 "name": name,
                 "type": ptype,
+                "category": provider_categories.get(name, "System"),
                 "description": pcfg.description or "",
                 "docs_url": pcfg.docs_url or "",
             }

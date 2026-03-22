@@ -2,6 +2,9 @@
 
 x402gate is configured via `config.yaml` in the project root. Secrets are stored in `.env` and interpolated using `${VAR}` syntax.
 
+> [!IMPORTANT]
+> Startup is strict for active config sections: if `config.yaml` references `${VAR}` for payment settings or an enabled provider and that environment variable is missing, x402gate raises `ValueError` during boot and does not start. This is intentional so misconfigured deployments fail fast instead of exposing providers that would only break on the first request. Disabled providers (`enabled: false`) are still parsed, but their unresolved secrets are ignored until the provider is enabled again.
+
 ## config.yaml Reference
 
 ### `gateway`
@@ -52,7 +55,7 @@ Each provider is a key under `providers`:
 | `type` | string | `"managed"` | `"managed"` = full x402 flow, `"passthrough"` = transparent proxy |
 | `enabled` | bool | `true` | Whether this provider is active |
 | `base_url` | string | — | **Required.** Provider API base URL |
-| `api_key` | string | `""` | Provider API key (use `${ENV_VAR}` syntax) |
+| `api_key` | string | `""` | Provider API key (use `${ENV_VAR}` syntax; if the provider is enabled, the env var must exist at startup) |
 | `fixed_price_usd` | float | `0.0` | Fixed price per request in USD (when provider has no pricing API) |
 | `description` | string | `""` | Short description shown on the landing page |
 | `poll_interval` | int | `2` | Seconds between async task status polls |
@@ -66,6 +69,8 @@ Each provider is a key under `providers`:
 ## Environment Variables
 
 Store secrets in `.env` (see `.env.example`):
+
+Every variable referenced from active config is validated at startup. If you leave out `OPENROUTER_API_KEY`, `CLOUDCONVERT_API_KEY`, wallet keys, or any other secret referenced by payment settings or an enabled provider, the process exits immediately with a configuration error. Disabled providers may keep unresolved `${ENV_VAR}` placeholders until you enable them.
 
 | Variable | Required | Description |
 |---|---|---|

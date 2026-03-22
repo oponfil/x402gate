@@ -283,14 +283,20 @@ class CloudConvertProvider(BaseProvider):
 
                         if status == "error":
                             error_msg = self._extract_error(job)
+                            fmt_info = self._extract_formats(job)
                             logger.error(
-                                "CloudConvert job %s failed: %s",
+                                "CloudConvert job %s failed%s: %s",
                                 task_id,
+                                f" ({fmt_info})" if fmt_info else "",
                                 error_msg,
                             )
                             raise ProviderError(
                                 provider=self.name,
-                                detail=f"Conversion failed: {error_msg}",
+                                detail=(
+                                    f"Conversion failed ({fmt_info}): {error_msg}"
+                                    if fmt_info
+                                    else f"Conversion failed: {error_msg}"
+                                ),
                                 status_code=502,
                             )
 
@@ -339,6 +345,19 @@ class CloudConvertProvider(BaseProvider):
             detail="No export files found in finished job",
             status_code=502,
         )
+
+    @staticmethod
+    def _extract_formats(job: dict[str, Any]) -> str:
+        """Extract 'input→output' format string from a job's process-file task."""
+        for task in job.get("tasks", []):
+            if task.get("name") == "process-file":
+                inp = task.get("input_format") or task.get("result", {}).get("input", {}).get(
+                    "ext", ""
+                )
+                out = task.get("output_format", "")
+                if inp or out:
+                    return f"{inp or '?'}→{out or '?'}"
+        return ""
 
     @staticmethod
     def _extract_error(job: dict[str, Any]) -> str:

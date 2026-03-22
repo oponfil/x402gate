@@ -16,7 +16,7 @@ from typing import Any
 import httpx
 
 from x402gate.core.config import ProviderConfig
-from x402gate.providers.base import BaseProvider, ProviderError
+from x402gate.providers.base import BaseProvider, ProviderError, require_text
 
 logger = logging.getLogger(__name__)
 
@@ -59,15 +59,8 @@ class ElevenLabsProvider(BaseProvider):
         Returns:
             Base price in USD.
         """
-        text = inputs.get("text", "")
+        text = require_text(inputs, self.name)
         char_count = len(text)
-
-        if char_count == 0:
-            raise ProviderError(
-                provider=self.name,
-                detail="Request body must contain non-empty 'text' field",
-                status_code=400,
-            )
 
         model_id = inputs.get("model_id", "")
         # Default to expensive standard rate; turbo rate only if "turbo"/"flash" in model name
@@ -104,13 +97,7 @@ class ElevenLabsProvider(BaseProvider):
         Raises:
             ProviderError: On validation failure or API error.
         """
-        text = body.get("text", "")
-        if not text:
-            raise ProviderError(
-                provider=self.name,
-                detail="Request body must contain non-empty 'text' field",
-                status_code=400,
-            )
+        text = require_text(body, self.name)
 
         # voice_id comes from the URL path
         voice_id = path

@@ -44,9 +44,9 @@ class TestRateForModel:
     def test_hd_in_name(self):
         assert _rate_for_model("speech-2.8-hd") == Decimal("0.10")
 
-    def test_default_is_turbo(self):
-        """Unknown model defaults to turbo pricing."""
-        assert _rate_for_model("speech-02") == Decimal("0.06")
+    def test_default_is_hd(self):
+        """Unknown model defaults to HD (expensive) pricing."""
+        assert _rate_for_model("speech-02") == Decimal("0.10")
 
 
 # ---------------------------------------------------------------------------

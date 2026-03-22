@@ -211,5 +211,6 @@ curl -X POST https://x402gate.io/v1/fishaudio/tts \
 
 - All providers are **synchronous** — audio is returned directly, no polling needed.
 - Audio is returned as **base64** inside a JSON response (`{"data": {"audio_base64": "..."}}`).
+- **Pricing safety:** if `model_id` (ElevenLabs) or `model` (MiniMax) is omitted or unrecognized, the **most expensive** tier is used for pricing. Always specify the model explicitly to get the cheaper rate.
 - Maximum text length depends on the provider's API limits (typically 5000+ characters).
 - Voice cloning is supported by Fish Audio via `reference_id` and by ElevenLabs via custom `voice_id`.

@@ -52,6 +52,26 @@ def model_info_response():
 
 
 @pytest.fixture
+def embedding_model_info_response():
+    """Mock response from GET /api/v1/models?output_modalities=embeddings."""
+    return httpx.Response(
+        status_code=200,
+        json={
+            "data": [
+                {
+                    "id": "openai/text-embedding-3-small",
+                    "name": "OpenAI: text-embedding-3-small",
+                    "pricing": {
+                        "prompt": "0.00000002",
+                        "completion": "0",
+                    },
+                }
+            ],
+        },
+    )
+
+
+@pytest.fixture
 def chat_completion_response():
     """Mock response from POST /api/v1/chat/completions."""
     return httpx.Response(
@@ -137,9 +157,29 @@ class TestGetPrice:
             price1 = await provider.get_price("chat/completions", body)
             price2 = await provider.get_price("chat/completions", body)
 
-        # Only one API call should have been made
-        mock_get.assert_called_once()
+        # Two API calls on first access (chat + embedding catalogs),
+        # but second get_price should use cache (no extra calls)
+        assert mock_get.call_count == 2
         assert price1 == price2
+
+    @pytest.mark.asyncio
+    async def test_fetches_embedding_catalog_with_output_modalities(
+        self, provider, model_info_response, embedding_model_info_response
+    ):
+        """Embedding lookup should query the dedicated embeddings catalog."""
+        body = {
+            "model": "openai/text-embedding-3-small",
+            "input": "hello world",
+        }
+
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.side_effect = [model_info_response, embedding_model_info_response]
+            price = await provider.get_price("embeddings", body)
+
+        assert price == Decimal("0.000001")
+        assert mock_get.call_count == 2
+        assert mock_get.call_args_list[0].args[0].endswith("/models")
+        assert mock_get.call_args_list[1].args[0].endswith("/models?output_modalities=embeddings")
 
     @pytest.mark.asyncio
     async def test_model_not_found(self, provider):
