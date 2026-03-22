@@ -32,6 +32,9 @@ htmlcov/
 .coverage
 tests/e2e/output/
 
-# Agent workflows (local only)
+# Agent config (local only)
 .agent/
-.agents/
+.agents/*
+!.agents/skills/
+!.agents/skills/x402gate/
+!.agents/skills/x402gate/SKILL.md

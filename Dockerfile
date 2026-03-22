@@ -13,6 +13,7 @@ COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/pytho
 COPY --from=builder /usr/local/bin /usr/local/bin
 
 COPY config.yaml .
+COPY .agents/skills/ .agents/skills/
 COPY x402gate/ x402gate/
 
 EXPOSE 4021

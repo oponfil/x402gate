@@ -280,6 +280,7 @@ See [docs/add-provider.md](docs/add-provider.md) for a step-by-step guide.
 - [Tungsten](docs/tungsten.md) — Tungsten image generation provider
 - [SocialDownload](docs/socialdownload.md) — download media from social networks
 - [Adding a Provider](docs/add-provider.md) — extend with new AI services
+- [AI Agent Skill](.agents/skills/x402gate/SKILL.md) — public skill for autonomous agents to use `x402gate.io` (OpenClaw, etc.)
 
 
 ## Contributing

@@ -313,6 +313,7 @@ async def service_info(request: Request) -> Response:
             "topup": f"{base_url}/v1/topup",
             "balance": f"{base_url}/v1/balance/{{wallet_address}}",
             "ai_plugin": f"{base_url}/.well-known/ai-plugin.json",
+            "skill": f"{base_url}/skill",
         },
     }
 
@@ -403,6 +404,17 @@ async def ai_plugin_manifest() -> dict[str, Any]:
 async def health_check() -> dict[str, str]:
     """Health check endpoint for deployment monitoring."""
     return {"status": "ok"}
+
+
+@app.get("/skill", include_in_schema=False)
+async def agent_skill() -> Response:
+    """Serve the SKILL.md file for autonomous AI agents."""
+    skill_path = (
+        pathlib.Path(__file__).parent.parent / ".agents" / "skills" / "x402gate" / "SKILL.md"
+    )
+    if not skill_path.exists():
+        return JSONResponse(status_code=404, content={"error": "SKILL.md not found"})
+    return Response(content=skill_path.read_text(encoding="utf-8"), media_type="text/markdown")
 
 
 # --- Dashboard ---
