@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from decimal import Decimal
 from typing import Any
 
@@ -46,6 +47,8 @@ class OpenRouterProvider(BaseProvider):
     ) -> None:
         super().__init__(name="openrouter", config=config)
         self._models_cache: dict[str, dict[str, Any]] = {}
+        self._cache_updated_at: float = 0.0
+        self._cache_ttl: float = float(config.models_cache_ttl)
         self._default_max_tokens = default_max_tokens
         self._web_search_tokens_per_result = web_search_tokens_per_result
         self._default_web_search_max_results = default_web_search_max_results
@@ -66,6 +69,13 @@ class OpenRouterProvider(BaseProvider):
         Raises:
             ProviderError: If the model is not found or the API call fails.
         """
+        current_time = time.time()
+
+        # Invalidate cache if TTL expired
+        if self._models_cache and (current_time - self._cache_updated_at > self._cache_ttl):
+            logger.info("OpenRouter models cache expired (1 day TTL), clearing...")
+            self._models_cache.clear()
+
         if model_id in self._models_cache:
             return self._models_cache[model_id]
 
@@ -76,6 +86,7 @@ class OpenRouterProvider(BaseProvider):
         if not self._models_cache:
             await self._fetch_models_list()
             await self._fetch_models_list(output_modalities="embeddings")
+            self._cache_updated_at = time.time()
 
         if model_id not in self._models_cache:
             raise ProviderError(
@@ -91,40 +102,84 @@ class OpenRouterProvider(BaseProvider):
         url = f"{self._config.base_url.rstrip('/')}/models"
         if output_modalities:
             url += f"?output_modalities={output_modalities}"
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.get(url)
 
-            if resp.status_code >= 400:
-                raise ProviderError(
-                    provider=self.name,
-                    detail=f"OpenRouter Models API error: {resp.text}",
-                    status_code=resp.status_code,
+        max_retries = 2
+        retry_delay = 2.0
+        last_error: Exception | None = None
+
+        for attempt in range(1 + max_retries):
+            try:
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    resp = await client.get(url)
+
+                if resp.status_code >= 500 and attempt < max_retries:
+                    delay = retry_delay * (2**attempt)
+                    logger.warning(
+                        "OpenRouter Models API returned %d (attempt %d/%d), retrying in %.1fs",
+                        resp.status_code,
+                        attempt + 1,
+                        1 + max_retries,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+
+                if resp.status_code >= 400:
+                    raise ProviderError(
+                        provider=self.name,
+                        detail=f"OpenRouter Models API error: {resp.text}",
+                        status_code=resp.status_code,
+                    )
+
+                models_list = resp.json().get("data", [])
+                count = 0
+                for model in models_list:
+                    mid = model.get("id", "")
+                    if mid:
+                        self._models_cache[mid] = model
+                        count += 1
+                label = f" ({output_modalities})" if output_modalities else ""
+                logger.info(
+                    "Cached %d models from OpenRouter%s (total: %d)",
+                    count,
+                    label,
+                    len(self._models_cache),
                 )
+                return
 
-            models_list = resp.json().get("data", [])
-            count = 0
-            for model in models_list:
-                mid = model.get("id", "")
-                if mid and mid not in self._models_cache:
-                    self._models_cache[mid] = model
-                    count += 1
-            label = f" ({output_modalities})" if output_modalities else ""
-            logger.info(
-                "Cached %d models from OpenRouter%s (total: %d)",
-                count,
-                label,
-                len(self._models_cache),
-            )
+            except ProviderError:
+                raise
+            except httpx.TimeoutException as e:
+                last_error = e
+                if attempt < max_retries:
+                    delay = retry_delay * (2**attempt)
+                    logger.warning(
+                        "OpenRouter Models API timeout (attempt %d/%d), retrying in %.1fs",
+                        attempt + 1,
+                        1 + max_retries,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries:
+                    delay = retry_delay * (2**attempt)
+                    logger.warning(
+                        "OpenRouter Models API error: %s (attempt %d/%d), retrying in %.1fs",
+                        e,
+                        attempt + 1,
+                        1 + max_retries,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
 
-        except ProviderError:
-            raise
-        except Exception as e:
-            raise ProviderError(
-                provider=self.name,
-                detail=f"Failed to fetch models list: {e}",
-                status_code=503,
-            ) from e
+        raise ProviderError(
+            provider=self.name,
+            detail=f"Failed to fetch models list after retries: {last_error}",
+            status_code=503,
+        ) from last_error
 
     async def get_price(self, model_path: str, inputs: dict[str, Any]) -> Decimal:
         """Estimate maximum request cost from per-token pricing.

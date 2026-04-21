@@ -42,6 +42,7 @@ providers:
     base_url: "https://openrouter.ai/api/v1"
     api_key: "${OPENROUTER_API_KEY}"
     poll_timeout: 600          # seconds, max wait for LLM response (10 min)
+    models_cache_ttl: 86400    # seconds, how long to cache the list of models (1 day)
     description: "300+ LLMs and embedding models (GPT, Claude, Gemini, Llama…)"
     docs_url: "https://openrouter.ai/docs"
     example_request:

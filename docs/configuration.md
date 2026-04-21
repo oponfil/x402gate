@@ -63,6 +63,7 @@ Each provider is a key under `providers`:
 | `docs_url` | string | `""` | Link to provider API documentation |
 | `example_request` | dict | `{}` | Example request for the landing page (`{model, body}`) |
 | `example_request_2` | dict | `{}` | Second example request (e.g. video model) |
+| `models_cache_ttl` | int | `86400` | Seconds to cache the list of models (for providers that fetch it dynamically) |
 | `jwt_token` | string | `""` | JWT token for cookie-based auth (Tungsten only) |
 | `cf_clearance` | string | `""` | Cloudflare clearance cookie (Tungsten only) |
 

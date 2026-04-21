@@ -126,6 +126,7 @@ class ProviderConfig(BaseModel):
     cf_clearance: str = ""
     fixed_price_usd: float = 0.0  # Fixed price per request (when provider has no pricing API)
     pricing: dict[str, Any] = {}  # Per-model pricing tiers (e.g. TTS providers)
+    models_cache_ttl: int = 86400  # Cache TTL for models list (seconds)
 
 
 class AppConfig(BaseModel):
