@@ -61,9 +61,10 @@ Client → POST /v1/wavespeed/{model} + PAYMENT-SIGNATURE header
 | **Prepaid** | `x402gate/core/prepaid.py` | In-memory prepaid balances, wallet signature verification |
 | **Stats** | `x402gate/core/stats.py` | Dashboard statistics, log capture, revenue tracking |
 | **Proxy** | `x402gate/core/proxy.py` | Forward requests, poll async tasks |
+| **Audio Duration** | `x402gate/core/audio_duration.py` | Parse audio file duration for STT pricing |
 | **Provider Base** | `x402gate/providers/base.py` | Abstract provider interface |
 | **WaveSpeed** | `x402gate/providers/wavespeed.py` | WaveSpeed AI (60+ image/video models) |
-| **OpenRouter** | `x402gate/providers/openrouter.py` | OpenRouter LLM aggregator (300+ models) |
+| **OpenRouter** | `x402gate/providers/openrouter.py` | OpenRouter aggregator (LLM, embeddings, STT) |
 | **Tungsten** | `x402gate/providers/tungsten.py` | Tungsten image generation (SDXL, Flux, etc.) |
 | **CloudConvert** | `x402gate/providers/cloudconvert.py` | File conversion (200+ formats, multipart upload) |
 | **SocialDownload** | `x402gate/providers/socialdownload.py` | Social media download via RapidAPI |
@@ -98,9 +99,11 @@ The standard `PaymentMiddlewareASGI` from the x402 library requires static route
 
 ### Actual Cost Tracking
 
-For token-based providers (OpenRouter), the gateway tracks both estimated and actual costs:
+For token-based providers (OpenRouter chat/embeddings), the gateway tracks both estimated and actual costs:
 
 - **Estimated cost** — ceiling calculated upfront from `max_tokens × completion_price + input_tokens × prompt_price`
 - **Actual cost** — computed after response from real `usage.prompt_tokens` and `usage.completion_tokens`
+
+For OpenRouter STT (`audio/transcriptions`), the gateway supports duration-priced Whisper models. It parses audio length before payment, and uses `usage.cost` from OpenRouter for actual billing when available. See [stt.md](stt.md).
 
 The x402 `exact` scheme requires settling the full signed amount, so the client always pays the ceiling price. Actual cost is used only for financial reporting in the Transaction Summary. When x402 adds a `deferred` scheme (settle ≤ signed amount), the gateway is ready to use actual cost for settlement.

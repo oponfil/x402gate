@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
+from tests.helpers import make_wav_b64
 from x402gate.core.config import ProviderConfig
 from x402gate.providers.base import ProviderError
 from x402gate.providers.openrouter import OpenRouterProvider
@@ -66,6 +67,34 @@ def embedding_model_info_response():
                         "completion": "0",
                     },
                 }
+            ],
+        },
+    )
+
+
+@pytest.fixture
+def transcription_model_info_response():
+    """Mock response from GET /api/v1/models?output_modalities=transcription."""
+    return httpx.Response(
+        status_code=200,
+        json={
+            "data": [
+                {
+                    "id": "openai/whisper-1",
+                    "name": "OpenAI: Whisper 1",
+                    "pricing": {
+                        "prompt": "0.006",
+                        "completion": "0",
+                    },
+                },
+                {
+                    "id": "openai/gpt-4o-mini-transcribe",
+                    "name": "OpenAI: GPT-4o Mini Transcribe",
+                    "pricing": {
+                        "prompt": "0.00000125",
+                        "completion": "0.000005",
+                    },
+                },
             ],
         },
     )
@@ -157,14 +186,12 @@ class TestGetPrice:
             price1 = await provider.get_price("chat/completions", body)
             price2 = await provider.get_price("chat/completions", body)
 
-        # Two API calls on first access (chat + embedding catalogs),
-        # but second get_price should use cache (no extra calls)
-        assert mock_get.call_count == 2
+        assert mock_get.call_count == 1
         assert price1 == price2
 
     @pytest.mark.asyncio
     async def test_fetches_embedding_catalog_with_output_modalities(
-        self, provider, model_info_response, embedding_model_info_response
+        self, provider, embedding_model_info_response
     ):
         """Embedding lookup should query the dedicated embeddings catalog."""
         body = {
@@ -173,13 +200,61 @@ class TestGetPrice:
         }
 
         with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
-            mock_get.side_effect = [model_info_response, embedding_model_info_response]
+            mock_get.return_value = embedding_model_info_response
             price = await provider.get_price("embeddings", body)
 
         assert price == Decimal("0.000001")
-        assert mock_get.call_count == 2
-        assert mock_get.call_args_list[0].args[0].endswith("/models")
-        assert mock_get.call_args_list[1].args[0].endswith("/models?output_modalities=embeddings")
+        assert mock_get.call_count == 1
+        assert mock_get.call_args_list[0].args[0].endswith("/models?output_modalities=embeddings")
+
+    @pytest.mark.asyncio
+    async def test_stt_whisper_price_duration_based(
+        self, provider, transcription_model_info_response
+    ):
+        """Whisper STT should price by audio duration (USD per minute)."""
+        body = {
+            "model": "openai/whisper-1",
+            "input_audio": {
+                "data": make_wav_b64(1.0),
+                "format": "wav",
+            },
+        }
+
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = transcription_model_info_response
+            price = await provider.get_price("audio/transcriptions", body)
+
+        # 1 billing second -> 1/60 minute * $0.006/min
+        assert price == Decimal("1") / Decimal("60") * Decimal("0.006")
+        assert (
+            mock_get.call_args_list[0].args[0].endswith("/models?output_modalities=transcription")
+        )
+
+    @pytest.mark.asyncio
+    async def test_stt_token_model_rejected(self, provider, transcription_model_info_response):
+        """Token-based STT models cannot be safely priced before payment."""
+        body = {
+            "model": "openai/gpt-4o-mini-transcribe",
+            "input_audio": {
+                "data": make_wav_b64(1.0),
+                "format": "wav",
+            },
+        }
+
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = transcription_model_info_response
+            with pytest.raises(ProviderError, match="Token-based STT model"):
+                await provider.get_price("audio/transcriptions", body)
+
+    @pytest.mark.asyncio
+    async def test_stt_missing_audio_raises(self, provider, transcription_model_info_response):
+        """STT requests without input_audio should fail fast."""
+        body = {"model": "openai/whisper-1"}
+
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = transcription_model_info_response
+            with pytest.raises(ProviderError, match="Missing input_audio"):
+                await provider.get_price("audio/transcriptions", body)
 
     @pytest.mark.asyncio
     async def test_model_not_found(self, provider):
@@ -299,9 +374,34 @@ class TestSubmit:
             mock_post.return_value = chat_completion_response
             await provider.submit("chat/completions", body)
 
-        # Should have injected max_tokens=1024
         sent_body = mock_post.call_args.kwargs["json"]
         assert sent_body["max_tokens"] == 1024
+
+    @pytest.mark.asyncio
+    async def test_stt_submit_strips_internal_keys(self, provider):
+        """STT submit should forward clean JSON without gateway-internal keys."""
+        body = {
+            "model": "openai/whisper-1",
+            "input_audio": {"data": make_wav_b64(0.1), "format": "wav"},
+            "_caller": "test-wallet",
+        }
+        stt_response = httpx.Response(
+            status_code=200,
+            json={
+                "text": "hello",
+                "usage": {"seconds": 1.0, "cost": 0.0001},
+            },
+        )
+
+        with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = stt_response
+            result = await provider.submit("audio/transcriptions", body)
+
+        assert result["text"] == "hello"
+        sent_body = mock_post.call_args.kwargs["json"]
+        assert "_caller" not in sent_body
+        assert "audio/transcriptions" in mock_post.call_args.args[0]
+        assert "max_tokens" not in sent_body
 
 
 class TestGetResult:
@@ -354,3 +454,47 @@ class TestCalculateActualCost:
 
         cost = await provider.calculate_actual_cost(body, result)
         assert cost is None
+
+    @pytest.mark.asyncio
+    async def test_stt_uses_reported_cost(self, provider):
+        """STT responses should prefer usage.cost from OpenRouter."""
+        body = {"model": "openai/whisper-1"}
+        result = {"text": "hi", "usage": {"seconds": 2.0, "cost": 0.0002}}
+
+        cost = await provider.calculate_actual_cost(body, result)
+        assert cost == Decimal("0.0002")
+
+    @pytest.mark.asyncio
+    async def test_chat_ignores_usage_cost(self, provider, model_info_response):
+        """Chat responses should use token counts even when usage.cost is present."""
+        body = {"model": "openai/gpt-4o-mini"}
+        result = {
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 50,
+                "total_tokens": 60,
+                "cost": 0.999,
+            },
+        }
+
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = model_info_response
+            cost = await provider.calculate_actual_cost(body, result)
+
+        expected = Decimal(10) * Decimal("0.00000015") + Decimal(50) * Decimal("0.0000006")
+        assert cost == expected
+
+    @pytest.mark.asyncio
+    async def test_stt_duration_fallback_without_cost(
+        self, provider, transcription_model_info_response
+    ):
+        """STT duration models should fall back to seconds-based pricing."""
+        body = {"model": "openai/whisper-1"}
+        result = {"text": "hi", "usage": {"seconds": 60.0}}
+
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = transcription_model_info_response
+            cost = await provider.calculate_actual_cost(body, result)
+
+        assert cost == Decimal("0.006")

@@ -1,6 +1,6 @@
 ---
 name: x402gate-api
-description: Access x402gate.io to use paid AI and utility APIs over x402/USDC without provider API keys. Use when you need LLMs, image or video generation, TTS, file conversion, social media download, prepaid balance requests, or provider request examples.
+description: Access x402gate.io to use paid AI and utility APIs over x402/USDC without provider API keys. Use when you need LLMs, image or video generation, TTS, STT, file conversion, social media download, prepaid balance requests, or provider request examples.
 metadata: {"openclaw":{"emoji":"$","homepage":"https://x402gate.io","os":["linux","darwin","win32"]}}
 ---
 
@@ -15,7 +15,7 @@ This skill intentionally points agents to the hosted `x402gate.io` service. If t
 - Accessing paid AI APIs without managing provider-specific API keys
 - Discovering supported providers, pricing, and example request bodies
 - Making repeated prepaid requests with Base or Solana USDC
-- Using one gateway for LLMs, image/video generation, TTS, file conversion, and social media download
+- Using one gateway for LLMs, image/video generation, TTS, STT, file conversion, and social media download
 
 ## Quick Start
 
@@ -26,7 +26,7 @@ curl -H "Accept: application/json" https://x402gate.io/
 ```
 
 ## 1. Capabilities & Supported Providers
-1. **LLMs:** OpenRouter (300+ models, web search), BlockRun.
+1. **LLMs:** OpenRouter (300+ models, web search, embeddings, STT/Whisper), BlockRun.
 2. **Image & Video:** WaveSpeed (60+ models like Flux, Sora), Tungsten (SDXL with LoRA).
 3. **TTS:** ElevenLabs (premium), MiniMax (emotional), Fish Audio (uncensored).
 4. **Utilities:** CloudConvert (file conversion), SocialDownload (YouTube/TikTok).
@@ -54,13 +54,14 @@ For prepaid signing details, top-up flow, and full Python examples, see `docs/pr
 If you need deep technical details on specific features:
 - **Main Readme:** [github.com/oponfil/x402gate](https://github.com/oponfil/x402gate)
 - **Prepaid Mode (Detailed API):** [docs/prepaid.md](https://github.com/oponfil/x402gate/blob/main/docs/prepaid.md)
+- **Speech-to-Text (Whisper):** [docs/stt.md](https://github.com/oponfil/x402gate/blob/main/docs/stt.md)
 - **Adding Providers / Architecture:** [docs/architecture.md](https://github.com/oponfil/x402gate/blob/main/docs/architecture.md)
 - **x402 Protocol Specification:** [x402.org](https://x402.org)
 
 ## 5. Key Agent Rules
 - **Pay on success**: If the provider fails (HTTP 5xx), the payment signature is never collected. Do not hesitate to use the API.
 - **Do not invent endpoints**: Always refer to the discovery manifest (`GET /`).
-- **File Uploads**: For `cloudconvert`, use standard `multipart/form-data`.
+- **File Uploads**: For `cloudconvert`, use standard `multipart/form-data`. For OpenRouter STT, send JSON with base64-encoded audio in `input_audio.data`.
 
 ## Tips
 

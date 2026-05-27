@@ -16,12 +16,14 @@ import respx
 from fastapi.testclient import TestClient
 from solders.keypair import Keypair
 
+from tests.helpers import make_wav_b64
 from x402gate.app import app
 from x402gate.core.config import load_config as real_load
 from x402gate.core.prepaid import deposit, get_balance, reset
 
 # Set env vars before importing the app
 os.environ.setdefault("WAVESPEED_API_KEY", "test-key-12345")
+os.environ.setdefault("OPENROUTER_API_KEY", "test-openrouter-key")
 os.environ.setdefault("BASE_PAY_TO_ADDRESS", "0x1234567890abcdef1234567890abcdef12345678")
 os.environ.setdefault("CLOUDCONVERT_API_KEY", "test-cc-key")
 
@@ -70,6 +72,13 @@ providers:
     fixed_price_usd: 0.03
     poll_interval: 0
     poll_timeout: 10
+  openrouter:
+    enabled: true
+    base_url: "https://openrouter.ai/api/v1"
+    api_key: "test-openrouter-key"
+    poll_timeout: 10
+    models_cache_ttl: 86400
+    max_stt_audio_mb: 25
 """)
     return config
 
@@ -373,6 +382,83 @@ class TestPrepaidFlow:
         )
 
         assert response.status_code == 401
+        reset()
+
+
+class TestOpenRouterSTT:
+    """Integration tests for OpenRouter speech-to-text."""
+
+    _STT_BODY = {
+        "model": "openai/whisper-1",
+        "input_audio": {"data": make_wav_b64(1.0), "format": "wav"},
+    }
+
+    _TRANSCRIPTION_CATALOG = {
+        "data": [
+            {
+                "id": "openai/whisper-1",
+                "pricing": {"prompt": "0.006", "completion": "0"},
+            }
+        ]
+    }
+
+    def _mock_transcription_catalog(self) -> None:
+        respx.get(
+            "https://openrouter.ai/api/v1/models",
+            params={"output_modalities": "transcription"},
+        ).mock(return_value=httpx.Response(200, json=self._TRANSCRIPTION_CATALOG))
+
+    @respx.mock
+    def test_stt_without_payment_returns_402(self, client):
+        """POST STT without payment returns 402 with price."""
+        self._mock_transcription_catalog()
+
+        response = client.post(
+            "/v1/openrouter/audio/transcriptions",
+            json=self._STT_BODY,
+        )
+
+        assert response.status_code == 402
+        body = response.json()
+        assert "accepts" in body
+        assert body["accepts"][0]["scheme"] == "exact"
+        assert body["accepts"][0]["price"].startswith("$")
+
+    @respx.mock
+    def test_stt_prepaid_success(self, client):
+        """POST STT with prepaid headers returns transcription and deducts balance."""
+        reset()
+        kp = Keypair()
+        pubkey_str = str(kp.pubkey())
+        asyncio.get_event_loop().run_until_complete(deposit(pubkey_str, Decimal("1.00")))
+
+        self._mock_transcription_catalog()
+        respx.post("https://openrouter.ai/api/v1/audio/transcriptions").mock(
+            return_value=httpx.Response(
+                200,
+                json={"text": "hello", "usage": {"seconds": 1.0, "cost": 0.0001}},
+            )
+        )
+
+        ts = int(time.time())
+        msg = f"x402gate:openrouter/audio/transcriptions:{ts}".encode()
+        sig = kp.sign_message(msg)
+
+        response = client.post(
+            "/v1/openrouter/audio/transcriptions",
+            json=self._STT_BODY,
+            headers={
+                "X-PREPAID-PUBKEY": pubkey_str,
+                "X-PREPAID-SIGNATURE": str(sig),
+                "X-PREPAID-TIMESTAMP": str(ts),
+            },
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        data = payload.get("data", payload)
+        assert data["text"] == "hello"
+        assert get_balance(pubkey_str) < Decimal("1.00")
         reset()
 
 

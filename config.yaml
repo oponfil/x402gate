@@ -43,7 +43,8 @@ providers:
     api_key: "${OPENROUTER_API_KEY}"
     poll_timeout: 600          # seconds, max wait for LLM response (10 min)
     models_cache_ttl: 86400    # seconds, how long to cache the list of models (1 day)
-    description: "300+ LLMs and embedding models (GPT, Claude, Gemini, Llama…)"
+    max_stt_audio_mb: 25       # max STT audio upload in MB (OpenRouter Whisper limit)
+    description: "300+ LLMs, embeddings, and STT (GPT, Claude, Gemini, Whisper…)"
     docs_url: "https://openrouter.ai/docs"
     example_request:
       model: "chat/completions"
@@ -71,6 +72,14 @@ providers:
       body:
         model: "openai/text-embedding-3-small"
         input: "Artificial intelligence is transforming the world."
+    example_request_4:
+      model: "audio/transcriptions"
+      body:
+        model: "openai/whisper-1"
+        input_audio:
+          data: "UklGRiYAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQIAAAAAAA=="
+          format: "wav"
+
   wavespeed:
     enabled: true
     base_url: "https://api.wavespeed.ai/api/v3"
