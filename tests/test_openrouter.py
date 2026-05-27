@@ -257,6 +257,31 @@ class TestGetPrice:
                 await provider.get_price("audio/transcriptions", body)
 
     @pytest.mark.asyncio
+    async def test_stt_oversized_audio_raises(self, transcription_model_info_response):
+        """STT audio exceeding max_stt_audio_mb should return 413."""
+        config = ProviderConfig(
+            enabled=True,
+            base_url="https://openrouter.ai/api/v1",
+            api_key="test-key-123",
+            max_stt_audio_mb=0,
+        )
+        small_provider = OpenRouterProvider(config=config)
+        body = {
+            "model": "openai/whisper-1",
+            "input_audio": {
+                "data": make_wav_b64(0.1),
+                "format": "wav",
+            },
+        }
+
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = transcription_model_info_response
+            with pytest.raises(ProviderError, match="too large") as exc_info:
+                await small_provider.get_price("audio/transcriptions", body)
+
+        assert exc_info.value.status_code == 413
+
+    @pytest.mark.asyncio
     async def test_model_not_found(self, provider):
         """Should raise ProviderError for unknown model."""
         body = {

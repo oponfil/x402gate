@@ -121,6 +121,7 @@ class ProviderConfig(BaseModel):
     example_request: dict[str, Any] = {}  # Example request: {model, body}
     example_request_2: dict[str, Any] = {}  # Second example: {model, body}
     example_request_3: dict[str, Any] = {}  # Third example: {model, body}
+    example_request_4: dict[str, Any] = {}  # Fourth example: {model, body} (e.g. STT)
     # Tungsten-specific: cookie-based auth (no API keys)
     jwt_token: str = ""
     cf_clearance: str = ""

@@ -31,7 +31,8 @@ logger = logging.getLogger(__name__)
 # Rough estimate: 1 token ≈ 4 characters
 _CHARS_PER_TOKEN = 4
 
-# OpenRouter STT: Whisper models use pricing.prompt as USD per minute of audio.
+# OpenRouter STT: Whisper models use pricing.prompt as USD per minute of audio
+# and pricing.completion == 0. Token-based transcribe models set completion > 0.
 _DURATION_STT_PROMPT_THRESHOLD = Decimal("0.0001")
 
 
@@ -273,7 +274,7 @@ class OpenRouterProvider(BaseProvider):
             self.name,
             max_audio_bytes=self._max_stt_audio_bytes,
         )
-        duration = get_audio_duration_seconds(audio_bytes, fmt)
+        duration = get_audio_duration_seconds(audio_bytes, fmt, provider=self.name)
         seconds = billing_seconds(duration)
         pricing = model_info.get("pricing", {})
 
@@ -571,7 +572,9 @@ class OpenRouterProvider(BaseProvider):
         if not usage:
             return None
 
-        is_stt = _is_stt_request("", body) or "text" in result or usage.get("seconds") is not None
+        is_stt = _is_stt_request("", body) or (
+            "text" in result and "choices" not in result and usage.get("seconds") is not None
+        )
 
         reported_cost = usage.get("cost")
         if reported_cost is not None and is_stt:

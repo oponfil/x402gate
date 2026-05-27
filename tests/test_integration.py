@@ -259,7 +259,7 @@ class TestPrepaidFlow:
         """GET /v1/balance after manual deposit shows correct balance."""
 
         reset()
-        asyncio.get_event_loop().run_until_complete(deposit("TestPubKey", Decimal("5.00")))
+        asyncio.run(deposit("TestPubKey", Decimal("5.00")))
 
         response = client.get("/v1/balance/TestPubKey")
         assert response.status_code == 200
@@ -273,7 +273,7 @@ class TestPrepaidFlow:
         reset()
         kp = Keypair()
         pubkey_str = str(kp.pubkey())
-        asyncio.get_event_loop().run_until_complete(deposit(pubkey_str, Decimal("1.00")))
+        asyncio.run(deposit(pubkey_str, Decimal("1.00")))
 
         # Mock WaveSpeed pricing + submit
         respx.post("https://api.wavespeed.ai/api/v3/model/pricing").mock(
@@ -309,7 +309,7 @@ class TestPrepaidFlow:
         reset()
         kp = Keypair()
         pubkey_str = str(kp.pubkey())
-        asyncio.get_event_loop().run_until_complete(deposit(pubkey_str, Decimal("0.001")))
+        asyncio.run(deposit(pubkey_str, Decimal("0.001")))
 
         respx.post("https://api.wavespeed.ai/api/v3/model/pricing").mock(
             return_value=httpx.Response(200, json={"data": {"unit_price": 0.003}})
@@ -430,7 +430,7 @@ class TestOpenRouterSTT:
         reset()
         kp = Keypair()
         pubkey_str = str(kp.pubkey())
-        asyncio.get_event_loop().run_until_complete(deposit(pubkey_str, Decimal("1.00")))
+        asyncio.run(deposit(pubkey_str, Decimal("1.00")))
 
         self._mock_transcription_catalog()
         respx.post("https://openrouter.ai/api/v1/audio/transcriptions").mock(

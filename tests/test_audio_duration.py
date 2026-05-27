@@ -1,5 +1,7 @@
 """Unit tests for audio duration parsing."""
 
+from unittest.mock import MagicMock, patch
+
 import pytest
 
 from tests.helpers import make_wav_bytes
@@ -15,6 +17,14 @@ class TestGetAudioDurationSeconds:
     def test_wav_format_with_dot(self):
         data = make_wav_bytes(0.5, rate=16000)
         assert get_audio_duration_seconds(data, ".WAV") == 0.5
+
+    def test_mutagen_format_duration(self):
+        mock_info = MagicMock()
+        mock_info.length = 2.5
+        mock_file = MagicMock()
+        mock_file.info = mock_info
+        with patch("x402gate.core.audio_duration.MutagenFile", return_value=mock_file):
+            assert get_audio_duration_seconds(b"fake-mp3-bytes", "mp3") == 2.5
 
     def test_missing_format_raises(self):
         with pytest.raises(ProviderError, match="Missing input_audio.format"):

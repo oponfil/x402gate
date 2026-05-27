@@ -63,7 +63,10 @@ Each provider is a key under `providers`:
 | `docs_url` | string | `""` | Link to provider API documentation |
 | `example_request` | dict | `{}` | Example request for the landing page (`{model, body}`) |
 | `example_request_2` | dict | `{}` | Second example request (e.g. video model) |
+| `example_request_3` | dict | `{}` | Third example request (e.g. embeddings) |
+| `example_request_4` | dict | `{}` | Fourth example request (e.g. STT / `audio/transcriptions`) |
 | `models_cache_ttl` | int | `86400` | Seconds to cache the list of models (for providers that fetch it dynamically) |
+| `max_stt_audio_mb` | int | `25` | Max STT audio upload size in MB (OpenRouter only) |
 | `jwt_token` | string | `""` | JWT token for cookie-based auth (Tungsten only) |
 | `cf_clearance` | string | `""` | Cloudflare clearance cookie (Tungsten only) |
 

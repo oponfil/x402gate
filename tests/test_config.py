@@ -102,6 +102,38 @@ class TestLoadConfig:
         assert ws.poll_interval == 5
         assert ws.poll_timeout == 120
 
+    def test_example_request_4_preserved(self, tmp_path: Path):
+        """Fourth example (e.g. STT) must survive load_config for discovery endpoints."""
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("""
+payment:
+  networks:
+    base:
+      type: "evm"
+      network: "eip155:8453"
+      pay_to: "0x1234567890abcdef1234567890abcdef12345678"
+      token_address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+      rpc_url: "https://mainnet.base.org"
+      facilitator_key: "0x0000000000000000000000000000000000000000000000000000000000000001"
+
+providers:
+  openrouter:
+    enabled: true
+    base_url: "https://openrouter.ai/api/v1"
+    api_key: "test-key"
+    example_request_4:
+      model: "audio/transcriptions"
+      body:
+        model: "openai/whisper-1"
+        input_audio:
+          data: "UklGRg=="
+          format: "wav"
+""")
+        config = load_config(config_file)
+        ex4 = config.providers["openrouter"].example_request_4
+        assert ex4["model"] == "audio/transcriptions"
+        assert ex4["body"]["model"] == "openai/whisper-1"
+
     def test_missing_file_raises(self):
         """Loading a non-existent file raises FileNotFoundError."""
         with pytest.raises(FileNotFoundError):
