@@ -15,11 +15,9 @@ import base64
 import logging
 import os
 import sys
-from pathlib import Path
 
 import httpx
-import yaml
-from helpers import Timings
+from helpers import Timings, load_config_yaml
 from solders.keypair import Keypair
 from x402 import PaymentRequired, x402Client
 from x402.mechanisms.svm.exact.client import ExactSvmScheme
@@ -28,13 +26,10 @@ from x402.mechanisms.svm.signers import KeypairSigner
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("x402-solana-openrouter-client")
 
-CONFIG_PATH = Path(__file__).parent.parent.parent / "config.yaml"
-
 
 def _load_example_request() -> tuple[str, dict]:
     """Load model and body from config.yaml's openrouter example_request."""
-    with open(CONFIG_PATH) as f:
-        cfg = yaml.safe_load(f)
+    cfg = load_config_yaml()
     ex = cfg["providers"]["openrouter"]["example_request"]
     return ex["model"], dict(ex["body"])
 

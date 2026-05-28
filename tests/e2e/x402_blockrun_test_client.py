@@ -20,9 +20,8 @@ import sys
 import traceback
 
 import httpx
-import yaml
 from eth_account import Account
-from helpers import Timings
+from helpers import Timings, load_config_yaml
 from x402 import PaymentRequired, x402Client
 from x402.mechanisms.evm.exact.client import ExactEvmScheme
 from x402.mechanisms.evm.signers import EthAccountSigner
@@ -34,9 +33,7 @@ logger = logging.getLogger("x402-blockrun-client")
 
 def _load_example_request() -> tuple[str, dict]:
     """Load model and body from config.yaml's blockrun example_request."""
-    config_path = os.path.join(os.path.dirname(__file__), "..", "..", "config.yaml")
-    with open(config_path) as f:
-        cfg = yaml.safe_load(f)
+    cfg = load_config_yaml()
     ex = cfg["providers"]["blockrun"]["example_request"]
     return ex["model"], dict(ex["body"])
 

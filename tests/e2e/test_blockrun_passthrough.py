@@ -10,18 +10,17 @@ import os
 
 import httpx
 import pytest
-import yaml
 from eth_account import Account
 from x402 import PaymentRequired, x402Client
 from x402.mechanisms.evm.exact.client import ExactEvmScheme
 from x402.mechanisms.evm.signers import EthAccountSigner
 
+from tests.e2e.helpers import load_config_yaml
+
 
 def _load_blockrun_example():
     """Load model and body from config.yaml's blockrun example_request."""
-    config_path = os.path.join(os.path.dirname(__file__), "..", "..", "config.yaml")
-    with open(config_path) as f:
-        cfg = yaml.safe_load(f)
+    cfg = load_config_yaml()
     ex = cfg["providers"]["blockrun"]["example_request"]
     return ex["model"], dict(ex["body"])
 

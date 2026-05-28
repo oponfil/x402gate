@@ -16,11 +16,10 @@ import base64
 import logging
 import os
 import sys
-from pathlib import Path
 
 import httpx
-import yaml
 from eth_account import Account
+from helpers import load_config_yaml
 from x402 import PaymentRequired, x402Client
 from x402.mechanisms.evm.exact import ExactEvmScheme
 from x402.mechanisms.evm.signers import EthAccountSigner
@@ -28,13 +27,10 @@ from x402.mechanisms.evm.signers import EthAccountSigner
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("x402-bad-params")
 
-CONFIG_PATH = Path(__file__).parent.parent.parent / "config.yaml"
-
 
 def _load_example_request() -> tuple[str, dict]:
     """Load model path from config, but override body with bad params."""
-    with open(CONFIG_PATH) as f:
-        cfg = yaml.safe_load(f)
+    cfg = load_config_yaml()
     example = cfg["providers"]["wavespeed"]["example_request"]
     model = example["model"]
     # Use valid prompt but INVALID size

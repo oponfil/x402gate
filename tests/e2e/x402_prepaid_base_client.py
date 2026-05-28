@@ -17,13 +17,11 @@ import logging
 import os
 import sys
 import time
-from pathlib import Path
 
 import httpx
-import yaml
 from eth_account import Account
 from eth_account.messages import encode_defunct
-from helpers import save_from_urls, save_images
+from helpers import load_config_yaml, save_from_urls, save_images
 from x402 import PaymentRequired, x402Client
 from x402.mechanisms.evm.exact import ExactEvmScheme
 from x402.mechanisms.evm.signers import EthAccountSigner
@@ -31,16 +29,14 @@ from x402.mechanisms.evm.signers import EthAccountSigner
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("x402-prepaid-base-client")
 
-CONFIG_PATH = Path(__file__).parent.parent.parent / "config.yaml"
-
-# Top-up amount in USDC
-TOPUP_AMOUNT = "0.110000"  # $0.11
-
 
 def _load_config():
     """Load config.yaml."""
-    with open(CONFIG_PATH) as f:
-        return yaml.safe_load(f)
+    return load_config_yaml()
+
+
+# Top-up amount in USDC
+TOPUP_AMOUNT = "0.110000"  # $0.11
 
 
 async def _topup(

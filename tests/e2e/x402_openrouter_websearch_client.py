@@ -12,12 +12,10 @@ import base64
 import logging
 import os
 import sys
-from pathlib import Path
 
 import httpx
-import yaml
 from eth_account import Account
-from helpers import Timings
+from helpers import Timings, load_config_yaml
 from x402 import PaymentRequired, x402Client
 from x402.mechanisms.evm.exact import ExactEvmScheme
 from x402.mechanisms.evm.signers import EthAccountSigner
@@ -25,13 +23,10 @@ from x402.mechanisms.evm.signers import EthAccountSigner
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("x402-openrouter-websearch")
 
-CONFIG_PATH = Path(__file__).parent.parent.parent / "config.yaml"
-
 
 def _load_example_request() -> tuple[str, dict]:
     """Load model and body from config.yaml's openrouter example_request_2."""
-    with open(CONFIG_PATH) as f:
-        cfg = yaml.safe_load(f)
+    cfg = load_config_yaml()
     ex = cfg["providers"]["openrouter"]["example_request_2"]
     return ex["model"], dict(ex["body"])
 
@@ -103,14 +98,14 @@ async def run_client():
                 payment_payload.model_dump_json(by_alias=True).encode()
             ).decode()
 
-        # 3. Retry with payment → expect 200 with web-sourced response
+        # Web search + LLM can exceed 2 minutes on prod under load
         logger.info("Retrying with payment (web search enabled)...")
         with timings.measure("paid_request"):
             response = await http_client.post(
                 f"{gateway_url}/v1/openrouter/chat/completions",
                 json=body,
                 headers={"PAYMENT-SIGNATURE": signature},
-                timeout=60.0,
+                timeout=240.0,
             )
         timings.add_server_timings(response)
 

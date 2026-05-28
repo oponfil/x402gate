@@ -6,12 +6,21 @@ import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import httpx
+import yaml
 
 logger = logging.getLogger("x402-e2e-helpers")
 
 OUTPUT_DIR = Path(__file__).parent / "output"
+CONFIG_PATH = Path(__file__).resolve().parents[2] / "config.yaml"
+
+
+def load_config_yaml() -> dict[str, Any]:
+    """Load project config.yaml with UTF-8 (Windows default cp1252 breaks on unicode)."""
+    with open(CONFIG_PATH, encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
 
 class Timings:

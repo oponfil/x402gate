@@ -133,12 +133,12 @@ providers:
       body:
         type: "z_image_turbo"
         data:
-          model_version_uuid: "59sCgDpS76"
-          prompt: "erotic scene with an adult woman, explicit pose, passionate atmosphere, detailed body, soft lighting"
+          model_version_uuid: "5xsQEXnZn6"
+          prompt: "beautiful portrait, photorealistic, detailed skin, soft natural lighting, masterpiece"
           negative_prompt: "worst_quality, bad_quality, lowres, deformed, blurry"
           num_images: 1
           sampler: "euler"
-          steps: 10
+          steps: 8
           cfg: 1.0
           clip_skip: 2
           width: 1024

@@ -15,12 +15,10 @@ import base64
 import logging
 import os
 import sys
-from pathlib import Path
 
 import httpx
-import yaml
 from eth_account import Account
-from helpers import Timings, save_from_urls
+from helpers import Timings, load_config_yaml, save_from_urls
 from x402 import PaymentRequired, x402Client
 from x402.mechanisms.evm.exact import ExactEvmScheme
 from x402.mechanisms.evm.signers import EthAccountSigner
@@ -29,14 +27,11 @@ from x402.mechanisms.evm.signers import EthAccountSigner
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("x402-client")
 
-CONFIG_PATH = Path(__file__).parent.parent.parent / "config.yaml"
-
 
 def _load_example_request() -> tuple[str, dict]:
     """Load model path and request body from config.yaml."""
 
-    with open(CONFIG_PATH) as f:
-        cfg = yaml.safe_load(f)
+    cfg = load_config_yaml()
     example = cfg["providers"]["wavespeed"]["example_request"]
     return example["model"], example["body"]
 

@@ -101,7 +101,9 @@ Fixed **$0.01 per generation** (all models, all sizes).
 Browse available models: **[tungsten.run/model_feed](https://tungsten.run/model_feed)**
 
 Each model page shows:
-- Model UUID (use as `model_version_uuid`)
+- Model UUID in the URL (e.g. `8bhodKtg2B`) — this is **not** the API field
+- **Version UUID** (e.g. `5xsQEXnZn6` for ZIT v2.0) — use this as `model_version_uuid`
+- Find it in page source (`modelVersionUUID` in `__NEXT_DATA__`) or DevTools → Network when clicking **Run**
 - Compatible LoRAs and embeddings
 - Recommended generation parameters
 
@@ -130,12 +132,12 @@ curl -X POST https://x402gate.io/v1/tungsten/generations \
   -d '{
     "type": "z_image_turbo",
     "data": {
-      "model_version_uuid": "59sCgDpS76",
-      "prompt": "beautiful woman, photorealistic, detailed eyes",
+      "model_version_uuid": "5xsQEXnZn6",
+      "prompt": "beautiful portrait, photorealistic, detailed skin, soft natural lighting, masterpiece",
       "negative_prompt": "worst_quality, bad_quality, lowres, deformed, blurry",
       "num_images": 1,
       "sampler": "euler",
-      "steps": 10,
+      "steps": 8,
       "cfg": 1.0,
       "clip_skip": 2,
       "width": 1024,

@@ -88,7 +88,7 @@ async def run_client():
             files={"file": (TEST_FILE_NAME, TEST_FILE_CONTENT)},
             data={"output_format": "pdf", "operation": "nonexistent_operation"},
             headers={"PAYMENT-SIGNATURE": signature},
-            timeout=30.0,
+            timeout=120.0,
         )
 
         logger.info("Response status: %d", response.status_code)
