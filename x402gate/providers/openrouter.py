@@ -382,10 +382,19 @@ class OpenRouterProvider(BaseProvider):
             raw_max if isinstance(raw_max, int) else self._default_max_tokens,
             self._default_max_tokens,
         )
+        raw_n = inputs.get("n", 1)
+        if raw_n is None:
+            raw_n = 1
+        if isinstance(raw_n, bool) or not isinstance(raw_n, int) or raw_n < 1:
+            raise ProviderError(
+                provider=self.name,
+                detail="n must be a positive integer",
+                status_code=400,
+            )
 
         estimated_cost = (
             Decimal(estimated_input_tokens) * prompt_price_dec
-            + Decimal(max_tokens) * completion_price_dec
+            + Decimal(max_tokens) * completion_price_dec * Decimal(raw_n)
             + web_search_cost
         )
 
@@ -417,7 +426,8 @@ class OpenRouterProvider(BaseProvider):
         Args:
             path: API sub-path.
             body: Request body, forwarded to OpenRouter.
-            prepaid: If True, skip max_tokens injection for chat requests.
+            prepaid: Kept for the provider interface. Chat requests are capped
+                in every mode so the prepaid reservation cannot be exceeded.
 
         Returns:
             OpenRouter response dict.
@@ -428,7 +438,7 @@ class OpenRouterProvider(BaseProvider):
         is_embedding = "embedding" in path.lower()
         is_stt = "transcription" in path.lower() or "input_audio" in body
 
-        if not prepaid and not is_embedding and not is_stt:
+        if not is_embedding and not is_stt:
             raw_max = body.get("max_tokens")
             user_max = raw_max if isinstance(raw_max, int) else 0
             if user_max < self._default_max_tokens:

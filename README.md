@@ -132,13 +132,13 @@ Client                    x402gate
   ├─ POST /v1/topup + sig ──►  ← balance credited
   │                          │
   ├─ POST /v1/openrouter/... ►  ← wallet signature (no blockchain tx)
-  │  X-PREPAID-PUBKEY         │  ← deduct actual_cost from balance
+  │  X-PREPAID-PUBKEY         │  ← reserve estimate, then charge actual cost
   │  X-PREPAID-SIGNATURE      │
   │  X-PREPAID-TIMESTAMP      │
   │◄─── 200 + result ────────┤
 ```
 
-Commission and gas are charged **once at top-up**. Subsequent requests deduct only the provider's actual cost. In prepaid mode, `max_tokens` is not injected — models respond fully, and you pay for actual usage.
+Commission and gas are charged **once at top-up**. Subsequent requests deduct the provider's actual cost, up to the estimate reserved before the call. OpenRouter chat uses the same `max_tokens` ceiling as a direct x402 payment, so a prepaid request cannot run past the reserved amount. If the provider fails, the reservation is returned to the balance.
 
 Supports both **Solana** (Ed25519) and **Base/EVM** (EIP-191) wallets — auto-detected by address format.
 

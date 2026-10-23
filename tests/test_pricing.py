@@ -103,3 +103,13 @@ class TestPriceCache:
         cache.set("model-a", {}, Decimal("0.003"))
         cache.clear()
         assert cache.get("model-a", {}) is None
+
+    def test_file_bytes_are_hashed(self):
+        """Uploads with different bytes do not share a cache entry."""
+        cache = PriceCache(ttl=60)
+        cache.set("model-a", {"_file_bytes": b"aaa", "name": "a"}, Decimal("1"))
+        assert cache.get("model-a", {"name": "a", "_file_bytes": b"aaa"}) == Decimal("1")
+        assert cache.get("model-a", {"name": "a", "_file_bytes": b"bbb"}) is None
+        key = PriceCache._make_key("model-a", {"_file_bytes": b"hello world" * 1000})
+        assert "hello" not in key
+        assert len(key) < 80

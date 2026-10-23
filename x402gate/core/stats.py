@@ -12,6 +12,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -22,6 +23,21 @@ from x402gate.core.prepaid import get_total_balance
 # How long (seconds) before a provider with no requests goes "unknown"
 STALE_THRESHOLD = 14400  # 4 hours
 MAX_LOG_ENTRIES = 1000  # Rolling log buffer size
+
+_USER_ID_RE = re.compile(r'("user_id"\s*:\s*")[^"]*(")')
+_BEARER_RE = re.compile(r"(?i)bearer\s+\S+")
+_KEY_RE = re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_\-]{8,}\b")
+_PUBLIC_TEXT_LIMIT = 300
+
+
+def sanitize_public_text(text: str) -> str:
+    """Strip account ids and secrets before text is shown on the dashboard."""
+    cleaned = _USER_ID_RE.sub(r"\1…\2", text)
+    cleaned = _BEARER_RE.sub("Bearer …", cleaned)
+    cleaned = _KEY_RE.sub("…", cleaned)
+    if len(cleaned) > _PUBLIC_TEXT_LIMIT:
+        cleaned = cleaned[:_PUBLIC_TEXT_LIMIT] + "…"
+    return cleaned
 
 
 @dataclass
@@ -88,7 +104,7 @@ class _DashboardLogHandler(logging.Handler):
                 {
                     "ts": record.created,
                     "level": record.levelname,
-                    "message": self.format(record),
+                    "message": sanitize_public_text(self.format(record)),
                 }
             )
 
@@ -146,7 +162,7 @@ def record_request(
     else:
         ps.error_count += 1
         ps.last_status = "error"
-        ps.last_error = error_msg or "Unknown error"
+        ps.last_error = sanitize_public_text(error_msg or "Unknown error")
 
 
 def record_revenue(

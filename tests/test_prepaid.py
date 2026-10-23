@@ -1,5 +1,6 @@
 """Unit tests for prepaid balance management."""
 
+import asyncio
 import time
 from decimal import Decimal
 
@@ -11,6 +12,8 @@ from x402gate.core.prepaid import (
     deduct,
     deposit,
     get_balance,
+    release,
+    reserve,
     reset,
     validate_timestamp,
     verify_wallet_signature,
@@ -62,6 +65,45 @@ class TestBalanceOperations:
 
     async def test_get_balance_unknown_pubkey(self):
         assert get_balance("UNKNOWN") == Decimal("0")
+
+
+class TestReservation:
+    """Tests for atomic reserve and release."""
+
+    async def test_reserve_holds_funds(self):
+        await deposit("ABC123", Decimal("1.50"))
+        assert await reserve("ABC123", Decimal("1.00")) is True
+        assert get_balance("ABC123") == Decimal("0.50")
+
+    async def test_reserve_rejects_when_short(self):
+        await deposit("ABC123", Decimal("0.10"))
+        assert await reserve("ABC123", Decimal("0.50")) is False
+        assert get_balance("ABC123") == Decimal("0.10")
+
+    async def test_release_charges_actual_and_returns_the_rest(self):
+        await deposit("ABC123", Decimal("1.50"))
+        assert await reserve("ABC123", Decimal("1.00")) is True
+        balance = await release("ABC123", Decimal("1.00"), Decimal("0.40"))
+        assert balance == Decimal("1.10")
+
+    async def test_release_caps_charge_at_the_reservation(self):
+        await deposit("ABC123", Decimal("0.002"))
+        assert await reserve("ABC123", Decimal("0.002")) is True
+        balance = await release("ABC123", Decimal("0.002"), Decimal("0.01"))
+        assert balance == Decimal("0")
+
+    async def test_release_of_zero_actual_restores_the_hold(self):
+        await deposit("ABC123", Decimal("1.00"))
+        assert await reserve("ABC123", Decimal("0.25")) is True
+        balance = await release("ABC123", Decimal("0.25"), Decimal("0"))
+        assert balance == Decimal("1.00")
+
+    async def test_concurrent_reserves_spend_once(self):
+        await deposit("ABC123", Decimal("0.003"))
+        results = await asyncio.gather(*[reserve("ABC123", Decimal("0.003")) for _ in range(5)])
+        assert results.count(True) == 1
+        assert results.count(False) == 4
+        assert get_balance("ABC123") == Decimal("0")
 
 
 # --- Ed25519 signature verification ---

@@ -173,6 +173,37 @@ class TestGetPrice:
         assert price == expected
 
     @pytest.mark.asyncio
+    async def test_multiplies_completion_price_by_n(self, provider, model_info_response):
+        """n completions multiply the completion portion of the estimate."""
+        body = {
+            "model": "openai/gpt-4o-mini",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "n": 3,
+        }
+
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = model_info_response
+            price = await provider.get_price("chat/completions", body)
+
+        prompt = Decimal("1") * Decimal("0.00000015")
+        completion = Decimal("1024") * Decimal("0.0000006")
+        assert price == prompt + completion * 3
+
+    @pytest.mark.asyncio
+    async def test_rejects_non_positive_n(self, provider, model_info_response):
+        """n must be a positive integer."""
+        body = {
+            "model": "openai/gpt-4o-mini",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "n": 0,
+        }
+
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = model_info_response
+            with pytest.raises(ProviderError, match="n must be a positive integer"):
+                await provider.get_price("chat/completions", body)
+
+    @pytest.mark.asyncio
     async def test_caches_model_info(self, provider, model_info_response):
         """Should cache model info and not re-fetch on second call."""
         body = {
@@ -398,6 +429,21 @@ class TestSubmit:
         with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
             mock_post.return_value = chat_completion_response
             await provider.submit("chat/completions", body)
+
+        sent_body = mock_post.call_args.kwargs["json"]
+        assert sent_body["max_tokens"] == 1024
+
+    @pytest.mark.asyncio
+    async def test_prepaid_submit_still_caps_max_tokens(self, provider, chat_completion_response):
+        """Prepaid chat is capped the same way as an x402 payment."""
+        body = {
+            "model": "openai/gpt-4o-mini",
+            "messages": [{"role": "user", "content": "Hello!"}],
+        }
+
+        with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = chat_completion_response
+            await provider.submit("chat/completions", body, prepaid=True)
 
         sent_body = mock_post.call_args.kwargs["json"]
         assert sent_body["max_tokens"] == 1024

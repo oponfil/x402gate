@@ -43,7 +43,7 @@ In **x402 mode**, the gateway injects a default `max_tokens` (2048) into OpenRou
 
 This injection does **not** apply to OpenRouter `embeddings` or duration-priced `audio/transcriptions` (STT) — those endpoints use different pricing logic.
 
-In **prepaid mode**, `max_tokens` is **not injected** — the model responds with its full capacity. You're charged **actual token usage**, so there's no need to cap output. If you want to limit tokens, include `max_tokens` in your request explicitly.
+In **prepaid mode**, OpenRouter chat gets the same `max_tokens` ceiling. The gateway reserves that estimate on the balance before calling the provider, then charges the actual cost up to the reservation and returns the rest. A failed provider call releases the whole reservation. Set `max_tokens` yourself when you want a higher ceiling; that larger value is what gets reserved.
 
 ## Endpoints
 
@@ -62,7 +62,7 @@ Top up your prepaid balance.
 
 **Without payment header** → validates amount, returns 402 with payment requirements for the specified amount.
 
-**With `PAYMENT-SIGNATURE` header** → verifies the USDC payment, settles it on-chain, and only then deducts commission (4% + $0.001 gas) and credits the remaining amount. If settlement fails, the balance is not credited and the response is HTTP 402.
+**With `PAYMENT-SIGNATURE` header** → verifies the USDC payment, settles it on-chain, and only then deducts commission (4% + $0.001 gas) and credits the remaining amount. The signed amount must sit inside the min/max limits and, when the body includes `amount`, must equal that amount. Otherwise the response is HTTP 400 and nothing is settled. If settlement fails, the balance is not credited and the response is HTTP 402.
 
 Response:
 ```json

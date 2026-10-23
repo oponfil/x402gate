@@ -311,11 +311,13 @@ class PaymentHandler:
             logger.exception("Payment verification failed")
             return False, "", "", "internal_error"
 
-    async def check_evm_balance(self, network: str, payer: str, amount: Decimal) -> bool:
+    async def check_evm_balance(self, network: str, payer: str, amount: Decimal) -> bool | None:
         """Check if payer has sufficient USDC balance on EVM.
 
         EVM verify() only checks the ECDSA signature — not the on-chain balance.
         This method prevents free generation from clients with insufficient funds.
+        An RPC failure is not treated as a success: the caller must stop the
+        request, because Base settlement happens after the result is returned.
 
         Args:
             network: Network ID (e.g. "eip155:8453").
@@ -323,32 +325,45 @@ class PaymentHandler:
             amount: Required amount in USD.
 
         Returns:
-            True if balance >= required amount, False otherwise.
+            True if balance >= required amount, False if the balance is too
+            small, None if the RPC check could not be completed.
         """
         ns = self._schemes.get(network)
         if not ns or not ns.w3:
             return True  # non-EVM or no w3 — skip check
 
-        try:
-            bal_sig = ns.w3.keccak(text="balanceOf(address)")[:4]
-            data = bal_sig + bytes(12) + bytes.fromhex(payer[2:])
-            raw = await asyncio.to_thread(
-                ns.w3.eth.call, {"to": ns.config.token_address, "data": data}
-            )
-            balance = int.from_bytes(raw, "big")
-            required = int(amount * 1_000_000)
-            if balance < required:
-                logger.warning(
-                    "Insufficient USDC: %s has %d, need %d",
-                    payer[:10] + "…",
-                    balance,
-                    required,
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                bal_sig = ns.w3.keccak(text="balanceOf(address)")[:4]
+                data = bal_sig + bytes(12) + bytes.fromhex(payer[2:])
+                raw = await asyncio.to_thread(
+                    ns.w3.eth.call, {"to": ns.config.token_address, "data": data}
                 )
-            return balance >= required
-        except Exception:
-            logger.exception("EVM balance check failed for %s", payer[:10] + "…")
-            # Fail open — don't block on RPC errors, settle will catch it
-            return True
+                balance = int.from_bytes(raw, "big")
+                required = int(amount * 1_000_000)
+                if balance < required:
+                    logger.warning(
+                        "Insufficient USDC: %s has %d, need %d",
+                        payer[:10] + "…",
+                        balance,
+                        required,
+                    )
+                return balance >= required
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    "EVM balance check failed for %s (attempt %d/2): %s",
+                    payer[:10] + "…",
+                    attempt + 1,
+                    e,
+                )
+        logger.error(
+            "EVM balance check unavailable for %s: %s",
+            payer[:10] + "…",
+            last_error,
+        )
+        return None
 
     async def settle(
         self,

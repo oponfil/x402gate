@@ -3,6 +3,7 @@
 import json
 from decimal import Decimal
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -119,3 +120,29 @@ class TestSettlementFailureReason:
         assert _settlement_failure_reason(result) == (
             "transaction_simulation_failed: Simulation failed"
         )
+
+
+class TestEvmBalanceCheck:
+    """Tests for the on-chain USDC balance check."""
+
+    async def test_rpc_error_fails_closed(self, handler: PaymentHandler):
+        """A failing balance RPC is retried once and then reported as unavailable."""
+        ns = handler._schemes["eip155:8453"]
+        ns.w3.eth.call = Mock(side_effect=ConnectionError("rpc down"))
+        result = await handler.check_evm_balance(
+            "eip155:8453",
+            "0x1234567890abcdef1234567890abcdef12345678",
+            Decimal("1"),
+        )
+        assert result is None
+        assert ns.w3.eth.call.call_count == 2
+
+    async def test_insufficient_balance_is_false(self, handler: PaymentHandler):
+        ns = handler._schemes["eip155:8453"]
+        ns.w3.eth.call = Mock(return_value=(0).to_bytes(32, "big"))
+        result = await handler.check_evm_balance(
+            "eip155:8453",
+            "0x1234567890abcdef1234567890abcdef12345678",
+            Decimal("1"),
+        )
+        assert result is False

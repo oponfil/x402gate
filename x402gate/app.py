@@ -26,9 +26,10 @@ from x402gate.core.config import AppConfig, load_config
 from x402gate.core.payment import PaymentHandler
 from x402gate.core.prepaid import (
     build_signing_message,
-    deduct,
     deposit,
     get_balance,
+    release,
+    reserve,
     validate_timestamp,
     verify_wallet_signature,
 )
@@ -517,10 +518,10 @@ async def topup(request: Request) -> Response:
     except Exception:
         body = {}
 
-    raw_amount = body.get("amount") if isinstance(body, dict) else None
-    if raw_amount is not None:
+    body_amount = body.get("amount") if isinstance(body, dict) else None
+    if body_amount is not None:
         try:
-            requested_amount = Decimal(str(raw_amount))
+            requested_amount = Decimal(str(body_amount))
         except Exception:
             return _error_response(400, "Invalid amount value")
         if requested_amount < min_topup:
@@ -545,6 +546,13 @@ async def topup(request: Request) -> Response:
 
     if topup_amount <= 0:
         return _error_response(400, "Top-up amount must be positive")
+    if topup_amount < min_topup or topup_amount > max_topup:
+        return _error_response(
+            400,
+            f"Top-up amount must be between ${min_topup} and ${max_topup}",
+        )
+    if body_amount is not None and topup_amount != requested_amount:
+        return _error_response(400, "Signed amount does not match the requested top-up")
 
     # Verify payment
     is_valid, payment_network, payer, reason = await payment_handler.verify(
@@ -657,8 +665,25 @@ async def _passthrough_proxy(provider_name: str, path: str, request: Request) ->
             forward_headers[key] = val
 
     t_start = time.monotonic()
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        resp = await client.post(url, content=body, headers=forward_headers)
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.post(url, content=body, headers=forward_headers)
+    except httpx.TimeoutException:
+        stats.record_request(
+            provider_name,
+            time.monotonic() - t_start,
+            False,
+            error_msg="Upstream request timed out",
+        )
+        return _error_response(504, "Upstream request timed out", provider=provider_name)
+    except httpx.RequestError:
+        stats.record_request(
+            provider_name,
+            time.monotonic() - t_start,
+            False,
+            error_msg="Upstream request failed",
+        )
+        return _error_response(502, "Upstream request failed", provider=provider_name)
 
     latency = time.monotonic() - t_start
     success = resp.status_code < 400
@@ -742,6 +767,8 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
             body = await request.json()
         except Exception:
             return _error_response(400, "Invalid JSON body")
+        if not isinstance(body, dict):
+            return _error_response(400, "JSON body must be an object")
 
     # 2. Fetch price (with cache)
     try:
@@ -768,6 +795,7 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
     payment_network = ""
     payer = ""
     upfront_settlement: dict[str, Any] | None = None
+    prepaid_reserved: Decimal | None = None
 
     if payment_sig:
         # 5a. Standard x402 payment flow
@@ -786,6 +814,9 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
         # EVM verify() only checks signature, not balance — check on-chain
         if payment_network.startswith("eip155:"):
             has_funds = await payment_handler.check_evm_balance(payment_network, payer, final_price)
+            if has_funds is None:
+                verify_s = time.monotonic() - t_verify_start
+                return _error_response(503, "Payment network unavailable, retry")
             if not has_funds:
                 verify_s = time.monotonic() - t_verify_start
                 return _error_response(402, "Insufficient USDC balance")
@@ -810,14 +841,16 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
         if not verify_wallet_signature(prepaid_pubkey, prepaid_sig, msg):
             return _error_response(401, "Invalid prepaid signature")
 
-        # Check balance against base_price (no commission — already paid at top-up)
-        current_balance = get_balance(prepaid_pubkey)
-        if current_balance < base_price:
+        # Hold the estimate before the provider runs. The hold is atomic, so
+        # parallel requests cannot all pass a balance check and then go free.
+        if not await reserve(prepaid_pubkey, base_price):
+            current_balance = get_balance(prepaid_pubkey)
             return _error_response(
                 402,
                 f"Insufficient prepaid balance: ${current_balance} < ${base_price}",
                 balance=str(current_balance),
             )
+        prepaid_reserved = base_price
         prepaid_mode = True
     else:
         return payment_handler.create_payment_required(final_price)
@@ -857,9 +890,11 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
         provider_label: str | None = None,
         **extra: Any,
     ) -> JSONResponse:
-        """Return a provider error, refunding an upfront Solana payment."""
+        """Return a provider error, giving held funds back."""
         if upfront_settlement is not None:
             extra.update(await _refund_settled_payment(payer, final_price))
+        if prepaid_reserved is not None:
+            await release(prepaid_pubkey, prepaid_reserved, Decimal("0"))
         return _error_response(status_code, detail, provider=provider_label, **extra)
 
     # 6. Forward request to provider
@@ -921,31 +956,33 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
         actual_base_price = base_price  # fallback to estimate
 
     if prepaid_mode:
-        # Prepaid: deduct actual cost from balance (no settlement needed)
-        deducted = await deduct(prepaid_pubkey, actual_base_price)
-        remaining = get_balance(prepaid_pubkey)
-        if not deducted:
-            logger.error(
-                "Prepaid deduction failed for %s (tried $%s, had $%s)",
-                prepaid_pubkey[:12] + "…",
+        # The reservation already took base_price. Keep the actual cost, capped
+        # at that hold, and return whatever is left.
+        charged = min(actual_base_price, prepaid_reserved or Decimal("0"))
+        if prepaid_reserved is not None and actual_base_price > prepaid_reserved:
+            logger.warning(
+                "Prepaid actual $%s exceeds reserved $%s for %s; charging the reservation",
                 actual_base_price,
-                remaining,
-            )
-        else:
-            t_client = time.monotonic() - t_start
-            logger.info(
-                "Prepaid %s: -$%s from %s (remaining: $%s, %.1fs)",
-                provider_name,
-                actual_base_price,
+                prepaid_reserved,
                 prepaid_pubkey[:12] + "…",
-                remaining,
-                t_client,
             )
+        remaining = await release(
+            prepaid_pubkey, prepaid_reserved or Decimal("0"), actual_base_price
+        )
+        t_client = time.monotonic() - t_start
+        logger.info(
+            "Prepaid %s: -$%s from %s (remaining: $%s, %.1fs)",
+            provider_name,
+            charged,
+            prepaid_pubkey[:12] + "…",
+            remaining,
+            t_client,
+        )
         stats.record_request(provider_name, generation_s, True)
         # Prepaid: record usage on the provider card (revenue=cost, profit=0).
         # Bottom-line totals will exclude the revenue part to avoid
         # double-counting with the topup that funded this balance.
-        stats.record_prepaid_usage(provider_name, actual_base_price)
+        stats.record_prepaid_usage(provider_name, charged)
         # For sync providers where data was extracted from result (e.g.,
         # embeddings), preserve top-level metadata (usage, model).
         if not is_async and output is not result:

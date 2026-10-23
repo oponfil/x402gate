@@ -1,11 +1,13 @@
 """Unit tests for the stats module."""
 
+import logging
 import time
 from decimal import Decimal
 
 from x402gate.core.stats import (
     MAX_LOG_ENTRIES,
     STALE_THRESHOLD,
+    _DashboardLogHandler,
     get_logs,
     get_stats,
     init,
@@ -13,6 +15,7 @@ from x402gate.core.stats import (
     record_revenue,
     record_topup,
     reset,
+    sanitize_public_text,
 )
 
 
@@ -49,6 +52,41 @@ class TestRecordRequest:
         record_request("openrouter", 0.1, True)
         s = get_stats()
         assert s["providers"]["openrouter"]["status"] == "ok"
+
+    def test_last_error_strips_account_and_secrets(self):
+        raw = '{"error":{"user_id":"user_secret","message":"nope"}} sk-abcdefghij1234'
+        record_request("openrouter", 0.1, False, error_msg=raw)
+        last_error = get_stats()["providers"]["openrouter"]["last_error"]
+        assert "user_secret" not in last_error
+        assert "sk-abcdefghij1234" not in last_error
+        assert '"user_id":"…"' in last_error
+
+
+class TestPublicText:
+    """Tests for dashboard text sanitising."""
+
+    def test_sanitize_truncates_and_strips_bearer(self):
+        text = "Authorization: Bearer super-secret-token " + ("x" * 400)
+        cleaned = sanitize_public_text(text)
+        assert "super-secret-token" not in cleaned
+        assert "Bearer …" in cleaned
+        assert len(cleaned) <= 301
+
+    def test_log_handler_stores_sanitised_message(self):
+        reset()
+        handler = _DashboardLogHandler()
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        record = logging.LogRecord(
+            "x402gate",
+            logging.INFO,
+            __file__,
+            1,
+            '"user_id":"user_abc"',
+            (),
+            None,
+        )
+        handler.emit(record)
+        assert "user_abc" not in get_logs()[0]["message"]
 
     def test_sets_status_error_on_failure(self):
         record_request("openrouter", 0.1, False, error_msg="API down")

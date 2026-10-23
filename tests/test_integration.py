@@ -5,6 +5,8 @@ and httpx.AsyncClient with FastAPI's TestClient for request testing.
 """
 
 import asyncio
+import base64
+import json
 import os
 import time
 from decimal import Decimal
@@ -937,3 +939,189 @@ class TestTopupSettlesBeforeCredit:
         body = response.json()
         assert Decimal(body["credited"]) == Decimal("0.959")
         assert get_balance(SOL_PAYER) == Decimal("0.959")
+
+    def test_signed_amount_above_maximum_is_rejected(self, client):
+        """A signed top-up above the limit is refused before settlement."""
+        reset()
+        payload = base64.b64encode(
+            json.dumps({"accepted": {"amount": "500000000"}}).encode()
+        ).decode()
+
+        with patch("x402gate.app.payment_handler") as mock_ph:
+            mock_ph.extract_payment_signature.return_value = payload
+            mock_ph.verify = AsyncMock(return_value=(True, SOLANA_NETWORK, SOL_PAYER, ""))
+            mock_ph.settle = AsyncMock(return_value={"success": True, "amount_usdc": 500})
+            response = client.post(
+                "/v1/topup",
+                json={"amount": 1.0},
+                headers={"Payment-Signature": "fake-sig"},
+            )
+
+        assert response.status_code == 400
+        assert "between" in response.json()["error"]
+        assert get_balance(SOL_PAYER) == 0
+        assert mock_ph.settle.await_count == 0
+        assert mock_ph.verify.await_count == 0
+
+
+def _prepaid_headers(kp: Keypair, path: str) -> dict[str, str]:
+    """Sign a prepaid request for path with a fresh timestamp."""
+    ts = int(time.time())
+    message = f"x402gate:{path}:{ts}".encode()
+    return {
+        "X-PREPAID-PUBKEY": str(kp.pubkey()),
+        "X-PREPAID-SIGNATURE": str(kp.sign_message(message)),
+        "X-PREPAID-TIMESTAMP": str(ts),
+    }
+
+
+class TestPrepaidReservation:
+    """Prepaid funds are held before the provider runs."""
+
+    @respx.mock
+    def test_provider_error_restores_reservation(self, client):
+        """A provider failure returns the reserved balance in full."""
+        reset()
+        kp = Keypair()
+        pubkey = str(kp.pubkey())
+        asyncio.run(deposit(pubkey, Decimal("1.00")))
+        respx.post(WAVESPEED_PRICE).mock(
+            return_value=httpx.Response(200, json={"data": {"unit_price": 0.003}})
+        )
+        respx.post(WAVESPEED_SUBMIT).mock(return_value=httpx.Response(500, text="upstream down"))
+
+        with patch("x402gate.core.proxy.asyncio.sleep", new_callable=AsyncMock):
+            response = client.post(
+                "/v1/wavespeed/wavespeed-ai/flux-dev",
+                json={"prompt": "a cat"},
+                headers=_prepaid_headers(kp, "wavespeed/wavespeed-ai/flux-dev"),
+            )
+
+        assert response.status_code == 502
+        assert get_balance(pubkey) == Decimal("1.00")
+
+    @respx.mock
+    def test_actual_cost_above_reservation_does_not_go_negative(self, client):
+        """A result that costs more than the hold still charges only the hold."""
+        reset()
+        kp = Keypair()
+        pubkey = str(kp.pubkey())
+        asyncio.run(deposit(pubkey, Decimal("0.002")))
+        respx.post(WAVESPEED_PRICE).mock(
+            return_value=httpx.Response(200, json={"data": {"unit_price": 0.002}})
+        )
+        respx.post(WAVESPEED_SUBMIT).mock(
+            return_value=httpx.Response(200, json={"data": {"output": {"images": ["ok"]}}})
+        )
+
+        async def _expensive(body, result):
+            return Decimal("0.01")
+
+        providers["wavespeed"].calculate_actual_cost = _expensive
+        response = client.post(
+            "/v1/wavespeed/wavespeed-ai/flux-dev",
+            json={"prompt": "a cat"},
+            headers=_prepaid_headers(kp, "wavespeed/wavespeed-ai/flux-dev"),
+        )
+
+        assert response.status_code == 200
+        assert get_balance(pubkey) == Decimal("0")
+        assert Decimal(response.headers["x-prepaid-balance"]) == Decimal("0")
+
+    @respx.mock
+    def test_concurrent_requests_spend_the_balance_once(self, client):
+        """Five parallel requests on a one-request balance produce one success."""
+        reset()
+        kp = Keypair()
+        pubkey = str(kp.pubkey())
+        asyncio.run(deposit(pubkey, Decimal("0.003")))
+        respx.post(WAVESPEED_PRICE).mock(
+            return_value=httpx.Response(200, json={"data": {"unit_price": 0.003}})
+        )
+        respx.post(WAVESPEED_SUBMIT).mock(
+            return_value=httpx.Response(200, json={"data": {"output": {"images": ["ok"]}}})
+        )
+        headers = _prepaid_headers(kp, "wavespeed/wavespeed-ai/flux-dev")
+
+        async def _fire():
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+                return await asyncio.gather(
+                    *[
+                        http.post(
+                            "/v1/wavespeed/wavespeed-ai/flux-dev",
+                            json={"prompt": "a cat"},
+                            headers=headers,
+                        )
+                        for _ in range(5)
+                    ]
+                )
+
+        responses = client.portal.call(_fire)
+        codes = [response.status_code for response in responses]
+        assert codes.count(200) == 1
+        assert codes.count(402) == 4
+        assert get_balance(pubkey) >= 0
+        assert get_balance(pubkey) == Decimal("0")
+
+
+class TestRequestGuards:
+    """Cheap request-shape and upstream-failure guards."""
+
+    def test_json_array_is_rejected(self, client):
+        response = client.post(
+            "/v1/wavespeed/wavespeed-ai/flux-dev",
+            json=["not", "an", "object"],
+        )
+        assert response.status_code == 400
+        assert response.json()["error"] == "JSON body must be an object"
+
+    @respx.mock
+    def test_passthrough_connection_error_is_502(self, client):
+        respx.post("https://blockrun.ai/api/v1/chat/completions").mock(
+            side_effect=httpx.ConnectError("refused")
+        )
+        response = client.post(
+            "/v1/blockrun/v1/chat/completions",
+            json={"model": "openai/gpt-4o", "messages": []},
+        )
+        assert response.status_code == 502
+        assert response.json()["error"] == "Upstream request failed"
+
+    @respx.mock
+    def test_passthrough_timeout_is_504(self, client):
+        respx.post("https://blockrun.ai/api/v1/chat/completions").mock(
+            side_effect=httpx.TimeoutException("slow")
+        )
+        response = client.post(
+            "/v1/blockrun/v1/chat/completions",
+            json={"model": "openai/gpt-4o", "messages": []},
+        )
+        assert response.status_code == 504
+        assert response.json()["error"] == "Upstream request timed out"
+
+    @respx.mock
+    def test_evm_rpc_outage_does_not_call_provider(self, client):
+        """A Base balance RPC failure stops the request before the provider."""
+        respx.post(WAVESPEED_PRICE).mock(
+            return_value=httpx.Response(200, json={"data": {"unit_price": 0.003}})
+        )
+
+        with patch("x402gate.app.payment_handler") as mock_ph:
+            mock_ph.extract_payment_signature.return_value = "fake-sig"
+            mock_ph.verify = AsyncMock(return_value=(True, EVM_NETWORK, "0xPayer", ""))
+            mock_ph.check_evm_balance = AsyncMock(return_value=None)
+            mock_ph.settle = AsyncMock()
+            response = client.post(
+                "/v1/wavespeed/wavespeed-ai/flux-dev",
+                json={"prompt": "a cat"},
+                headers={"Payment-Signature": "fake-sig"},
+            )
+
+        assert response.status_code == 503
+        assert response.json()["error"] == "Payment network unavailable, retry"
+        submit_calls = [
+            call for call in respx.calls if str(call.request.url).endswith("wavespeed-ai/flux-dev")
+        ]
+        assert submit_calls == []
+        assert mock_ph.settle.await_count == 0

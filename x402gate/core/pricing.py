@@ -26,8 +26,16 @@ class PriceCache:
 
     @staticmethod
     def _make_key(model_id: str, inputs: dict[str, Any]) -> str:
-        """Create a deterministic cache key from model_id and inputs."""
-        inputs_json = json.dumps(inputs, sort_keys=True, default=str)
+        """Create a deterministic cache key from model_id and inputs.
+
+        File bytes are hashed on their own. Putting the raw upload into
+        ``json.dumps`` would copy the whole file into the key.
+        """
+        safe: dict[str, Any] = {key: value for key, value in inputs.items() if key != "_file_bytes"}
+        file_bytes = inputs.get("_file_bytes")
+        if isinstance(file_bytes, (bytes, bytearray)):
+            safe["_file_sha256"] = hashlib.sha256(file_bytes).hexdigest()
+        inputs_json = json.dumps(safe, sort_keys=True, default=str)
         inputs_hash = hashlib.sha256(inputs_json.encode()).hexdigest()[:16]
         return f"{model_id}:{inputs_hash}"
 

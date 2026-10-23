@@ -76,6 +76,69 @@ async def deduct(pubkey: str, amount: Decimal) -> bool:
         return True
 
 
+async def reserve(pubkey: str, amount: Decimal) -> bool:
+    """Hold funds until :func:`release`.
+
+    The hold and the balance check happen together under ``_lock``, so two
+    concurrent requests cannot spend the same money.
+
+    Args:
+        pubkey: Wallet address (Solana base58 or EVM hex).
+        amount: Amount in USD to hold. Must be non-negative.
+
+    Returns:
+        True if the hold succeeded, False if the balance is too small.
+    """
+    if amount < 0:
+        return False
+    async with _lock:
+        current = _balances.get(pubkey, Decimal("0"))
+        if current < amount:
+            return False
+        _balances[pubkey] = current - amount
+        logger.info(
+            "Prepaid reserve: $%s from %s (remaining: $%s)",
+            amount,
+            pubkey[:12] + "…",
+            _balances[pubkey],
+        )
+        return True
+
+
+async def release(pubkey: str, reserved: Decimal, actual: Decimal) -> Decimal:
+    """Settle a reservation and return the new balance.
+
+    Charges ``min(actual, reserved)`` and puts the rest back. A failed
+    provider call releases the whole hold by passing ``actual`` of 0.
+
+    Args:
+        pubkey: Wallet address (Solana base58 or EVM hex).
+        reserved: Amount previously taken by :func:`reserve`.
+        actual: Provider cost to keep. Negative values are treated as 0.
+
+    Returns:
+        New total balance.
+    """
+    if reserved < 0:
+        reserved = Decimal("0")
+    if actual < 0:
+        actual = Decimal("0")
+    charged = min(actual, reserved)
+    refund = reserved - charged
+    async with _lock:
+        current = _balances.get(pubkey, Decimal("0"))
+        new_balance = current + refund
+        _balances[pubkey] = new_balance
+        logger.info(
+            "Prepaid release: charged $%s, returned $%s to %s (balance: $%s)",
+            charged,
+            refund,
+            pubkey[:12] + "…",
+            new_balance,
+        )
+        return new_balance
+
+
 def get_balance(pubkey: str) -> Decimal:
     """Get current prepaid balance for a wallet.
 
