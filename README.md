@@ -42,9 +42,9 @@ Client                    x402gate                  WaveSpeed AI
 1. Client sends a request → gateway fetches the price from the provider
 2. Gateway responds with **HTTP 402** and payment options for all configured networks
 3. Client picks a network (Base or Solana), signs the payment, retries with `PAYMENT-SIGNATURE` header
-4. Gateway verifies → forwards request → waits for result → settles payment → returns output
+4. Gateway verifies the payment, then forwards the request and returns the result. On Base it settles after the provider succeeds. On Solana it settles first, because the signed transaction expires in about a minute.
 
-**No payment? No settlement on failure.** Payment is only settled after the AI task completes successfully.
+On Base, a failed or timed-out task is not settled and the client keeps the USDC. On Solana the payment is already settled, so a later provider failure credits that amount to the payer's prepaid balance.
 
 ### Passthrough Providers (BlockRun)
 
@@ -119,7 +119,7 @@ If the provider rejects a request (e.g. invalid parameters), the gateway returns
 **Retry on 5xx:** If a provider returns a server error (502, 503, etc.), x402gate automatically retries the request up to **2 times** with exponential backoff (2s → 4s) before returning the error. This prevents payment loss during brief provider outages (e.g. CDN restarts). Timeouts are also retried. Client errors (4xx) are never retried.
 
 
-> **Note:** Payment is settled **only** on success (HTTP 200). On any error, the payment is not settled and no USDC is transferred.
+> **Note:** On Base, USDC moves only after the provider returns HTTP 200. On Solana, USDC moves before the provider is called. If that job then fails, the error JSON includes `refunded_to_prepaid` and `prepaid_balance` — the full settled amount, credited in memory, not sent back on-chain.
 
 ### Prepaid Mode
 

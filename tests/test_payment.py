@@ -2,11 +2,12 @@
 
 import json
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
 from x402gate.core.config import NetworkConfig
-from x402gate.core.payment import PaymentHandler
+from x402gate.core.payment import PaymentHandler, _settlement_failure_reason
 
 
 @pytest.fixture
@@ -83,3 +84,38 @@ class TestPaymentRequirements:
         assert reqs["amount"] == "5000"
         assert reqs["maxTimeoutSeconds"] == 3600
         assert reqs["extra"] == {"name": "USD Coin", "version": "2"}
+
+
+class TestSettlementFailureReason:
+    """Tests for readable settlement failure text."""
+
+    def test_ignores_empty_error_message(self):
+        """A None error_message must not be logged as the text 'None'."""
+        result = SimpleNamespace(
+            error_reason="transaction_simulation_failed",
+            error_message=None,
+        )
+        assert _settlement_failure_reason(result) == "transaction_simulation_failed"
+
+    def test_includes_simulation_text(self):
+        """Simulation detail is appended when the SDK provides it."""
+        result = SimpleNamespace(
+            error_reason="transaction_simulation_failed",
+            error_message=None,
+            invalid_message="Blockhash not found",
+        )
+        assert (
+            _settlement_failure_reason(result)
+            == "transaction_simulation_failed: Blockhash not found"
+        )
+
+    def test_prefers_error_message(self):
+        """error_message wins over invalid_message when both are set."""
+        result = SimpleNamespace(
+            error_reason="transaction_simulation_failed",
+            error_message="Simulation failed",
+            invalid_message="ignored",
+        )
+        assert _settlement_failure_reason(result) == (
+            "transaction_simulation_failed: Simulation failed"
+        )

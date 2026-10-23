@@ -62,7 +62,7 @@ Top up your prepaid balance.
 
 **Without payment header** → validates amount, returns 402 with payment requirements for the specified amount.
 
-**With `PAYMENT-SIGNATURE` header** → verifies the USDC payment, deducts commission (4% + $0.001 gas), and credits the remaining amount to your wallet's prepaid balance.
+**With `PAYMENT-SIGNATURE` header** → verifies the USDC payment, settles it on-chain, and only then deducts commission (4% + $0.001 gas) and credits the remaining amount. If settlement fails, the balance is not credited and the response is HTTP 402.
 
 Response:
 ```json
@@ -198,5 +198,6 @@ print(response.json())
 
 - **In-memory storage only** — balances are lost on server restart
 - **Top-up limits** — min $0.10, max $10 (configurable in config.yaml)
-- **No refunds** — prepaid amounts are non-refundable
+- **No cash-out** — prepaid balances cannot be withdrawn back to USDC
+- **Solana job refunds** — if a Solana payment was settled up front and the provider then fails, the amount is credited to that wallet's prepaid balance. It is still in-memory and lost on restart. This is not an on-chain refund
 - **No multi-server** — balances are local to a single server instance

@@ -65,6 +65,52 @@ def _error_response(
     return JSONResponse(status_code=status_code, content=body)
 
 
+def _record_onchain_settlement(
+    provider_name: str,
+    network: str,
+    settlement: dict[str, Any],
+    settle_latency: float,
+    revenue_usd: Decimal | None = None,
+) -> None:
+    """Record gas and per-network stats for a successful on-chain settlement.
+
+    ``revenue_usd`` overrides the amount taken from the settlement dict.
+    Top-up passes the exact credited payment so the network card matches
+    the Decimal amount the client signed.
+    """
+    gas_cost = Decimal(str(settlement.get("gas_cost_usd", 0.0)))
+    stats.record_gas(provider_name, gas_cost)
+    if revenue_usd is None:
+        revenue_usd = Decimal(str(settlement.get("amount_usdc", 0)))
+    stats.record_settlement(
+        network,
+        settle_latency,
+        settlement.get("gas_cost_usd", 0.0),
+        settlement.get("gas_cost_native", 0.0),
+        settlement.get("gas_label", ""),
+        revenue_usd=revenue_usd,
+    )
+
+
+async def _refund_settled_payment(payer: str, amount: Decimal) -> dict[str, str]:
+    """Credit a settled Solana payment back to the payer's prepaid balance.
+
+    Used when the provider fails after an upfront Solana settlement. The
+    balance is in-memory and is lost on restart.
+    """
+    new_balance = await deposit(payer, amount)
+    logger.warning(
+        "Solana refund: $%s credited to prepaid %s (balance: $%s)",
+        amount,
+        (payer[:12] + "…") if payer else "",
+        new_balance,
+    )
+    return {
+        "refunded_to_prepaid": str(amount),
+        "prepaid_balance": str(new_balance),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Provider registry: maps config name → provider class.
 # Passthrough providers don't need a class — they're handled generically.
@@ -515,37 +561,28 @@ async def topup(request: Request) -> Response:
     if net_credit <= 0:
         return _error_response(400, "Top-up amount too small to cover fees")
 
-    # Credit the prepaid balance
+    # Settle before crediting. A failed or expired transaction must not
+    # leave a prepaid balance that was never paid for.
+    t_settle_start = time.monotonic()
+    settlement = await payment_handler.settle(
+        payment_sig,
+        topup_amount,
+        payment_network,
+        extra_context={"provider_name": "topup", "provider_cost": 0},
+    )
+    settle_latency = time.monotonic() - t_settle_start
+    if not settlement or not settlement.get("success"):
+        reason = (settlement or {}).get("error_reason") or "unknown"
+        return _error_response(402, f"Payment settlement failed: {reason}")
+
     new_balance = await deposit(payer, net_credit)
-
-    # Settle payment in background
-    async def _settle_topup() -> None:
-        try:
-            t_settle_start = time.monotonic()
-            settlement = await payment_handler.settle(
-                payment_sig,
-                topup_amount,
-                payment_network,
-                extra_context={"provider_name": "topup", "provider_cost": 0},
-            )
-            settle_latency = time.monotonic() - t_settle_start
-            if settlement and settlement.get("success"):
-                gas_cost = Decimal(str(settlement.get("gas_cost_usd", 0.0)))
-                stats.record_gas("topup", gas_cost)
-                stats.record_settlement(
-                    payment_network,
-                    settle_latency,
-                    settlement.get("gas_cost_usd", 0.0),
-                    settlement.get("gas_cost_native", 0.0),
-                    settlement.get("gas_label", ""),
-                    revenue_usd=topup_amount,
-                )
-        except Exception:
-            logger.exception("Top-up settlement failed for %s", payer)
-
-    task = asyncio.create_task(_settle_topup())
-    _pending_settlements.add(task)
-    task.add_done_callback(_pending_settlements.discard)
+    _record_onchain_settlement(
+        "topup",
+        payment_network,
+        settlement,
+        settle_latency,
+        revenue_usd=topup_amount,
+    )
 
     stats.record_request("topup", time.monotonic() - t_start, True)
     stats.record_topup(topup_amount)
@@ -658,9 +695,14 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
     3. Apply commission (4% + gas fee)
     4. If no PAYMENT-SIGNATURE header → return 402
     5. Verify payment via facilitator
+    5b. Solana: settle immediately. The signed transaction's blockhash expires
+        in about a minute, before a long job finishes. A failed settle does
+        not call the provider. If the provider fails afterwards, the amount
+        is credited to the payer's prepaid balance.
     6. Forward request to provider as-is
     7. If async (task_id present) → poll for result; else use response directly
-    8. Settle payment on-chain (background)
+    8. Base: settle in the background after success. Solana: record revenue
+        only, because settlement already happened.
     9. Return result to client
     """
     provider = providers.get(provider_name)
@@ -723,6 +765,9 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
     prepaid_pubkey = request.headers.get("x-prepaid-pubkey")
     prepaid_mode = False
     verify_s = 0.0
+    payment_network = ""
+    payer = ""
+    upfront_settlement: dict[str, Any] | None = None
 
     if payment_sig:
         # 5a. Standard x402 payment flow
@@ -777,6 +822,46 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
     else:
         return payment_handler.create_payment_required(final_price)
 
+    # 5b. Solana transactions carry a blockhash that expires in about a minute.
+    # Settle before the provider call so a long job cannot outlive the signature.
+    if payment_sig and payment_network.startswith("solana:"):
+        t_settle_start = time.monotonic()
+        upfront_settlement = await payment_handler.settle(
+            payment_sig,
+            final_price,
+            payment_network,
+            extra_context={
+                "provider_name": provider_name,
+                "estimated_cost": float(base_price),
+                "provider_cost": float(base_price),
+                "generation_s": 0.0,
+                "t_client": time.monotonic() - t_start,
+                "commission_rate": config.gateway.commission,
+                "gas_surcharge": config.gateway.gas_surcharge,
+            },
+        )
+        if not upfront_settlement or not upfront_settlement.get("success"):
+            reason = (upfront_settlement or {}).get("error_reason") or "unknown"
+            return _error_response(402, f"Payment settlement failed: {reason}")
+        _record_onchain_settlement(
+            provider_name,
+            payment_network,
+            upfront_settlement,
+            time.monotonic() - t_settle_start,
+        )
+
+    async def _provider_error(
+        status_code: int,
+        detail: str,
+        *,
+        provider_label: str | None = None,
+        **extra: Any,
+    ) -> JSONResponse:
+        """Return a provider error, refunding an upfront Solana payment."""
+        if upfront_settlement is not None:
+            extra.update(await _refund_settled_payment(payer, final_price))
+        return _error_response(status_code, detail, provider=provider_label, **extra)
+
     # 6. Forward request to provider
     body["_caller"] = (prepaid_pubkey or payer or "x402")[:12]
     t_gen_start = time.monotonic()
@@ -785,7 +870,7 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
     except ProviderError as e:
         t_err = time.monotonic() - t_gen_start
         stats.record_request(provider_name, t_err, False, error_msg=e.detail)
-        return _error_response(e.status_code, e.detail, provider=e.provider)
+        return await _provider_error(e.status_code, e.detail, provider_label=e.provider)
 
     # 7. Determine if response is async (needs polling) or sync (ready)
     #    - Sync providers (OpenRouter, TTS, etc.) return results directly,
@@ -805,20 +890,20 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
         try:
             output = await provider.get_result(task_id)
         except TaskTimeoutError as e:
-            # Don't settle -- client keeps their money
+            # Base: leave the authorization unsettled. Solana was settled
+            # up front, so give the amount back as prepaid credit.
             t_err = time.monotonic() - t_gen_start
             stats.record_request(provider_name, t_err, False, error_msg=f"Timeout {e.timeout}s")
-            return _error_response(
+            return await _provider_error(
                 504,
                 f"Task timed out after {e.timeout}s",
-                provider=provider.name,
+                provider_label=provider.name,
                 task_id=e.task_id,
             )
         except ProviderError as e:
-            # Don't settle -- task failed
             t_err = time.monotonic() - t_gen_start
             stats.record_request(provider_name, t_err, False, error_msg=e.detail)
-            return _error_response(e.status_code, e.detail, provider=e.provider)
+            return await _provider_error(e.status_code, e.detail, provider_label=e.provider)
     else:
         # Synchronous provider -- use extracted data for the response body.
         output = task_data
@@ -873,60 +958,69 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
             headers={"X-Prepaid-Balance": str(remaining)},
         )
 
-    # 9. Settle payment in background (don't block client)
+    # 9. Settle. Solana already settled before the provider call.
     t_client = time.monotonic() - t_start
 
-    async def background_settle() -> None:
-        """Settle payment and log financial summary in background."""
-        try:
-            ctx = {
-                "provider_name": provider_name,
-                "estimated_cost": float(base_price),
-                "provider_cost": float(actual_base_price),
-                "generation_s": generation_s,
-                "t_client": t_client,
-                "commission_rate": config.gateway.commission,
-                "gas_surcharge": config.gateway.gas_surcharge,
-            }
-            t_settle_start = time.monotonic()
-            settlement = await payment_handler.settle(
-                payment_sig,
-                final_price,
-                payment_network,
-                extra_context=ctx,
-            )
-            settle_latency = time.monotonic() - t_settle_start
+    if upfront_settlement is not None:
+        stats.record_revenue(
+            provider_name,
+            Decimal(str(upfront_settlement.get("amount_usdc", 0))),
+            actual_base_price,
+        )
+        logger.info(
+            "Solana %s completed after upfront settle: cost=$%s (%.1fs)",
+            provider_name,
+            actual_base_price,
+            generation_s,
+        )
+    else:
 
-            if not settlement:
-                logger.error("Settlement returned None for %s — check logs above", payment_network)
-            elif not settlement.get("success"):
-                logger.error(
-                    "Settlement FAILED for %s: %s",
+        async def background_settle() -> None:
+            """Settle payment and log financial summary in background."""
+            try:
+                ctx = {
+                    "provider_name": provider_name,
+                    "estimated_cost": float(base_price),
+                    "provider_cost": float(actual_base_price),
+                    "generation_s": generation_s,
+                    "t_client": t_client,
+                    "commission_rate": config.gateway.commission,
+                    "gas_surcharge": config.gateway.gas_surcharge,
+                }
+                t_settle_start = time.monotonic()
+                settlement = await payment_handler.settle(
+                    payment_sig,
+                    final_price,
                     payment_network,
-                    settlement.get("error_reason", "unknown"),
+                    extra_context=ctx,
                 )
-            else:
-                gas_cost = Decimal(str(settlement.get("gas_cost_usd", 0.0)))
-                stats.record_gas(provider_name, gas_cost)
-                stats.record_revenue(
-                    provider_name,
-                    Decimal(str(settlement.get("amount_usdc", 0))),
-                    actual_base_price,
-                )
-                stats.record_settlement(
-                    payment_network,
-                    settle_latency,
-                    settlement.get("gas_cost_usd", 0.0),
-                    settlement.get("gas_cost_native", 0.0),
-                    settlement.get("gas_label", ""),
-                    revenue_usd=Decimal(str(settlement.get("amount_usdc", 0))),
-                )
-        except Exception:
-            logger.exception("Background settlement crashed for %s", payment_network)
+                settle_latency = time.monotonic() - t_settle_start
 
-    task = asyncio.create_task(background_settle())
-    _pending_settlements.add(task)
-    task.add_done_callback(_pending_settlements.discard)
+                if not settlement:
+                    logger.error(
+                        "Settlement returned None for %s — check logs above", payment_network
+                    )
+                elif not settlement.get("success"):
+                    logger.error(
+                        "Settlement FAILED for %s: %s",
+                        payment_network,
+                        settlement.get("error_reason", "unknown"),
+                    )
+                else:
+                    _record_onchain_settlement(
+                        provider_name, payment_network, settlement, settle_latency
+                    )
+                    stats.record_revenue(
+                        provider_name,
+                        Decimal(str(settlement.get("amount_usdc", 0))),
+                        actual_base_price,
+                    )
+            except Exception:
+                logger.exception("Background settlement crashed for %s", payment_network)
+
+        task = asyncio.create_task(background_settle())
+        _pending_settlements.add(task)
+        task.add_done_callback(_pending_settlements.discard)
 
     # 10. Return result to client
     stats.record_request(provider_name, generation_s, True)

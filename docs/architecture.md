@@ -51,6 +51,8 @@ Client → POST /v1/wavespeed/{model} + PAYMENT-SIGNATURE header
    Client ← 200 OK + result + PAYMENT-RESPONSE header
 ```
 
+The diagram is the Base order. On Solana, settle runs immediately after verify and before the request is forwarded.
+
 ## Components
 
 | Component | File | Purpose |
@@ -89,9 +91,13 @@ The gateway forwards request bodies to providers **as-is**. It does not parse, v
 
 Prices are fetched from the provider's pricing API at request time. A TTL cache (`price_cache_ttl` in config) reduces redundant API calls. The same cache key is used for both the 402 response and the payment verification retry.
 
-### Settlement After Work
+### Settlement
 
-Payment is verified **before** starting work, but settled **after** successful completion. If the task fails or times out, the payment is never settled and the client keeps their money.
+Payment is verified before any work.
+
+On Base the client signs an EIP-3009 authorization that stays valid for `max_timeout` (3600 seconds). The gateway settles only after the provider succeeds. A failed or timed-out task is not settled, and the client keeps the USDC.
+
+On Solana the client signs a transaction whose blockhash expires in about a minute. The gateway settles that transaction immediately after verify, before calling the provider. If submit, polling, or the provider then fails, the settled amount is credited to the payer's in-memory prepaid balance. The error JSON includes `refunded_to_prepaid` and `prepaid_balance`.
 
 ### Custom x402 Flow
 

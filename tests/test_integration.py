@@ -17,9 +17,11 @@ from fastapi.testclient import TestClient
 from solders.keypair import Keypair
 
 from tests.helpers import make_wav_b64
-from x402gate.app import app
+from x402gate.app import _pending_settlements, app, providers
 from x402gate.core.config import load_config as real_load
 from x402gate.core.prepaid import deposit, get_balance, reset
+from x402gate.core.pricing import apply_commission
+from x402gate.core.proxy import TaskTimeoutError
 
 # Set env vars before importing the app
 os.environ.setdefault("WAVESPEED_API_KEY", "test-key-12345")
@@ -631,3 +633,307 @@ class TestPaymentVerificationFailure:
 
         assert response.status_code == 402
         assert "Insufficient USDC balance" in response.json()["error"]
+
+
+SOLANA_NETWORK = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+SOL_PAYER = "SolPayer1111"
+EVM_NETWORK = "eip155:8453"
+WAVESPEED_PRICE = "https://api.wavespeed.ai/api/v3/model/pricing"
+WAVESPEED_SUBMIT = "https://api.wavespeed.ai/api/v3/wavespeed-ai/flux-dev"
+TOPUP_SIG = "eyJhY2NlcHRlZCI6eyJhbW91bnQiOiIxMDAwMDAwIn19"  # {"accepted":{"amount":"1000000"}}
+
+
+def _price_ok() -> None:
+    """Mock WaveSpeed pricing at $0.003."""
+    respx.post(WAVESPEED_PRICE).mock(
+        return_value=httpx.Response(200, json={"data": {"unit_price": 0.003}})
+    )
+
+
+def _paid_handler(mock_ph, network: str, payer: str) -> None:
+    """Point a mocked payment handler at a verified payer."""
+    mock_ph.extract_payment_signature.return_value = "fake-sig"
+    mock_ph.verify = AsyncMock(return_value=(True, network, payer, ""))
+    mock_ph.check_evm_balance = AsyncMock(return_value=True)
+
+
+def _settled_ok(gas_label: str = "SOL") -> dict:
+    """Settlement dict the handler returns after a successful settle."""
+    return {
+        "success": True,
+        "amount_usdc": 0.00412,
+        "gas_cost_usd": 0.0001,
+        "gas_cost_native": 0.00001,
+        "gas_label": gas_label,
+    }
+
+
+def _post_wavespeed(client):
+    """POST a small WaveSpeed job with a payment header."""
+    return client.post(
+        "/v1/wavespeed/wavespeed-ai/flux-dev",
+        json={"prompt": "a cat"},
+        headers={"Payment-Signature": "fake-sig"},
+    )
+
+
+class TestSolanaUpfrontSettlement:
+    """Solana payments settle before the provider runs."""
+
+    @respx.mock
+    def test_settles_once_before_provider(self, client):
+        """Settle is awaited once, and that happens before WaveSpeed is called."""
+        reset()
+        _price_ok()
+        seen: dict[str, int] = {}
+
+        def on_submit(request):
+            seen["settle_before_submit"] = mock_ph.settle.await_count
+            return httpx.Response(200, json={"outputs": ["ok"]})
+
+        respx.post(WAVESPEED_SUBMIT).mock(side_effect=on_submit)
+
+        with patch("x402gate.app.payment_handler") as mock_ph:
+            _paid_handler(mock_ph, SOLANA_NETWORK, SOL_PAYER)
+            mock_ph.settle = AsyncMock(return_value=_settled_ok())
+            response = _post_wavespeed(client)
+
+        assert response.status_code == 200
+        assert seen["settle_before_submit"] == 1
+        assert mock_ph.settle.await_count == 1
+        expected = apply_commission(Decimal("0.003"), 0.04, 0.001)
+        assert mock_ph.settle.await_args.args[1] == expected
+        assert mock_ph.settle.await_args.args[2] == SOLANA_NETWORK
+        assert "refunded_to_prepaid" not in response.json()
+
+    @respx.mock
+    def test_failed_settle_does_not_call_provider(self, client):
+        """A failed Solana settle is a 402 and the provider is not called."""
+        reset()
+        _price_ok()
+
+        with patch("x402gate.app.payment_handler") as mock_ph:
+            _paid_handler(mock_ph, SOLANA_NETWORK, SOL_PAYER)
+            mock_ph.settle = AsyncMock(
+                return_value={
+                    "success": False,
+                    "error_reason": "transaction_simulation_failed",
+                }
+            )
+            response = _post_wavespeed(client)
+
+        assert response.status_code == 402
+        assert "transaction_simulation_failed" in response.json()["error"]
+        submit_calls = [
+            call for call in respx.calls if str(call.request.url).endswith("wavespeed-ai/flux-dev")
+        ]
+        assert submit_calls == []
+        assert get_balance(SOL_PAYER) == 0
+        assert mock_ph.settle.await_count == 1
+
+    @respx.mock
+    def test_settle_returning_none_does_not_call_provider(self, client):
+        """A settle that returns None is a 402 and the provider is not called."""
+        reset()
+        _price_ok()
+
+        with patch("x402gate.app.payment_handler") as mock_ph:
+            _paid_handler(mock_ph, SOLANA_NETWORK, SOL_PAYER)
+            mock_ph.settle = AsyncMock(return_value=None)
+            response = _post_wavespeed(client)
+
+        assert response.status_code == 402
+        assert response.json()["error"] == "Payment settlement failed: unknown"
+        submit_calls = [
+            call for call in respx.calls if str(call.request.url).endswith("wavespeed-ai/flux-dev")
+        ]
+        assert submit_calls == []
+
+    @respx.mock
+    def test_provider_500_refunds_prepaid(self, client):
+        """A provider 500 after a successful Solana settle credits prepaid."""
+        reset()
+        _price_ok()
+        respx.post(WAVESPEED_SUBMIT).mock(return_value=httpx.Response(500, text="upstream down"))
+
+        with (
+            patch("x402gate.app.payment_handler") as mock_ph,
+            patch("x402gate.core.proxy.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            _paid_handler(mock_ph, SOLANA_NETWORK, SOL_PAYER)
+            mock_ph.settle = AsyncMock(return_value=_settled_ok())
+            response = _post_wavespeed(client)
+
+        assert response.status_code == 502
+        body = response.json()
+        assert Decimal(body["refunded_to_prepaid"]) == get_balance(SOL_PAYER)
+        assert Decimal(body["prepaid_balance"]) == get_balance(SOL_PAYER)
+        assert mock_ph.settle.await_count == 1
+
+    @respx.mock
+    def test_provider_task_failure_refunds_prepaid(self, client):
+        """A failed async task after Solana settle credits prepaid."""
+        reset()
+        _price_ok()
+        respx.post(WAVESPEED_SUBMIT).mock(
+            return_value=httpx.Response(
+                200,
+                json={"data": {"id": "task-1", "status": "processing"}},
+            )
+        )
+        respx.get("https://api.wavespeed.ai/api/v3/predictions/task-1/result").mock(
+            return_value=httpx.Response(
+                200,
+                json={"data": {"id": "task-1", "status": "failed", "error": "boom"}},
+            )
+        )
+
+        with (
+            patch("x402gate.app.payment_handler") as mock_ph,
+            patch("x402gate.core.proxy.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            _paid_handler(mock_ph, SOLANA_NETWORK, SOL_PAYER)
+            mock_ph.settle = AsyncMock(return_value=_settled_ok())
+            response = _post_wavespeed(client)
+
+        assert response.status_code == 502
+        body = response.json()
+        assert "boom" in body["error"]
+        assert Decimal(body["refunded_to_prepaid"]) == get_balance(SOL_PAYER)
+
+    @respx.mock
+    def test_provider_timeout_refunds_prepaid(self, client):
+        """A task timeout after Solana settle credits prepaid."""
+        reset()
+        _price_ok()
+        respx.post(WAVESPEED_SUBMIT).mock(
+            return_value=httpx.Response(
+                200,
+                json={"data": {"id": "task-1", "status": "processing"}},
+            )
+        )
+
+        with (
+            patch("x402gate.app.payment_handler") as mock_ph,
+            patch.object(
+                providers["wavespeed"],
+                "get_result",
+                AsyncMock(side_effect=TaskTimeoutError("task-1", 10)),
+            ),
+        ):
+            _paid_handler(mock_ph, SOLANA_NETWORK, SOL_PAYER)
+            mock_ph.settle = AsyncMock(return_value=_settled_ok())
+            response = _post_wavespeed(client)
+
+        assert response.status_code == 504
+        body = response.json()
+        assert body["task_id"] == "task-1"
+        assert Decimal(body["refunded_to_prepaid"]) == get_balance(SOL_PAYER)
+        assert Decimal(body["prepaid_balance"]) == get_balance(SOL_PAYER)
+
+    @respx.mock
+    def test_evm_provider_runs_before_settle(self, client):
+        """Base still calls the provider before any settlement."""
+        reset()
+        _price_ok()
+        seen: dict[str, int] = {}
+
+        def on_submit(request):
+            seen["settle_at_submit"] = mock_ph.settle.await_count
+            return httpx.Response(200, json={"outputs": ["ok"]})
+
+        respx.post(WAVESPEED_SUBMIT).mock(side_effect=on_submit)
+        before = set(_pending_settlements)
+
+        with patch("x402gate.app.payment_handler") as mock_ph:
+            _paid_handler(mock_ph, EVM_NETWORK, "0xPayer")
+            mock_ph.settle = AsyncMock(return_value=_settled_ok("ETH"))
+            response = _post_wavespeed(client)
+
+            async def _drain() -> None:
+                pending = [task for task in list(_pending_settlements) if not task.done()]
+                if pending:
+                    await asyncio.wait(pending, timeout=2)
+
+            portal = getattr(client, "portal", None)
+            if portal is not None:
+                portal.call(_drain)
+            new_tasks = _pending_settlements - before
+
+        assert response.status_code == 200
+        assert seen["settle_at_submit"] == 0
+        assert "refunded_to_prepaid" not in response.json()
+        assert mock_ph.settle.await_count == 1 or new_tasks
+
+    @respx.mock
+    def test_evm_provider_error_does_not_settle_or_refund(self, client):
+        """A Base provider error leaves the authorization unsettled."""
+        reset()
+        _price_ok()
+        respx.post(WAVESPEED_SUBMIT).mock(return_value=httpx.Response(400, text="bad prompt"))
+
+        with patch("x402gate.app.payment_handler") as mock_ph:
+            _paid_handler(mock_ph, EVM_NETWORK, "0xPayer")
+            mock_ph.settle = AsyncMock(return_value=_settled_ok("ETH"))
+            response = _post_wavespeed(client)
+
+        assert response.status_code == 502
+        assert "refunded_to_prepaid" not in response.json()
+        assert mock_ph.settle.await_count == 0
+        assert get_balance("0xPayer") == 0
+
+
+class TestTopupSettlesBeforeCredit:
+    """Top-up credits a balance only after settlement succeeds."""
+
+    def test_failed_settle_does_not_credit(self, client):
+        """A failed top-up settlement returns 402 and leaves the balance at zero."""
+        reset()
+        with patch("x402gate.app.payment_handler") as mock_ph:
+            mock_ph.extract_payment_signature.return_value = TOPUP_SIG
+            mock_ph.verify = AsyncMock(return_value=(True, SOLANA_NETWORK, SOL_PAYER, ""))
+            mock_ph.settle = AsyncMock(
+                return_value={
+                    "success": False,
+                    "error_reason": "transaction_simulation_failed",
+                }
+            )
+            response = client.post(
+                "/v1/topup",
+                json={"amount": 1.0},
+                headers={"Payment-Signature": "fake-sig"},
+            )
+
+        assert response.status_code == 402
+        assert "transaction_simulation_failed" in response.json()["error"]
+        assert get_balance(SOL_PAYER) == 0
+        assert mock_ph.settle.await_count == 1
+
+    def test_credits_only_after_successful_settle(self, client):
+        """The prepaid balance is still zero while settle is in progress."""
+        reset()
+
+        async def settle_side(*args, **kwargs):
+            assert get_balance(SOL_PAYER) == 0
+            return {
+                "success": True,
+                "amount_usdc": 1.0,
+                "gas_cost_usd": 0.0,
+                "gas_cost_native": 0.0,
+                "gas_label": "SOL",
+            }
+
+        with patch("x402gate.app.payment_handler") as mock_ph:
+            mock_ph.extract_payment_signature.return_value = TOPUP_SIG
+            mock_ph.verify = AsyncMock(return_value=(True, SOLANA_NETWORK, SOL_PAYER, ""))
+            mock_ph.settle = AsyncMock(side_effect=settle_side)
+            response = client.post(
+                "/v1/topup",
+                json={"amount": 1.0},
+                headers={"Payment-Signature": "fake-sig"},
+            )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert Decimal(body["credited"]) == Decimal("0.959")
+        assert get_balance(SOL_PAYER) == Decimal("0.959")

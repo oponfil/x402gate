@@ -76,6 +76,21 @@ async def _get_sol_price() -> float:
     return _price_cache["solana"]
 
 
+def _settlement_failure_reason(result: Any) -> str:
+    """Build a readable reason from a failed settle result.
+
+    The SDK often sets ``error_message`` to None, which used to log as the
+    text "None". Prefer the first real detail attached to the result.
+    """
+    error_reason = getattr(result, "error_reason", None) or "unknown"
+    detail = getattr(result, "error_message", None) or getattr(result, "invalid_message", None)
+    if isinstance(detail, dict):
+        detail = detail.get("message") or detail.get("error") or str(detail)
+    if detail:
+        return f"{error_reason}: {detail}"
+    return str(error_reason)
+
+
 class _NetworkScheme:
     """Holds a network's scheme, signer, and config for verify/settle."""
 
@@ -444,14 +459,15 @@ class PaymentHandler:
                     t_client,
                 )
             else:
+                reason = _settlement_failure_reason(result)
                 logger.warning(
-                    "Settlement failed: $%.6f USDC from %s on %s -- %s: %s",
+                    "Settlement failed: $%.6f USDC from %s on %s -- %s",
                     amount_usdc,
-                    result.payer,
+                    getattr(result, "payer", "") or "",
                     network,
-                    result.error_reason,
-                    getattr(result, "error_message", "no details"),
+                    reason,
                 )
+                settle_data["error_reason"] = reason
             return settle_data
 
         except Exception:
