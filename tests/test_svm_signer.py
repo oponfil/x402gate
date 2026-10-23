@@ -4,15 +4,21 @@ import base64
 from types import SimpleNamespace
 
 import pytest
+from solders.commitment_config import CommitmentLevel
 from solders.hash import Hash
 from solders.keypair import Keypair
 from solders.message import MessageV0
+from solders.rpc.config import RpcContextConfig
 from solders.rpc.requests import IsBlockhashValid
 from solders.rpc.responses import IsBlockhashValidResp
 from solders.system_program import TransferParams, transfer
 from solders.transaction import VersionedTransaction
 
-from x402gate.core.svm_signer import SolanaSigner
+from x402gate.core.svm_signer import (
+    _CONFIRM_RUN_TIMEOUT_S,
+    _CONFIRM_TIMEOUT_S,
+    SolanaSigner,
+)
 
 
 def _signed_transfer() -> tuple[bytes, str, str]:
@@ -148,6 +154,8 @@ class TestSolanaConfirm:
         check = rpc.events[check_at]
         assert isinstance(check[1], IsBlockhashValid)
         assert check[1].blockhash == VersionedTransaction.from_bytes(raw).message.recent_blockhash
+        assert check[1].config == RpcContextConfig(commitment=CommitmentLevel.Confirmed)
+        assert '"commitment":"confirmed"' in check[1].to_json()
         assert check[2] is IsBlockhashValidResp
         assert signer._inflight == {}
 
@@ -216,11 +224,11 @@ class TestSolanaConfirm:
         signer = _signer(rpc)
         await signer._send_async(encoded)
 
-        with pytest.raises(RuntimeError, match="not confirmed within 60s"):
+        with pytest.raises(RuntimeError, match="not confirmed within 120s"):
             await signer._confirm_async(signature)
 
-        assert clock["t"] >= 60
-        assert signer._inflight[signature] == raw
+        assert clock["t"] >= _CONFIRM_TIMEOUT_S
+        assert signer._inflight[signature][0] == raw
 
         rpc.events.clear()
         rpc._statuses = [None, _status(confirmation_status="finalized")]
@@ -237,12 +245,12 @@ class TestSolanaConfirm:
         signer = _signer(rpc)
         await signer._send_async(encoded)
 
-        with pytest.raises(RuntimeError, match="not confirmed within 60s") as raised:
+        with pytest.raises(RuntimeError, match="not confirmed within 120s") as raised:
             await signer._confirm_async(signature)
 
         assert "expired" not in str(raised.value)
-        assert signer._inflight[signature] == raw
-        assert clock["t"] >= 60
+        assert signer._inflight[signature][0] == raw
+        assert clock["t"] >= _CONFIRM_TIMEOUT_S
 
     async def test_processed_status_waits_for_confirmed(self, clock: dict[str, float]) -> None:
         _raw, encoded, signature = _signed_transfer()
@@ -260,3 +268,38 @@ class TestSolanaConfirm:
         assert _sends(rpc) == []
         assert signer._inflight == {}
         assert clock["t"] < 60
+
+
+def test_confirm_wait_outlives_the_poll_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The thread helper must not cut off a confirm that is still inside its loop."""
+    captured: dict[str, float] = {}
+
+    def _run(self, coro, *, timeout: float = 90):  # noqa: ANN001
+        _ = self
+        captured["timeout"] = timeout
+        coro.close()
+
+    monkeypatch.setattr(SolanaSigner, "_run_async", _run)
+    signer = SolanaSigner.__new__(SolanaSigner)
+    signer.confirm_transaction("sig", "solana:mainnet")
+
+    assert captured["timeout"] == _CONFIRM_RUN_TIMEOUT_S
+    assert _CONFIRM_RUN_TIMEOUT_S > _CONFIRM_TIMEOUT_S
+
+
+class TestInflightCleanup:
+    """Bytes from a transaction that is never retried do not stay forever."""
+
+    async def test_entries_older_than_two_minutes_are_dropped(
+        self, clock: dict[str, float]
+    ) -> None:
+        _ = clock
+        raw, encoded, signature = _signed_transfer()
+        rpc = _Rpc([_status(confirmation_status="confirmed")])
+        signer = _signer(rpc)
+        signer._inflight["old"] = (b"stale", -121.0)
+
+        await signer._send_async(encoded)
+
+        assert "old" not in signer._inflight
+        assert signer._inflight[signature][0] == raw

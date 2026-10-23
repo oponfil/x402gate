@@ -24,7 +24,9 @@ from typing import Any
 
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.types import TxOpts
+from solders.commitment_config import CommitmentLevel
 from solders.keypair import Keypair
+from solders.rpc.config import RpcContextConfig
 from solders.rpc.requests import IsBlockhashValid
 from solders.rpc.responses import IsBlockhashValidResp
 from solders.signature import Signature
@@ -32,9 +34,14 @@ from solders.transaction import VersionedTransaction
 
 logger = logging.getLogger(__name__)
 
-_CONFIRM_TIMEOUT_S = 60
+_CONFIRM_TIMEOUT_S = 120
+# The poll loop is the long call. This must stay above it, or _run_async
+# cancels the wait while the blockhash is still valid.
+_CONFIRM_RUN_TIMEOUT_S = 150
 _POLL_INTERVAL_S = 2
 _BLOCKHASH_CHECK_EVERY = 3
+_INFLIGHT_TTL_S = 120
+_BLOCKHASH_CONFIG = RpcContextConfig(commitment=CommitmentLevel.Confirmed)
 _EXPIRED_MESSAGE = (
     "Transaction expired (blockhash no longer valid); payment was not taken, sign a new payment"
 )
@@ -63,7 +70,7 @@ class SolanaSigner:
         self._rpc_url = rpc_url
         # Signed bytes kept so confirm can rebroadcast the same transaction.
         # Touched only from this signer's background loop.
-        self._inflight: dict[str, bytes] = {}
+        self._inflight: dict[str, tuple[bytes, float]] = {}
 
         # Persistent background event loop + async client
         self._loop = asyncio.new_event_loop()
@@ -208,10 +215,28 @@ class SolanaSigner:
         sig = getattr(result, "value", None)
         if sig:
             signature = str(sig)
-            self._inflight[signature] = tx_bytes
+            self._remember_inflight(signature, tx_bytes)
             logger.info("Transaction sent: %s", signature[:16] + "...")
             return signature
         raise RuntimeError(f"Transaction send failed: {result}")
+
+    def _remember_inflight(self, signature: str, tx_bytes: bytes) -> None:
+        """Keep the signed bytes, and drop entries that were never retried."""
+        self._prune_inflight()
+        self._inflight[signature] = (tx_bytes, time.monotonic())
+
+    def _inflight_bytes(self, signature: str) -> bytes | None:
+        self._prune_inflight()
+        entry = self._inflight.get(signature)
+        if entry is None:
+            return None
+        return entry[0]
+
+    def _prune_inflight(self) -> None:
+        cutoff = time.monotonic() - _INFLIGHT_TTL_S
+        stale = [sig for sig, (_, stored_at) in self._inflight.items() if stored_at < cutoff]
+        for sig in stale:
+            del self._inflight[sig]
 
     # ------------------------------------------------------------------
     # Protocol: confirm_transaction
@@ -220,7 +245,7 @@ class SolanaSigner:
     def confirm_transaction(self, signature: str, network: str) -> None:
         """Wait for transaction confirmation on Solana."""
         _ = network
-        self._run_async(self._confirm_async(signature))
+        self._run_async(self._confirm_async(signature), timeout=_CONFIRM_RUN_TIMEOUT_S)
 
     async def _confirm_async(self, signature: str) -> None:
         """Poll until the transaction lands, rebroadcasting the original bytes.
@@ -241,7 +266,7 @@ class SolanaSigner:
             if self._apply_status(status, signature, start):
                 return
 
-            tx_bytes = self._inflight.get(signature)
+            tx_bytes = self._inflight_bytes(signature)
             blockhash_dead = False
             if status is None and tx_bytes is not None and iteration % _BLOCKHASH_CHECK_EVERY == 0:
                 still_valid = await self._blockhash_still_valid(tx_bytes)
@@ -312,12 +337,14 @@ class SolanaSigner:
         """Return whether the signed blockhash can still land.
 
         ``None`` means the RPC check itself failed. That is not expiry.
+        The check uses confirmed commitment. The default, finalized, reports a
+        fresh confirmed blockhash as invalid for the first 10-15 seconds.
         solana-py 0.39 has no ``AsyncClient.is_blockhash_valid`` wrapper.
         """
         try:
             blockhash = VersionedTransaction.from_bytes(tx_bytes).message.recent_blockhash
             resp = await self._client._provider.make_request(
-                IsBlockhashValid(blockhash),
+                IsBlockhashValid(blockhash, _BLOCKHASH_CONFIG),
                 IsBlockhashValidResp,
             )
             return bool(resp.value)

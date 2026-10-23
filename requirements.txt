@@ -6,3 +6,6 @@ pyyaml>=6.0
 pydantic>=2.10.0
 pydantic-settings>=2.7.0
 mutagen>=1.47.0
+# Pinned: SolanaSigner calls AsyncClient._provider, a private solana-py attribute.
+solana==0.39.0
+solders==0.27.1
