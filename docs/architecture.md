@@ -97,7 +97,7 @@ Payment is verified before any work.
 
 On Base the client signs an EIP-3009 authorization that stays valid for `max_timeout` (3600 seconds). The gateway settles only after the provider succeeds. A failed or timed-out task is not settled, and the client keeps the USDC.
 
-On Solana the client signs a transaction whose blockhash expires in about a minute. The gateway settles that transaction immediately after verify, before calling the provider. If submit, polling, or the provider then fails, the settled amount is credited to the payer's in-memory prepaid balance. The error JSON includes `refunded_to_prepaid` and `prepaid_balance`.
+On Solana the client signs a transaction whose blockhash expires in about a minute. The gateway settles that transaction immediately after verify, before calling the provider. While it waits, it rebroadcasts the same signed bytes. If the blockhash expires before the transaction lands, settlement fails and the client is not charged. If submit, polling, or the provider then fails, the settled amount is credited to the payer's in-memory prepaid balance. The error JSON includes `refunded_to_prepaid` and `prepaid_balance`.
 
 ### Custom x402 Flow
 

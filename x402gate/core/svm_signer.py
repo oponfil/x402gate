@@ -20,14 +20,24 @@ import contextlib
 import logging
 import threading
 import time
+from typing import Any
 
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.types import TxOpts
 from solders.keypair import Keypair
+from solders.rpc.requests import IsBlockhashValid
+from solders.rpc.responses import IsBlockhashValidResp
 from solders.signature import Signature
 from solders.transaction import VersionedTransaction
 
 logger = logging.getLogger(__name__)
+
+_CONFIRM_TIMEOUT_S = 60
+_POLL_INTERVAL_S = 2
+_BLOCKHASH_CHECK_EVERY = 3
+_EXPIRED_MESSAGE = (
+    "Transaction expired (blockhash no longer valid); payment was not taken, sign a new payment"
+)
 
 
 class SolanaSigner:
@@ -51,6 +61,9 @@ class SolanaSigner:
         """
         self._keypair = Keypair.from_base58_string(private_key)
         self._rpc_url = rpc_url
+        # Signed bytes kept so confirm can rebroadcast the same transaction.
+        # Touched only from this signer's background loop.
+        self._inflight: dict[str, bytes] = {}
 
         # Persistent background event loop + async client
         self._loop = asyncio.new_event_loop()
@@ -194,8 +207,10 @@ class SolanaSigner:
 
         sig = getattr(result, "value", None)
         if sig:
-            logger.info("Transaction sent: %s", str(sig)[:16] + "...")
-            return str(sig)
+            signature = str(sig)
+            self._inflight[signature] = tx_bytes
+            logger.info("Transaction sent: %s", signature[:16] + "...")
+            return signature
         raise RuntimeError(f"Transaction send failed: {result}")
 
     # ------------------------------------------------------------------
@@ -208,37 +223,107 @@ class SolanaSigner:
         self._run_async(self._confirm_async(signature))
 
     async def _confirm_async(self, signature: str) -> None:
+        """Poll until the transaction lands, rebroadcasting the original bytes.
 
+        Solana settlement waits on this call, so a dropped broadcast is a
+        client-visible hang. The same signed bytes are sent again while the
+        status is empty. Once the blockhash is no longer valid the transaction
+        cannot land, and the wait ends. A plain timeout keeps the bytes so a
+        later confirm of the same signature can still rebroadcast them.
+        """
         sig = Signature.from_string(signature)
-        timeout = 60
         start = time.monotonic()
+        iteration = 0
 
-        while time.monotonic() - start < timeout:
-            resp = await self._client.get_signature_statuses(
-                [sig],
-                search_transaction_history=True,
-            )
-            if resp.value and resp.value[0]:
-                status = resp.value[0]
-                if status.err:
-                    raise RuntimeError(f"Transaction failed: {status.err}")
-                if status.confirmation_status is not None:
-                    conf = str(status.confirmation_status).lower()
-                    if "confirmed" in conf or "finalized" in conf:
-                        elapsed = time.monotonic() - start
-                        logger.info(
-                            "Transaction %s %s (%.1fs)",
-                            signature[:16] + "...",
-                            conf,
-                            elapsed,
-                        )
+        while time.monotonic() - start < _CONFIRM_TIMEOUT_S:
+            iteration += 1
+            status = await self._read_status(sig)
+            if self._apply_status(status, signature, start):
+                return
+
+            tx_bytes = self._inflight.get(signature)
+            blockhash_dead = False
+            if status is None and tx_bytes is not None and iteration % _BLOCKHASH_CHECK_EVERY == 0:
+                still_valid = await self._blockhash_still_valid(tx_bytes)
+                if still_valid is False:
+                    last = await self._read_status(sig)
+                    if self._apply_status(last, signature, start):
                         return
-            # NOTE: This polling interval does NOT affect client latency.
-            # Settlement runs as a background task (asyncio.create_task in app.py),
-            # so the HTTP response is already returned to the client before this runs.
-            await asyncio.sleep(2)
+                    if last is None:
+                        self._inflight.pop(signature, None)
+                        logger.warning(
+                            "Transaction %s expired before landing",
+                            signature[:16] + "...",
+                        )
+                        raise RuntimeError(_EXPIRED_MESSAGE)
+                    blockhash_dead = True
 
-        raise RuntimeError(f"Transaction {signature} not confirmed within {timeout}s")
+            if status is None and tx_bytes is not None and not blockhash_dead:
+                await self._rebroadcast(tx_bytes)
+            await asyncio.sleep(_POLL_INTERVAL_S)
+
+        raise RuntimeError(f"Transaction {signature} not confirmed within {_CONFIRM_TIMEOUT_S}s")
+
+    async def _read_status(self, sig: Signature) -> Any:
+        resp = await self._client.get_signature_statuses(
+            [sig],
+            search_transaction_history=True,
+        )
+        if resp.value and resp.value[0]:
+            return resp.value[0]
+        return None
+
+    def _apply_status(self, status: Any, signature: str, start: float) -> bool:
+        """Record a terminal status. Return True when the transaction is confirmed."""
+        if status is None:
+            return False
+        if status.err:
+            self._inflight.pop(signature, None)
+            raise RuntimeError(f"Transaction failed: {status.err}")
+        if status.confirmation_status is None:
+            return False
+        conf = str(status.confirmation_status).lower()
+        if "confirmed" in conf or "finalized" in conf:
+            self._inflight.pop(signature, None)
+            logger.info(
+                "Transaction %s %s (%.1fs)",
+                signature[:16] + "...",
+                conf,
+                time.monotonic() - start,
+            )
+            return True
+        return False
+
+    async def _rebroadcast(self, tx_bytes: bytes) -> None:
+        """Send the original signed bytes again. A duplicate landing is impossible."""
+        try:
+            await self._client.send_raw_transaction(
+                tx_bytes,
+                opts=TxOpts(skip_preflight=True, skip_confirmation=True, max_retries=0),
+            )
+        except Exception as exc:
+            message = str(exc).lower()
+            if "already processed" in message or "duplicate" in message:
+                logger.debug("Solana rebroadcast already processed: %s", exc)
+                return
+            logger.warning("Solana rebroadcast failed: %s", exc)
+
+    async def _blockhash_still_valid(self, tx_bytes: bytes) -> bool | None:
+        """Return whether the signed blockhash can still land.
+
+        ``None`` means the RPC check itself failed. That is not expiry.
+        solana-py 0.39 has no ``AsyncClient.is_blockhash_valid`` wrapper.
+        """
+        try:
+            blockhash = VersionedTransaction.from_bytes(tx_bytes).message.recent_blockhash
+            resp = await self._client._provider.make_request(
+                IsBlockhashValid(blockhash),
+                IsBlockhashValidResp,
+            )
+            return bool(resp.value)
+        except Exception as exc:
+            logger.warning("Blockhash validity check failed: %s", exc)
+            return None
 
     # ------------------------------------------------------------------
     # Extra: async get_transaction (used by payment.py for gas reporting)

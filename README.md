@@ -119,7 +119,7 @@ If the provider rejects a request (e.g. invalid parameters), the gateway returns
 **Retry on 5xx:** If a provider returns a server error (502, 503, etc.), x402gate automatically retries the request up to **2 times** with exponential backoff (2s → 4s) before returning the error. This prevents payment loss during brief provider outages (e.g. CDN restarts). Timeouts are also retried. Client errors (4xx) are never retried.
 
 
-> **Note:** On Base, USDC moves only after the provider returns HTTP 200. On Solana, USDC moves before the provider is called. If that job then fails, the error JSON includes `refunded_to_prepaid` and `prepaid_balance` — the full settled amount, credited in memory, not sent back on-chain.
+> **Note:** On Base, USDC moves only after the provider returns HTTP 200. On Solana, USDC moves before the provider is called. The gateway rebroadcasts that same signed transaction until it lands. If the blockhash expires first, the response is 402 and the client is not charged. If the job then fails, the error JSON includes `refunded_to_prepaid` and `prepaid_balance` — the full settled amount, credited in memory, not sent back on-chain.
 
 ### Prepaid Mode
 
