@@ -401,7 +401,7 @@ class TestOpenRouterSTT:
         "data": [
             {
                 "id": "openai/whisper-1",
-                "pricing": {"prompt": "0.006", "completion": "0"},
+                "pricing": {"prompt": "0.0001", "completion": "0"},
             }
         ]
     }

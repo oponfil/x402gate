@@ -83,7 +83,7 @@ def transcription_model_info_response():
                     "id": "openai/whisper-1",
                     "name": "OpenAI: Whisper 1",
                     "pricing": {
-                        "prompt": "0.006",
+                        "prompt": "0.0001",
                         "completion": "0",
                     },
                 },
@@ -242,7 +242,7 @@ class TestGetPrice:
     async def test_stt_whisper_price_duration_based(
         self, provider, transcription_model_info_response
     ):
-        """Whisper STT should price by audio duration (USD per minute)."""
+        """Whisper STT should price by audio duration (USD per second)."""
         body = {
             "model": "openai/whisper-1",
             "input_audio": {
@@ -255,11 +255,67 @@ class TestGetPrice:
             mock_get.return_value = transcription_model_info_response
             price = await provider.get_price("audio/transcriptions", body)
 
-        # 1 billing second -> 1/60 minute * $0.006/min
-        assert price == Decimal("1") / Decimal("60") * Decimal("0.006")
+        # 1 billing second * $0.0001 per second
+        assert price == Decimal("0.0001")
         assert (
             mock_get.call_args_list[0].args[0].endswith("/models?output_modalities=transcription")
         )
+
+    @pytest.mark.asyncio
+    async def test_stt_small_per_second_price_is_accepted(self, provider):
+        """A sub-cent per-second rate is duration pricing, not a token model."""
+        body = {
+            "model": "openai/whisper-large-v3",
+            "input_audio": {
+                "data": make_wav_b64(1.0),
+                "format": "wav",
+            },
+        }
+        catalog = httpx.Response(
+            status_code=200,
+            json={
+                "data": [
+                    {
+                        "id": "openai/whisper-large-v3",
+                        "pricing": {"prompt": "0.0000075", "completion": "0"},
+                    }
+                ]
+            },
+        )
+
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = catalog
+            price = await provider.get_price("audio/transcriptions", body)
+
+        assert price == Decimal("0.0000075")
+
+    @pytest.mark.asyncio
+    async def test_stt_hourly_catalog_price(self, provider):
+        """Microsoft publishes the hourly rate in pricing.prompt."""
+        body = {
+            "model": "microsoft/mai-transcribe-1.5",
+            "input_audio": {
+                "data": make_wav_b64(1.0),
+                "format": "wav",
+            },
+        }
+        catalog = httpx.Response(
+            status_code=200,
+            json={
+                "data": [
+                    {
+                        "id": "microsoft/mai-transcribe-1.5",
+                        "pricing": {"prompt": "0.36", "completion": "0"},
+                    }
+                ]
+            },
+        )
+
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = catalog
+            price = await provider.get_price("audio/transcriptions", body)
+
+        assert price == Decimal("0.36") / Decimal("3600")
 
     @pytest.mark.asyncio
     async def test_stt_token_model_rejected(self, provider, transcription_model_info_response):
@@ -568,4 +624,4 @@ class TestCalculateActualCost:
             mock_get.return_value = transcription_model_info_response
             cost = await provider.calculate_actual_cost(body, result)
 
-        assert cost == Decimal("0.006")
+        assert cost == Decimal("0.006")  # 60 seconds * $0.0001 per second

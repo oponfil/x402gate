@@ -14,7 +14,7 @@ POST /v1/openrouter/audio/transcriptions
 |---|---|
 | OpenRouter STT docs | [openrouter.ai/docs/guides/overview/multimodal/stt](https://openrouter.ai/docs/guides/overview/multimodal/stt) |
 | Model catalog | [openrouter.ai/models](https://openrouter.ai/models) — filter by **Transcription** |
-| Whisper 1 pricing | [openrouter.ai/openai/whisper-1](https://openrouter.ai/openai/whisper-1) — $0.006/min |
+| Whisper 1 pricing | [openrouter.ai/openai/whisper-1](https://openrouter.ai/openai/whisper-1) — $0.0001/sec ($0.006/min) |
 
 ## Request
 
@@ -70,13 +70,14 @@ x402gate estimates cost **before** payment from audio duration and the model's p
 
 | Model type | Examples | How priced |
 |---|---|---|
-| Supported: duration-based | `openai/whisper-1`, `openai/whisper-large-v3` | USD per **minute** of audio |
+| Supported: duration-based | `openai/whisper-1`, `openai/whisper-large-v3` | USD per **second** of audio (`pricing.prompt`) |
 | Not supported: token-based | `openai/gpt-4o-transcribe`, `openai/gpt-4o-mini-transcribe` | Cannot be safely capped before payment |
 
 **Estimate rules:**
 - Audio duration is parsed from the uploaded file and rounded **up to whole seconds** (conservative estimate).
 - Minimum billing unit is **1 second** — even a 0.01 s clip is estimated as 1 s.
 - Maximum file size: **25 MB** (OpenRouter Whisper limit).
+- Microsoft MAI models publish an hourly rate in `pricing.prompt` (`0.10`, `0.36`). Those rates are divided by 3600. Every other duration model is already priced per second.
 
 **After the request:** prepaid mode deducts `usage.cost` from OpenRouter when available; x402 mode settles the signed estimate (see [prepaid.md](prepaid.md)).
 
@@ -92,8 +93,8 @@ Popular models:
 
 | Model | Pricing | Notes |
 |---|---|---|
-| `openai/whisper-1` | $0.006/min | 50+ languages, up to 25 MB |
-| `openai/whisper-large-v3` | ~$0.0015/min | Multilingual, higher quality |
+| `openai/whisper-1` | $0.0001/sec | 50+ languages, up to 25 MB |
+| `openai/whisper-large-v3` | $0.0000075/sec | Multilingual, higher quality |
 
 ## Example (x402)
 

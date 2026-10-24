@@ -31,9 +31,10 @@ logger = logging.getLogger(__name__)
 # Rough estimate: 1 token ≈ 4 characters
 _CHARS_PER_TOKEN = 4
 
-# OpenRouter STT: Whisper models use pricing.prompt as USD per minute of audio
-# and pricing.completion == 0. Token-based transcribe models set completion > 0.
-_DURATION_STT_PROMPT_THRESHOLD = Decimal("0.0001")
+# OpenRouter duration STT sets pricing.completion to 0. Token-priced
+# transcribers set completion above 0. pricing.prompt is USD per second,
+# except values at or above this, which are the hourly rate (MAI-Transcribe).
+_HOURLY_STT_PRICE = Decimal("0.01")
 
 
 def _is_stt_request(path: str, inputs: dict[str, Any]) -> bool:
@@ -41,9 +42,18 @@ def _is_stt_request(path: str, inputs: dict[str, Any]) -> bool:
 
 
 def _is_duration_based_stt(pricing: dict[str, Any]) -> bool:
+    """True when the catalog prices this STT model by audio duration."""
     prompt = Decimal(str(pricing.get("prompt", "0")))
     completion = Decimal(str(pricing.get("completion", "0")))
-    return prompt >= _DURATION_STT_PROMPT_THRESHOLD and completion == 0
+    return prompt > 0 and completion == 0
+
+
+def _duration_stt_cost(seconds: int, prompt_price: Decimal) -> Decimal:
+    """Price a duration-based transcription from the catalog prompt rate."""
+    per_second = (
+        prompt_price / Decimal("3600") if prompt_price >= _HOURLY_STT_PRICE else prompt_price
+    )
+    return _apply_cost_floor(Decimal(seconds) * per_second)
 
 
 def _extract_stt_audio(
@@ -279,8 +289,7 @@ class OpenRouterProvider(BaseProvider):
         pricing = model_info.get("pricing", {})
 
         if _is_duration_based_stt(pricing):
-            # pricing.prompt is USD per minute of audio (Whisper family).
-            estimated_cost = Decimal(seconds) / Decimal("60") * prompt_price_dec
+            estimated_cost = _duration_stt_cost(seconds, prompt_price_dec)
             logger.info(
                 "OpenRouter price estimate for %s: $%s (%d billing seconds, duration-based STT)",
                 model_id,
@@ -624,8 +633,7 @@ class OpenRouterProvider(BaseProvider):
         audio_seconds = usage.get("seconds")
         if audio_seconds is not None and _is_duration_based_stt(pricing):
             seconds = billing_seconds(float(audio_seconds))
-            actual_cost = Decimal(seconds) / Decimal("60") * prompt_price_dec
-            actual_cost = _apply_cost_floor(actual_cost)
+            actual_cost = _duration_stt_cost(seconds, prompt_price_dec)
             logger.info(
                 "OpenRouter actual cost for %s: $%s (%d billing seconds, duration STT)",
                 model_id,
