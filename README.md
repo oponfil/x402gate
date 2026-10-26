@@ -70,6 +70,47 @@ The payment goes directly to BlockRun's wallet — x402gate earns nothing but pr
 
 CloudConvert uses **multipart/form-data** for file uploads. Supports 200+ formats (DOCX→PDF, PNG→JPG, etc.) and PDF optimization. See [docs/configuration.md](docs/configuration.md) for supported parameters.
 
+### SpicyAPI (image and video)
+
+Every SpicyAPI image and video model uses one endpoint. Put the catalog model id in `model` and that model's fields in `input`. The gateway quotes the exact request before payment, then runs the job.
+
+```
+POST /v1/spicyapi/jobs
+```
+
+Image:
+
+```bash
+curl -X POST https://x402gate.io/v1/spicyapi/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "alibaba/z-image-spicy/text-to-image",
+    "input": {
+      "prompt": "A ceramic teapot on a linen cloth, soft window light, muted palette",
+      "enable_prompt_expansion": false
+    }
+  }'
+```
+
+Video uses the same path. The gateway polls until the clip is ready, up to 10 minutes:
+
+```bash
+curl -X POST https://x402gate.io/v1/spicyapi/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "bytedance/seedance-1.5-pro/text-to-video",
+    "input": {
+      "prompt": "A cat slowly walking across a sunlit room, cinematic",
+      "aspect_ratio": "16:9",
+      "resolution": "480p",
+      "duration_seconds": 4,
+      "generate_audio": false
+    }
+  }'
+```
+
+Model ids come from the [SpicyAPI catalog](https://spicyapi.ai). A finished job returns the file URL in `output.assets`.
+
 ### Transaction Summary
 
 After each settled payment, the gateway logs a financial summary with both estimated and actual costs:
@@ -278,6 +319,7 @@ See [docs/add-provider.md](docs/add-provider.md) for a step-by-step guide.
 - [Configuration](docs/configuration.md) — all config options
 - [TTS Providers](docs/tts.md) — ElevenLabs, MiniMax, Fish Audio
 - [STT (OpenRouter)](docs/stt.md) — Whisper and speech-to-text transcription
+- [SpicyAPI](https://docs.spicyapi.ai/docs/tasks) — image and video jobs (`POST /v1/spicyapi/jobs`)
 - [SocialDownload](docs/socialdownload.md) — download media from social networks
 - [Adding a Provider](docs/add-provider.md) — extend with new AI services
 - [AI Agent Skill](.agents/skills/x402gate/SKILL.md) — public skill for autonomous agents to use `x402gate.io` (OpenClaw, etc.)
