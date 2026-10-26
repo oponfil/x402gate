@@ -119,7 +119,7 @@ providers:
           mode: "on"
           max_search_results: 1
   tungsten:
-    enabled: true
+    enabled: false  # hidden from the site and not routed; set true to restore
     base_url: "https://api.tungsten.run/v1"
     jwt_token: "${TUNGSTEN_JWT_TOKEN}"
     cf_clearance: "${TUNGSTEN_CF_CLEARANCE}"
@@ -174,6 +174,31 @@ providers:
               weight: 0.75
           controlnets: []
           img2img: null
+  spicyapi:
+    enabled: true
+    base_url: "https://api.spicyapi.ai"
+    api_key: "${SPICYAPI_API_KEY}"
+    poll_interval: 2
+    poll_timeout: 600
+    description: "200+ image and video models (Flux, Wan, Seedance, Kling…), quoted per request"
+    docs_url: "https://docs.spicyapi.ai/docs/tasks"
+    example_request:
+      model: "jobs"
+      body:
+        model: "alibaba/z-image-spicy/text-to-image"
+        input:
+          prompt: "A ceramic teapot on a linen cloth, soft window light, muted palette"
+          enable_prompt_expansion: false
+    example_request_2:
+      model: "jobs"
+      body:
+        model: "bytedance/seedance-1.5-pro/text-to-video"
+        input:
+          prompt: "A cat slowly walking across a sunlit room, cinematic"
+          aspect_ratio: "16:9"
+          resolution: "480p"
+          duration_seconds: 4
+          generate_audio: false
   cloudconvert:
     enabled: true
     base_url: "https://api.cloudconvert.com/v2"

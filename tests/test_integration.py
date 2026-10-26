@@ -83,6 +83,12 @@ providers:
     poll_timeout: 10
     models_cache_ttl: 86400
     max_stt_audio_mb: 25
+  tungsten:
+    enabled: false
+    base_url: "https://api.tungsten.run/v1"
+    jwt_token: "${TUNGSTEN_JWT_TOKEN}"
+    cf_clearance: "${TUNGSTEN_CF_CLEARANCE}"
+    fixed_price_usd: 0.01
 """)
     return config
 
@@ -116,6 +122,24 @@ class TestProvidersList:
         assert response.status_code == 200
         data = response.json()
         assert "wavespeed" in data["providers"]
+        assert "tungsten" not in data["providers"]
+
+    def test_disabled_provider_is_hidden(self, client):
+        """A disabled provider has no route and is omitted from discovery."""
+        missing = client.post("/v1/tungsten/generations", json={"prompt": "x"})
+        assert missing.status_code == 404
+
+        page = client.get("/", headers={"Accept": "text/html"})
+        assert page.status_code == 200
+        assert "tungsten" not in page.text.lower()
+
+        manifest = client.get("/", headers={"Accept": "application/json"})
+        body = manifest.json()
+        assert "tungsten" not in body["providers"]
+        assert "tungsten" not in body["provider_docs"]
+
+        plugin = client.get("/.well-known/ai-plugin.json")
+        assert "tungsten" not in plugin.json()["description_for_model"]
 
 
 class TestWaveSpeedProxy:

@@ -80,10 +80,11 @@ Every variable referenced from active config is validated at startup. If you lea
 |---|---|---|
 | `WAVESPEED_API_KEY` | Yes | WaveSpeed AI API key |
 | `OPENROUTER_API_KEY` | Yes | OpenRouter API key |
-| `TUNGSTEN_JWT_TOKEN` | Yes | Tungsten JWT cookie |
-| `TUNGSTEN_CF_CLEARANCE` | Yes | Tungsten Cloudflare clearance cookie |
+| `TUNGSTEN_JWT_TOKEN` | No | Tungsten JWT cookie. Required only when `providers.tungsten.enabled` is true |
+| `TUNGSTEN_CF_CLEARANCE` | No | Tungsten Cloudflare clearance cookie. Required only when Tungsten is enabled |
 | `CLOUDCONVERT_API_KEY` | Yes | CloudConvert API key |
 | `RAPIDAPI_KEY` | Yes | RapidAPI key for SocialDownload |
+| `SPICYAPI_API_KEY` | Yes | SpicyAPI key for image and video jobs |
 | `BASE_PAY_TO_ADDRESS` | Yes | EVM wallet address for receiving USDC |
 | `BASE_FACILITATOR_PRIVATE_KEY` | Yes | EVM private key for on-chain settlement (needs ETH for gas) |
 | `SOLANA_PAY_TO_ADDRESS` | Solana | Solana wallet address for receiving USDC (base58) |

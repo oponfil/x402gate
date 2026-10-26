@@ -5,12 +5,15 @@ import time
 import pytest
 
 from tests.e2e.conftest import run_script
+from x402gate.core.config import load_config
 
 
 @pytest.mark.order("first")
 @pytest.mark.asyncio
 async def test_tungsten_bad_model_no_settlement(gateway_process, base_chain):
     """Send non-existent model UUID to Tungsten, verify error + no money lost."""
+    if not load_config().providers["tungsten"].enabled:
+        pytest.skip("tungsten provider is disabled")
     client_before = base_chain.get_usdc(base_chain.client_address)
     print(f"\n=== [Base] Client USDC BEFORE: {client_before / 1e6:.6f} ===")
 

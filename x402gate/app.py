@@ -45,6 +45,7 @@ from x402gate.providers.fishaudio import FishAudioProvider
 from x402gate.providers.minimax import MinimaxProvider
 from x402gate.providers.openrouter import OpenRouterProvider
 from x402gate.providers.socialdownload import SocialDownloadProvider
+from x402gate.providers.spicyapi import SpicyApiProvider
 from x402gate.providers.tungsten import TungstenProvider
 from x402gate.providers.wavespeed import WaveSpeedProvider
 
@@ -126,6 +127,7 @@ PROVIDER_REGISTRY: dict[str, type[BaseProvider]] = {
     "elevenlabs": ElevenLabsProvider,
     "minimax": MinimaxProvider,
     "fishaudio": FishAudioProvider,
+    "spicyapi": SpicyApiProvider,
 }
 
 # Global state (initialized in lifespan)
@@ -275,6 +277,7 @@ async def service_info(request: Request) -> Response:
         "blockrun": "LLM",
         "wavespeed": "Image & Video",
         "tungsten": "Image & Video",
+        "spicyapi": "Image & Video",
         "elevenlabs": "Text-to-Speech",
         "minimax": "Text-to-Speech",
         "fishaudio": "Text-to-Speech",
@@ -283,6 +286,8 @@ async def service_info(request: Request) -> Response:
     }
 
     for name, pcfg in config.providers.items():
+        if not pcfg.enabled:
+            continue
         ptype = getattr(pcfg, "type", "managed") or "managed"
         provider_info.append(
             {
@@ -407,6 +412,8 @@ async def ai_plugin_manifest() -> dict[str, Any]:
     # Build provider usage hints from config
     provider_hints = []
     for name, pcfg in config.providers.items():
+        if not pcfg.enabled:
+            continue
         hint = f"Provider '{name}': POST /v1/{name}/{{model_path}}"
         if pcfg.docs_url:
             hint += f" (docs: {pcfg.docs_url})"

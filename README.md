@@ -10,7 +10,7 @@ x402gate sits between your AI agent and AI service providers, adding [x402](http
 |----------|------|------|----------|
 | [OpenRouter](https://openrouter.ai) | Managed | 300+ LLMs, embeddings, STT (GPT, Claude, Whisper…) | `/v1/openrouter/...` |
 | [WaveSpeed AI](https://wavespeed.ai) | Managed | 60+ image/video models (Flux, Wan, Kling, Sora…) | `/v1/wavespeed/...` |
-| [Tungsten](https://tungsten.run) | Managed | AI image generation (SDXL, Flux, Qwen, Z-Image…) | `/v1/tungsten/...` |
+| [SpicyAPI](https://spicyapi.ai) | Managed | 200+ image and video models (Flux, Wan, Seedance, Kling…) | `/v1/spicyapi/jobs` |
 | [BlockRun](https://blockrun.ai) | Passthrough | 40+ LLMs (GPT, Claude, Gemini…) | `/v1/blockrun/...` |
 | [CloudConvert](https://cloudconvert.com) | Managed | File conversion (200+ formats) | `/v1/cloudconvert/...` |
 | [SocialDownload](https://rapidapi.com/nguyenmanhict-MuTUtGWD7K/api/social-download-all-in-one) | Managed | Download media from social networks | `/v1/socialdownload/...` |
@@ -278,7 +278,6 @@ See [docs/add-provider.md](docs/add-provider.md) for a step-by-step guide.
 - [Configuration](docs/configuration.md) — all config options
 - [TTS Providers](docs/tts.md) — ElevenLabs, MiniMax, Fish Audio
 - [STT (OpenRouter)](docs/stt.md) — Whisper and speech-to-text transcription
-- [Tungsten](docs/tungsten.md) — Tungsten image generation provider
 - [SocialDownload](docs/socialdownload.md) — download media from social networks
 - [Adding a Provider](docs/add-provider.md) — extend with new AI services
 - [AI Agent Skill](.agents/skills/x402gate/SKILL.md) — public skill for autonomous agents to use `x402gate.io` (OpenClaw, etc.)

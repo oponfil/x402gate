@@ -1,5 +1,7 @@
 # Tungsten Provider
 
+Tungsten is turned off in `config.yaml` (`enabled: false`). The gateway does not route it or list it until that flag is set back to `true`.
+
 [Tungsten.run](https://tungsten.run) is an AI image generator supporting Stable Diffusion, Flux, and other models with LoRA/embedding support.
 
 ## Endpoint

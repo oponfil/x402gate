@@ -3,11 +3,14 @@
 import pytest
 
 from tests.e2e.conftest import run_e2e_client
+from x402gate.core.config import load_config
 
 
 @pytest.mark.asyncio
 async def test_base_tungsten(gateway_process, base_chain):
     """Full payment flow on Base: pay USDC → generate image via Tungsten → verify balances."""
+    if not load_config().providers["tungsten"].enabled:
+        pytest.skip("tungsten provider is disabled")
     diff = run_e2e_client(
         "tests/e2e/x402_tungsten_client.py",
         chain=base_chain,

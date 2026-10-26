@@ -263,22 +263,23 @@ async def run_client():
             http_client, gateway_url, pubkey_str, "WaveSpeed"
         )
 
-        # 5. Tungsten call (image generation)
-        tg_ex = cfg["providers"]["tungsten"]["example_request"]
-        tg_model = tg_ex["model"]  # e.g. "generations"
-        await _prepaid_request(
-            http_client,
-            gateway_url,
-            keypair,
-            provider="tungsten",
-            sub_path=tg_model,
-            body=tg_ex["body"],
-            label="Tungsten",
-            request_timeout=300.0,  # Tungsten can take 60-120+ seconds
-        )
-        balances["tungsten"] = await _check_balance(
-            http_client, gateway_url, pubkey_str, "Tungsten"
-        )
+        # 5. Tungsten call (image generation), when the provider is enabled
+        tg = cfg["providers"].get("tungsten") or {}
+        tg_ex = tg.get("example_request")
+        if tg.get("enabled", True) and tg_ex:
+            await _prepaid_request(
+                http_client,
+                gateway_url,
+                keypair,
+                provider="tungsten",
+                sub_path=tg_ex["model"],
+                body=tg_ex["body"],
+                label="Tungsten",
+                request_timeout=300.0,  # Tungsten can take 60-120+ seconds
+            )
+            balances["tungsten"] = await _check_balance(
+                http_client, gateway_url, pubkey_str, "Tungsten"
+            )
 
         # Summary
         print(f"\n{'=' * 60}")
