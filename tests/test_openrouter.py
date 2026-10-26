@@ -146,9 +146,12 @@ class TestGetPrice:
         assert isinstance(price, Decimal)
         assert price > Decimal("0")
 
-        # Verify: ~6 input tokens (25 chars / 4) × $0.00000015
+        # Verify: 25 chars / 2.7 ≈ 9 input tokens × $0.00000015
         #        + 1024 output tokens × $0.0000006 (max_tokens raised to default)
-        expected_input_tokens = max(len("What is quantum computing?") // 4, 1)
+        expected_input_tokens = max(
+            int(Decimal(len("What is quantum computing?")) / Decimal("2.7")),
+            1,
+        )
         expected = Decimal(expected_input_tokens) * Decimal("0.00000015") + Decimal(
             "1024"
         ) * Decimal("0.0000006")
@@ -167,7 +170,7 @@ class TestGetPrice:
             price = await provider.get_price("chat/completions", body)
 
         # Default is 1024 max_tokens
-        # input ~1 token (2 chars / 4), completion = 1024
+        # "Hi" is 2 chars / 2.7, which floors to 0 and is raised to 1 token
         # 1 * 0.00000015 + 1024 * 0.0000006 = 0.00061455
         expected = Decimal("1") * Decimal("0.00000015") + Decimal("1024") * Decimal("0.0000006")
         assert price == expected

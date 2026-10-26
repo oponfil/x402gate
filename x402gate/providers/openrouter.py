@@ -28,13 +28,26 @@ from x402gate.providers.base import BaseProvider, ProviderError
 
 logger = logging.getLogger(__name__)
 
-# Rough estimate: 1 token ≈ 4 characters
+# Embeddings keep the loose 4-character rule. Chat prompts, especially
+# DeepSeek, bill closer to 2.8 characters per token, so the chat estimate
+# uses 2.7 and holds a little extra until the actual usage is known.
 _CHARS_PER_TOKEN = 4
+_CHAT_CHARS_PER_TOKEN = Decimal("2.7")
 
 # OpenRouter duration STT sets pricing.completion to 0. Token-priced
 # transcribers set completion above 0. pricing.prompt is USD per second,
 # except values at or above this, which are the hourly rate (MAI-Transcribe).
 _HOURLY_STT_PRICE = Decimal("0.01")
+
+
+def _estimate_input_tokens(total_chars: int, *, chat: bool = False) -> int:
+    """Turn a character count into a token estimate.
+
+    Chat uses 2.7 characters per token. Everything else keeps 4.
+    """
+    if chat:
+        return max(int(Decimal(total_chars) / _CHAT_CHARS_PER_TOKEN), 1)
+    return max(total_chars // _CHARS_PER_TOKEN, 1)
 
 
 def _is_stt_request(path: str, inputs: dict[str, Any]) -> bool:
@@ -363,7 +376,7 @@ class OpenRouterProvider(BaseProvider):
                 total_chars = sum(len(str(item)) for item in text_input)
             else:
                 total_chars = len(str(text_input))
-            estimated_input_tokens = max(total_chars // _CHARS_PER_TOKEN, 1)
+            estimated_input_tokens = _estimate_input_tokens(total_chars)
 
             estimated_cost = Decimal(estimated_input_tokens) * prompt_price_dec
             logger.info(
@@ -376,7 +389,7 @@ class OpenRouterProvider(BaseProvider):
 
         messages = inputs.get("messages", [])
         total_chars = sum(len(str(m.get("content", ""))) for m in messages)
-        estimated_input_tokens = max(total_chars // _CHARS_PER_TOKEN, 1)
+        estimated_input_tokens = _estimate_input_tokens(total_chars, chat=True)
 
         web_search_cost = Decimal(0)
         plugins = inputs.get("plugins", [])
