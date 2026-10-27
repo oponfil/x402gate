@@ -10,7 +10,7 @@ x402gate sits between your AI agent and AI service providers, adding [x402](http
 |----------|------|------|----------|
 | [OpenRouter](https://openrouter.ai) | Managed | 300+ LLMs, embeddings, STT (GPT, Claude, Whisper…) | `/v1/openrouter/...` |
 | [WaveSpeed AI](https://wavespeed.ai) | Managed | 60+ image/video models (Flux, Wan, Kling, Sora…) | `/v1/wavespeed/...` |
-| [SpicyAPI](https://spicyapi.ai) | Managed | 200+ image and video models (Flux, Wan, Seedance, Kling…) | `/v1/spicyapi/jobs` |
+| [SpicyAPI](https://spicyapi.ai) | Managed | Image, video, and chat models (Flux, Wan, Seedance, DeepSeek, Grok…) | `/v1/spicyapi/jobs`, `/v1/spicyapi/chat/completions` |
 | [BlockRun](https://blockrun.ai) | Passthrough | 40+ LLMs (GPT, Claude, Gemini…) | `/v1/blockrun/...` |
 | [CloudConvert](https://cloudconvert.com) | Managed | File conversion (200+ formats) | `/v1/cloudconvert/...` |
 | [SocialDownload](https://rapidapi.com/nguyenmanhict-MuTUtGWD7K/api/social-download-all-in-one) | Managed | Download media from social networks | `/v1/socialdownload/...` |
@@ -70,7 +70,7 @@ The payment goes directly to BlockRun's wallet — x402gate earns nothing but pr
 
 CloudConvert uses **multipart/form-data** for file uploads. Supports 200+ formats (DOCX→PDF, PNG→JPG, etc.) and PDF optimization. See [docs/configuration.md](docs/configuration.md) for supported parameters.
 
-### SpicyAPI (image and video)
+### SpicyAPI (image, video, and chat)
 
 Every SpicyAPI image and video model uses one endpoint. Put the catalog model id in `model` and that model's fields in `input`. The gateway quotes the exact request before payment, then runs the job.
 
@@ -110,6 +110,19 @@ curl -X POST https://x402gate.io/v1/spicyapi/jobs \
 ```
 
 Model ids come from the [SpicyAPI catalog](https://spicyapi.ai). A finished job returns the file URL in `output.assets`.
+
+Chat uses the same quote, then returns one OpenAI completion. The gateway does not stream. Set `max_tokens`; if you omit it, the gateway uses its default cap. `reasoning_effort` changes the quote, because the model reserves thinking tokens before it writes.
+
+```bash
+curl -X POST https://x402gate.io/v1/spicyapi/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek/v4.1-flash/chat",
+    "messages": [{"role": "user", "content": "Say hello in one sentence."}],
+    "max_tokens": 256,
+    "reasoning_effort": "low"
+  }'
+```
 
 ### Transaction Summary
 
@@ -319,7 +332,7 @@ See [docs/add-provider.md](docs/add-provider.md) for a step-by-step guide.
 - [Configuration](docs/configuration.md) — all config options
 - [TTS Providers](docs/tts.md) — ElevenLabs, MiniMax, Fish Audio
 - [STT (OpenRouter)](docs/stt.md) — Whisper and speech-to-text transcription
-- [SpicyAPI](https://docs.spicyapi.ai/docs/tasks) — image and video jobs (`POST /v1/spicyapi/jobs`)
+- [SpicyAPI](https://docs.spicyapi.ai/docs/tasks) — image and video jobs (`POST /v1/spicyapi/jobs`) and chat (`POST /v1/spicyapi/chat/completions`)
 - [SocialDownload](docs/socialdownload.md) — download media from social networks
 - [Adding a Provider](docs/add-provider.md) — extend with new AI services
 - [AI Agent Skill](.agents/skills/x402gate/SKILL.md) — public skill for autonomous agents to use `x402gate.io` (OpenClaw, etc.)

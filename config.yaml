@@ -180,7 +180,7 @@ providers:
     api_key: "${SPICYAPI_API_KEY}"
     poll_interval: 2
     poll_timeout: 600
-    description: "200+ image and video models (Flux, Wan, Seedance, Kling…), quoted per request"
+    description: "Image, video, and chat models (Flux, Wan, Seedance, DeepSeek, Grok…), quoted per request"
     docs_url: "https://docs.spicyapi.ai/docs/tasks"
     example_request:
       model: "jobs"
@@ -199,6 +199,15 @@ providers:
           resolution: "480p"
           duration_seconds: 4
           generate_audio: false
+    example_request_3:
+      model: "chat/completions"
+      body:
+        model: "deepseek/v4.1-flash/chat"
+        messages:
+          - role: "user"
+            content: "Say hello in one sentence."
+        max_tokens: 256
+        reasoning_effort: "low"
   cloudconvert:
     enabled: true
     base_url: "https://api.cloudconvert.com/v2"

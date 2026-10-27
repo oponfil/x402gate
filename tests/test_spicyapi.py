@@ -102,10 +102,10 @@ class TestGetPrice:
 
     @pytest.mark.asyncio
     async def test_rejects_unknown_path(self):
-        """Only the jobs endpoint is part of the gateway contract."""
+        """Jobs and chat are the only SpicyAPI routes."""
         provider = _provider()
-        with pytest.raises(ProviderError, match="/v1/spicyapi/jobs"):
-            await provider.get_price("chat/completions", _BODY)
+        with pytest.raises(ProviderError, match="chat/completions"):
+            await provider.get_price("images", _BODY)
 
     @pytest.mark.asyncio
     async def test_rejects_missing_input(self):
@@ -309,3 +309,202 @@ class TestGetResult:
         with pytest.raises(TaskTimeoutError):
             await provider.get_result("job_1")
         provider._client.request.assert_not_awaited()
+
+
+_CHAT = {
+    "model": "deepseek/v4.1-flash/chat",
+    "messages": [{"role": "user", "content": "Say hello in one sentence."}],
+    "max_tokens": 64,
+    "reasoning_effort": "low",
+    "_caller": "abcd1234ef01",
+}
+
+
+class _StreamResponse:
+    """Minimal httpx stream response for chat tests."""
+
+    def __init__(self, status: int, lines: list[str] | None = None, payload: dict | None = None):
+        self.status_code = status
+        self.headers = {"x-spicy-task-id": "job_chat"} if status < 400 else {}
+        self._lines = lines or []
+        self._payload = payload or {}
+        self.text = json.dumps(self._payload)
+
+    def json(self) -> dict:
+        return self._payload
+
+    async def aread(self) -> bytes:
+        return self.text.encode()
+
+    async def aiter_lines(self):
+        for line in self._lines:
+            yield line
+
+
+class _StreamContext:
+    def __init__(self, response: _StreamResponse):
+        self._response = response
+
+    async def __aenter__(self) -> _StreamResponse:
+        return self._response
+
+    async def __aexit__(self, *args: object) -> bool:
+        return False
+
+
+def _chat_lines() -> list[str]:
+    first = (
+        'data: {"id":"chatcmpl_1","model":"deepseek/v4.1-flash/chat",'
+        '"choices":[{"index":0,"delta":{"content":"Hello"}}]}'
+    )
+    second = 'data: {"choices":[{"index":0,"delta":{"content":" there."},"finish_reason":"stop"}]}'
+    usage = 'data: {"usage":{"prompt_tokens":12,"completion_tokens":4}}'
+    return [first, second, usage, "data: [DONE]"]
+
+
+def _attach_stream(provider: SpicyApiProvider, responses: list[_StreamResponse]) -> None:
+    queue = list(responses)
+
+    def open_stream(*args: object, **kwargs: object) -> _StreamContext:
+        return _StreamContext(queue.pop(0))
+
+    provider._client.stream = open_stream
+
+
+class TestChat:
+    """Tests for POST /v1/spicyapi/chat/completions."""
+
+    @pytest.mark.asyncio
+    async def test_quotes_openai_body_as_text_input(self):
+        """Chat price is the SpicyAPI quote, with the output cap inside input."""
+        provider = _provider()
+        provider._client.request.return_value = _quote(cost="0.0098895", unit="per_1k_tokens")
+
+        price = await provider.get_price("chat/completions", _CHAT)
+
+        assert price == Decimal("0.0098895")
+        sent = provider._client.request.await_args.kwargs["json"]
+        assert sent == {
+            "model": _CHAT["model"],
+            "input": {
+                "messages": _CHAT["messages"],
+                "max_tokens": 64,
+                "reasoning_effort": "low",
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_omitted_max_tokens_uses_gateway_default(self):
+        """A missing cap must not fall through to the model's large default."""
+        provider = _provider()
+        provider._default_max_tokens = 2048
+        provider._client.request.return_value = _quote(unit="per_1k_tokens")
+        body = {key: value for key, value in _CHAT.items() if key != "max_tokens"}
+
+        await provider.get_price("chat/completions", body)
+
+        sent = provider._client.request.await_args.kwargs["json"]
+        assert sent["input"]["max_tokens"] == 2048
+
+    @pytest.mark.asyncio
+    async def test_stream_is_rejected(self):
+        """The gateway returns one JSON body, so SSE is not offered to the client."""
+        provider = _provider()
+        with pytest.raises(ProviderError, match="Streaming is not supported") as exc:
+            await provider.get_price("chat/completions", {**_CHAT, "stream": True})
+        assert exc.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_submit_folds_the_stream_and_reads_settled_cost(self):
+        """A quoted chat is streamed, then settled from the task record."""
+        provider = _provider()
+        provider._client.request.side_effect = [
+            _quote(cost="0.0098895", quote_id="qchat", unit="per_1k_tokens"),
+            _task("succeeded", task_id="job_chat", cost="0.001", settled=True),
+        ]
+        _attach_stream(provider, [_StreamResponse(200, _chat_lines())])
+
+        await provider.get_price("chat/completions", _CHAT)
+        result = await provider.submit("chat/completions", _CHAT)
+
+        assert result["object"] == "chat.completion"
+        assert result["choices"][0]["message"]["content"] == "Hello there."
+        assert result["choices"][0]["finish_reason"] == "stop"
+        assert result["usage"]["prompt_tokens"] == 12
+        assert result["task_id"] == "job_chat"
+        assert "status" not in result
+        assert await provider.calculate_actual_cost(_CHAT, result) == Decimal("0.001")
+
+    @pytest.mark.asyncio
+    async def test_submit_sends_the_quoted_price(self):
+        """The stream call carries the quote the client was shown."""
+        provider = _provider()
+        captured: dict = {}
+
+        def open_stream(*args: object, **kwargs: object) -> _StreamContext:
+            captured["json"] = kwargs.get("json")
+            captured["headers"] = kwargs.get("headers")
+            captured["url"] = args[1] if len(args) > 1 else ""
+            return _StreamContext(_StreamResponse(200, _chat_lines()))
+
+        provider._client.stream = open_stream
+        provider._client.request.side_effect = [
+            _quote(cost="0.0098895", quote_id="qchat", unit="per_1k_tokens"),
+            _task("succeeded", task_id="job_chat", cost="0.001", settled=True),
+        ]
+
+        await provider.get_price("chat/completions", _CHAT)
+        await provider.submit("chat/completions", _CHAT)
+
+        assert captured["json"]["quoteId"] == "qchat"
+        assert captured["json"]["expectedCost"] == "0.0098895"
+        assert captured["json"]["input"]["messages"] == _CHAT["messages"]
+        assert "_caller" not in captured["json"]
+        assert captured["headers"]["Idempotency-Key"]
+        assert str(captured["url"]).endswith("/api/v1/jobs/stream")
+
+    @pytest.mark.asyncio
+    async def test_content_rejection_is_a_client_error(self):
+        """A model refusal before any text does not look like a finished chat."""
+        provider = _provider()
+        provider._client.request.return_value = _quote(unit="per_1k_tokens")
+        _attach_stream(
+            provider,
+            [
+                _StreamResponse(
+                    200,
+                    [
+                        "event: error",
+                        'data: {"error":{"code":"content_rejected","message":"refused"}}',
+                    ],
+                )
+            ],
+        )
+
+        await provider.get_price("chat/completions", _CHAT)
+        with pytest.raises(ProviderError, match="refused") as exc:
+            await provider.submit("chat/completions", _CHAT)
+        assert exc.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_retries_stream_when_quote_is_stale(self):
+        """40901 quotes again and streams once more at the same price."""
+        provider = _provider()
+        provider._client.request.side_effect = [
+            _quote(cost="0.0098895", quote_id="q1", unit="per_1k_tokens"),
+            _quote(cost="0.0098895", quote_id="q2", unit="per_1k_tokens"),
+            _task("succeeded", task_id="job_chat", cost="0.001", settled=True),
+        ]
+        _attach_stream(
+            provider,
+            [
+                _StreamResponse(409, payload={"code": 40901, "msg": "quote no longer matches"}),
+                _StreamResponse(200, _chat_lines()),
+            ],
+        )
+
+        await provider.get_price("chat/completions", _CHAT)
+        result = await provider.submit("chat/completions", _CHAT)
+
+        assert result["task_id"] == "job_chat"
+        assert provider._client.stream is not None

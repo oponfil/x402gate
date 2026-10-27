@@ -9,6 +9,10 @@ Image and video jobs use SpicyAPI's task API:
 The client calls ``POST /v1/spicyapi/jobs`` with ``{model, input}``.
 The gateway adds ``quoteId`` and ``expectedCost`` and, for images, holds
 the create call briefly so a fast job can return without a poll loop.
+
+Text models use the same quote, then ``POST /api/v1/jobs/stream``. The
+client calls ``POST /v1/spicyapi/chat/completions`` with an OpenAI chat
+body. The gateway returns one JSON completion after the stream finishes.
 """
 
 from __future__ import annotations
@@ -32,6 +36,7 @@ from x402gate.providers.base import BaseProvider, ProviderError
 logger = logging.getLogger(__name__)
 
 _JOBS_PATH = "jobs"
+_CHAT_PATH = "chat/completions"
 _PENDING_STATES = frozenset({"queued", "running"})
 _QUOTE_SKEW_SECONDS = 20
 _IMAGE_WAIT_SECONDS = 45
@@ -39,9 +44,28 @@ _IMAGE_REQUEST_TIMEOUT = 75.0
 _DEFAULT_TIMEOUT = 30.0
 _MAX_RETRIES = 2
 _RETRY_DELAY = 2.0
+_COST_LOOKUP_TRIES = 3
 
 _INTERNAL_FIELDS = frozenset({"_caller", "_file_bytes", "_file_name"})
 _REQUEST_FIELDS = frozenset({"model", "input", "callBackUrl"})
+_CHAT_INPUT_FIELDS = frozenset(
+    {
+        "messages",
+        "max_tokens",
+        "temperature",
+        "top_p",
+        "tools",
+        "tool_choice",
+        "response_format",
+        "reasoning_effort",
+        "stop",
+        "seed",
+        "frequency_penalty",
+        "presence_penalty",
+        "parallel_tool_calls",
+    }
+)
+_CHAT_IGNORED_FIELDS = frozenset({"stream_options", "user", "metadata", "store"})
 
 
 @dataclass
@@ -62,16 +86,17 @@ class SpicyApiProvider(BaseProvider):
     quote so SpicyAPI cannot accept a higher price than the one shown.
     """
 
-    def __init__(self, config: ProviderConfig) -> None:
+    def __init__(self, config: ProviderConfig, *, default_max_tokens: int = 2048) -> None:
         super().__init__(name="spicyapi", config=config)
+        self._default_max_tokens = default_max_tokens
         self._client: httpx.AsyncClient | None = None
         self._quotes: dict[str, _Quote] = {}
         self._priced: dict[str, Decimal] = {}
         self._actual_costs: dict[str, Decimal] = {}
 
     async def get_price(self, model_path: str, inputs: dict[str, Any]) -> Decimal:
-        """Quote the exact job. The quote is reused when the client pays."""
-        payload = self._task_request(model_path, inputs)
+        """Quote the exact job or chat. The quote is reused when the client pays."""
+        payload = self._payload(model_path, inputs)
         quote = await self._quote(payload)
         self._priced[self._cache_key(payload)] = quote.cost
         logger.info(
@@ -89,12 +114,15 @@ class SpicyApiProvider(BaseProvider):
         *,
         prepaid: bool = False,
     ) -> dict[str, Any]:
-        """Create a task at the quoted price.
+        """Run a quoted image, video, or chat request.
 
         Image jobs pass ``wait`` so a finished image comes back on this
         call. Video jobs return immediately and are polled by ``get_result``.
+        Chat is streamed at the quoted price and returned as one completion.
         """
-        payload = self._task_request(path, body)
+        payload = self._payload(path, body)
+        if path.strip("/") == _CHAT_PATH:
+            return await self._submit_chat(payload)
         quote = await self._quote_for_submit(payload)
         wait = _IMAGE_WAIT_SECONDS if quote.unit == "per_image" else None
         try:
@@ -155,6 +183,11 @@ class SpicyApiProvider(BaseProvider):
         self, body: dict[str, Any], result: dict[str, Any]
     ) -> Decimal | None:
         """Return the settled SpicyAPI cost when the task recorded one."""
+        if isinstance(result, dict) and result.get("object") == "chat.completion":
+            task_id = str(result.get("task_id") or "")
+            if task_id and task_id in self._actual_costs:
+                return self._actual_costs.pop(task_id)
+            return None
         data = result.get("data") if isinstance(result, dict) else None
         if not isinstance(data, dict):
             return None
@@ -171,14 +204,187 @@ class SpicyApiProvider(BaseProvider):
             await self._client.aclose()
             self._client = None
 
+    def _payload(self, model_path: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Validate the gateway body and return the quoted SpicyAPI request."""
+        path = model_path.strip("/")
+        if path == _CHAT_PATH:
+            return self._chat_request(body)
+        if path == _JOBS_PATH:
+            return self._task_request(model_path, body)
+        raise ProviderError(
+            provider=self.name,
+            detail=(
+                "SpicyAPI image and video jobs use POST /v1/spicyapi/jobs. "
+                "Text models use POST /v1/spicyapi/chat/completions."
+            ),
+            status_code=400,
+        )
+
+    def _chat_request(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Turn an OpenAI chat body into a quoted SpicyAPI text request."""
+        if "_file_bytes" in body:
+            raise ProviderError(
+                provider=self.name,
+                detail="Chat requests are JSON. Multipart uploads are not accepted.",
+                status_code=400,
+            )
+        if body.get("stream") not in (None, False):
+            raise ProviderError(
+                provider=self.name,
+                detail="Streaming is not supported. Omit stream or set it to false.",
+                status_code=400,
+            )
+        model = body.get("model")
+        if not isinstance(model, str) or not model.strip():
+            raise ProviderError(
+                provider=self.name,
+                detail="Request body must contain a non-empty 'model' string",
+                status_code=400,
+            )
+        messages = body.get("messages")
+        if not isinstance(messages, list) or not messages:
+            raise ProviderError(
+                provider=self.name,
+                detail="Request body must contain a non-empty 'messages' list",
+                status_code=400,
+            )
+        if any(not isinstance(message, dict) for message in messages):
+            raise ProviderError(
+                provider=self.name,
+                detail="Each message must be an object",
+                status_code=400,
+            )
+        raw_n = body.get("n", 1)
+        if isinstance(raw_n, bool) or not isinstance(raw_n, int) or raw_n != 1:
+            raise ProviderError(
+                provider=self.name,
+                detail="n must be 1",
+                status_code=400,
+            )
+        max_tokens = _chat_max_tokens(body, self._default_max_tokens)
+        allowed = _CHAT_INPUT_FIELDS | _CHAT_IGNORED_FIELDS | _INTERNAL_FIELDS
+        allowed |= {"model", "stream", "max_completion_tokens", "n"}
+        unknown = sorted(set(body) - allowed)
+        if unknown:
+            raise ProviderError(
+                provider=self.name,
+                detail=f"Unknown fields: {', '.join(unknown)}.",
+                status_code=400,
+            )
+        task_input: dict[str, Any] = {"messages": messages, "max_tokens": max_tokens}
+        for field in _CHAT_INPUT_FIELDS - {"messages", "max_tokens"}:
+            if field in body:
+                task_input[field] = body[field]
+        return {"model": model, "input": task_input}
+
+    async def _submit_chat(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Stream a quoted chat and return one OpenAI completion."""
+        quote = await self._quote_for_submit(payload)
+        try:
+            completion, task_id = await self._stream_chat(payload, quote)
+        except ProviderError as exc:
+            if "40901" not in exc.detail and "no longer" not in exc.detail.lower():
+                raise
+            logger.info("SpicyAPI chat quote rejected, quoting %s again", payload["model"])
+            self._quotes.pop(self._cache_key(payload), None)
+            quote = await self._quote_for_submit(payload)
+            completion, task_id = await self._stream_chat(payload, quote)
+        cost = await self._lookup_settled_cost(task_id)
+        if cost is None:
+            cost = quote.cost
+        if task_id:
+            self._remember_cost(task_id, cost)
+            completion["task_id"] = task_id
+        return completion
+
+    async def _stream_chat(
+        self,
+        payload: dict[str, Any],
+        quote: _Quote,
+    ) -> tuple[dict[str, Any], str]:
+        """POST jobs/stream and fold the SSE chunks into one completion."""
+        request_body = {
+            **payload,
+            "quoteId": quote.quote_id,
+            "expectedCost": quote.cost_text,
+        }
+        url = f"{self._config.base_url.rstrip('/')}/api/v1/jobs/stream"
+        headers = {
+            "Authorization": f"Bearer {self._config.api_key}",
+            "Accept": "text/event-stream",
+            "Content-Type": "application/json",
+            "Idempotency-Key": str(uuid.uuid4()),
+        }
+        timeout = httpx.Timeout(30.0, read=float(self._config.poll_timeout))
+        client = await self._get_client()
+        try:
+            async with client.stream(
+                "POST",
+                url,
+                json=request_body,
+                headers=headers,
+                timeout=timeout,
+            ) as response:
+                if response.status_code >= 400:
+                    await response.aread()
+                    raise self._error_from_response(response)
+                task_id = response.headers.get("x-spicy-task-id") or ""
+                chunks = await _read_sse_chunks(response)
+        except ProviderError:
+            raise
+        except httpx.TimeoutException as exc:
+            raise ProviderError(
+                provider=self.name,
+                detail=f"SpicyAPI chat timed out after {self._config.poll_timeout}s",
+                status_code=504,
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise ProviderError(
+                provider=self.name,
+                detail=f"Failed to connect to SpicyAPI: {exc}",
+                status_code=503,
+            ) from exc
+        completion = _completion_from_chunks(chunks, payload["model"])
+        logger.info(
+            "SpicyAPI chat %s for %s finished",
+            task_id or completion.get("id") or "unknown",
+            payload["model"],
+        )
+        return completion, task_id
+
+    async def _lookup_settled_cost(self, task_id: str) -> Decimal | None:
+        """Read the settled chat cost once the stream has finished."""
+        if not task_id:
+            return None
+        for attempt in range(_COST_LOOKUP_TRIES):
+            try:
+                response = await self._send(
+                    "GET",
+                    "/api/v1/jobs/recordInfo",
+                    params={"taskId": task_id},
+                    request_timeout=_DEFAULT_TIMEOUT,
+                    retry=False,
+                )
+            except ProviderError:
+                return None
+            data = _envelope_data(response)
+            cost = _parse_cost(data.get("cost"))
+            if data.get("settled") is True and cost is not None:
+                return cost
+            if data.get("state") == "succeeded" and cost is not None:
+                return cost
+            if attempt + 1 < _COST_LOOKUP_TRIES:
+                await self._sleep(self._config.poll_interval)
+        return None
+
     def _task_request(self, model_path: str, body: dict[str, Any]) -> dict[str, Any]:
         """Validate the gateway body and return the SpicyAPI task request."""
         if model_path.strip("/") != _JOBS_PATH:
             raise ProviderError(
                 provider=self.name,
                 detail=(
-                    "SpicyAPI requests use POST /v1/spicyapi/jobs "
-                    "with a JSON body of {model, input}"
+                    "SpicyAPI image and video jobs use POST /v1/spicyapi/jobs. "
+                    "Text models use POST /v1/spicyapi/chat/completions."
                 ),
                 status_code=400,
             )
@@ -546,3 +752,167 @@ def _failure_detail(data: dict[str, Any]) -> str:
     state = data.get("state") or "failed"
     reason = data.get("errorMessage") or data.get("errorCode") or state
     return f"Generation {state}: {reason}"
+
+
+def _chat_max_tokens(body: dict[str, Any], default_max_tokens: int) -> int:
+    """Resolve the output cap sent to SpicyAPI."""
+    raw_max = body.get("max_tokens")
+    raw_completion = body.get("max_completion_tokens")
+    if raw_max is not None and raw_completion is not None and raw_max != raw_completion:
+        raise ProviderError(
+            provider="spicyapi",
+            detail="Send max_tokens or max_completion_tokens, not two different values",
+            status_code=400,
+        )
+    chosen = raw_max if raw_max is not None else raw_completion
+    if chosen is None:
+        return default_max_tokens
+    if isinstance(chosen, bool) or not isinstance(chosen, int) or chosen < 1:
+        raise ProviderError(
+            provider="spicyapi",
+            detail="max_tokens must be a positive integer",
+            status_code=400,
+        )
+    return chosen
+
+
+async def _read_sse_chunks(response: httpx.Response) -> list[dict[str, Any]]:
+    """Read a jobs/stream body into JSON chunks, ignoring keepalive comments."""
+    chunks: list[dict[str, Any]] = []
+    event_name = ""
+    async for line in response.aiter_lines():
+        if line.startswith(":"):
+            continue
+        if line.startswith("event:"):
+            event_name = line.split(":", 1)[1].strip()
+            continue
+        if not line.startswith("data:"):
+            continue
+        data = line.split(":", 1)[1].strip()
+        if data == "[DONE]":
+            break
+        try:
+            payload = json.loads(data)
+        except json.JSONDecodeError as exc:
+            raise ProviderError(
+                provider="spicyapi",
+                detail="SpicyAPI chat stream returned a non-JSON event",
+                status_code=502,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise ProviderError(
+                provider="spicyapi",
+                detail="SpicyAPI chat stream returned an unexpected event",
+                status_code=502,
+            )
+        if event_name == "error" or "error" in payload:
+            _raise_stream_error(payload)
+        chunks.append(payload)
+        event_name = ""
+    return chunks
+
+
+def _raise_stream_error(payload: dict[str, Any]) -> None:
+    """Turn a stream error event into ProviderError. Nothing was charged."""
+    error = payload.get("error")
+    if isinstance(error, dict):
+        code = str(error.get("code") or "")
+        message = str(error.get("message") or code or "chat failed")
+    else:
+        code = str(payload.get("code") or "")
+        message = str(payload.get("message") or payload.get("msg") or code or "chat failed")
+    client_error = code in {"content_rejected", "invalid_request", "unsupported_parameter"}
+    status = 400 if client_error else 502
+    raise ProviderError(provider="spicyapi", detail=message, status_code=status)
+
+
+def _completion_from_chunks(chunks: list[dict[str, Any]], model: str) -> dict[str, Any]:
+    """Fold OpenAI chat chunks into one completion object."""
+    choices: dict[int, dict[str, Any]] = {}
+    completion_id = ""
+    seen_model = model
+    usage: dict[str, Any] | None = None
+    for chunk in chunks:
+        if isinstance(chunk.get("id"), str):
+            completion_id = chunk["id"]
+        if isinstance(chunk.get("model"), str) and chunk["model"]:
+            seen_model = chunk["model"]
+        if isinstance(chunk.get("usage"), dict):
+            usage = chunk["usage"]
+        for choice in chunk.get("choices") or []:
+            if not isinstance(choice, dict):
+                continue
+            index = choice.get("index", 0)
+            if isinstance(index, bool) or not isinstance(index, int):
+                index = 0
+            slot = choices.setdefault(
+                index,
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "",
+                    "tool_calls": [],
+                    "finish_reason": None,
+                },
+            )
+            delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+            if isinstance(delta.get("content"), str):
+                slot["content"] += delta["content"]
+            if isinstance(delta.get("reasoning_content"), str):
+                slot["reasoning_content"] += delta["reasoning_content"]
+            if choice.get("finish_reason"):
+                slot["finish_reason"] = choice["finish_reason"]
+            for tool_call in delta.get("tool_calls") or []:
+                if isinstance(tool_call, dict):
+                    _merge_tool_call(slot, tool_call)
+    if not choices or any(slot["finish_reason"] is None for slot in choices.values()):
+        raise ProviderError(
+            provider="spicyapi",
+            detail="SpicyAPI chat stream ended before the answer finished",
+            status_code=502,
+        )
+    messages = []
+    for index in sorted(choices):
+        slot = choices[index]
+        message: dict[str, Any] = {"role": slot["role"], "content": slot["content"]}
+        if slot["reasoning_content"]:
+            message["reasoning_content"] = slot["reasoning_content"]
+        if slot["tool_calls"]:
+            message["tool_calls"] = slot["tool_calls"]
+        messages.append(
+            {
+                "index": index,
+                "message": message,
+                "finish_reason": slot["finish_reason"],
+            }
+        )
+    completion: dict[str, Any] = {
+        "id": completion_id,
+        "object": "chat.completion",
+        "model": seen_model,
+        "choices": messages,
+    }
+    if usage is not None:
+        completion["usage"] = usage
+    return completion
+
+
+def _merge_tool_call(slot: dict[str, Any], delta_call: dict[str, Any]) -> None:
+    """Append one streamed tool-call fragment onto the choice being built."""
+    index = delta_call.get("index", 0)
+    if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+        index = 0
+    while len(slot["tool_calls"]) <= index:
+        slot["tool_calls"].append(
+            {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
+        )
+    current = slot["tool_calls"][index]
+    if isinstance(delta_call.get("id"), str):
+        current["id"] = delta_call["id"]
+    if isinstance(delta_call.get("type"), str):
+        current["type"] = delta_call["type"]
+    function = delta_call.get("function") if isinstance(delta_call.get("function"), dict) else {}
+    if isinstance(function.get("name"), str):
+        current["function"]["name"] += function["name"]
+    if isinstance(function.get("arguments"), str):
+        current["function"]["arguments"] += function["arguments"]

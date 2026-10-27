@@ -174,6 +174,8 @@ async def lifespan(app: FastAPI):
                 kwargs["web_search_tokens_per_result"] = gw.web_search_tokens_per_result
                 kwargs["default_web_search_max_results"] = gw.default_web_search_max_results
                 kwargs["web_search_cost_per_result"] = gw.web_search_cost_per_result
+            elif name == "spicyapi":
+                kwargs["default_max_tokens"] = config.gateway.default_max_tokens
             elif name == "tungsten":
                 kwargs["jwt_token"] = provider_config.jwt_token
                 kwargs["cf_clearance"] = provider_config.cf_clearance

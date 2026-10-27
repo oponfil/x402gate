@@ -68,7 +68,7 @@ The diagram is the Base order. On Solana, settle runs immediately after verify a
 | **WaveSpeed** | `x402gate/providers/wavespeed.py` | WaveSpeed AI (60+ image/video models) |
 | **OpenRouter** | `x402gate/providers/openrouter.py` | OpenRouter aggregator (LLM, embeddings, STT) |
 | **Tungsten** | `x402gate/providers/tungsten.py` | Tungsten image generation (SDXL, Flux, etc.) |
-| **SpicyAPI** | `x402gate/providers/spicyapi.py` | SpicyAPI image and video jobs (quote, create, poll) |
+| **SpicyAPI** | `x402gate/providers/spicyapi.py` | SpicyAPI image and video jobs (quote, create, poll) and quoted chat (`jobs/stream`) |
 | **CloudConvert** | `x402gate/providers/cloudconvert.py` | File conversion (200+ formats, multipart upload) |
 | **SocialDownload** | `x402gate/providers/socialdownload.py` | Social media download via RapidAPI |
 | **App** | `x402gate/app.py` | FastAPI routes, lifecycle, provider registry |
