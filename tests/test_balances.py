@@ -1,5 +1,6 @@
 """Unit tests for upstream provider balance checks."""
 
+import time
 from decimal import Decimal
 
 import httpx
@@ -139,7 +140,7 @@ class TestFetch:
         )
         configs = {"wavespeed": _config("https://api.wavespeed.ai/api/v3")}
         first = await fetch_balances(configs)
-        balances._cache["wavespeed"].fetched_at = 0
+        balances._cache["wavespeed"].fetched_at = time.monotonic() - balances._CACHE_TTL_S - 1
         second = await fetch_balances(configs)
         third = await fetch_balances(configs)
         assert first["wavespeed"]["label"] == "$9.00"

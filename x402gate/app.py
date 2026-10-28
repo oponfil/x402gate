@@ -1175,4 +1175,3 @@ async def _stream_polled_job(
             poll_task.cancel()
             with suppress(asyncio.CancelledError, Exception):
                 await poll_task
-
