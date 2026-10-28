@@ -92,7 +92,7 @@ curl -X POST https://x402gate.io/v1/spicyapi/jobs \
   }'
 ```
 
-Video uses the same path. The gateway polls until the clip is ready, up to 10 minutes:
+Video uses the same path. The gateway polls until the clip is ready, up to 15 minutes, and sends whitespace heartbeats while it waits so the connection is not closed for being idle:
 
 ```bash
 curl -X POST https://x402gate.io/v1/spicyapi/jobs \

@@ -86,7 +86,7 @@ providers:
     api_key: "${WAVESPEED_API_KEY}"
     description: "60+ image/video models (Flux, Wan, Kling, Sora…)"
     poll_interval: 1           # seconds, between status polls
-    poll_timeout: 600          # seconds, max wait for result (10 min)
+    poll_timeout: 900          # seconds, max wait for result (15 min)
     docs_url: "https://wavespeed.ai/docs"
     example_request:
       model: "wavespeed-ai/z-image/turbo"
@@ -179,7 +179,7 @@ providers:
     base_url: "https://api.spicyapi.ai"
     api_key: "${SPICYAPI_API_KEY}"
     poll_interval: 2
-    poll_timeout: 600
+    poll_timeout: 900          # seconds, max wait for a video result (15 min)
     description: "Image, video, and chat models (Flux, Wan, Seedance, DeepSeek, Grok…), quoted per request"
     docs_url: "https://docs.spicyapi.ai/docs/tasks"
     example_request:

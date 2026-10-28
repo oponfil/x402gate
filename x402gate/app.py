@@ -12,14 +12,14 @@ import logging
 import os
 import pathlib
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from decimal import Decimal
 from typing import Any
 
 import httpx
 import jinja2
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
 from x402gate.core import stats
 from x402gate.core.config import AppConfig, load_config
@@ -50,6 +50,12 @@ from x402gate.providers.tungsten import TungstenProvider
 from x402gate.providers.wavespeed import WaveSpeedProvider
 
 logger = logging.getLogger(__name__)
+
+# Railway closes an HTTP response after 5 minutes with no bytes, and after
+# 15 minutes even when bytes are flowing. A pad of newlines is valid JSON
+# whitespace, so clients still parse the object that follows.
+_HEARTBEAT_INTERVAL_S = 20.0
+_HEARTBEAT_PAD = b"\n" * 8192
 
 
 def _error_response(
@@ -928,70 +934,127 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
         and "choices" not in result
     )
 
-    if is_async:
-        task_id = task_data["id"]
-        # Async provider -- poll for completion
-        try:
-            output = await provider.get_result(task_id)
-        except TaskTimeoutError as e:
-            # Base: leave the authorization unsettled. Solana was settled
-            # up front, so give the amount back as prepaid credit.
-            t_err = time.monotonic() - t_gen_start
-            stats.record_request(provider_name, t_err, False, error_msg=f"Timeout {e.timeout}s")
-            return await _provider_error(
-                504,
-                f"Task timed out after {e.timeout}s",
-                provider_label=provider.name,
-                task_id=e.task_id,
+    async def _respond(output: Any) -> JSONResponse:
+        """Settle a finished provider call and build the client response."""
+        generation_s = time.monotonic() - t_gen_start
+
+        # 8. Calculate actual cost (if provider supports it)
+        #    x402 exact scheme requires settling the signed amount (final_price).
+        #    Actual cost is used only for Transaction Summary reporting.
+        #    Pass the full `result` (not `output`) so the provider can access
+        #    top-level fields like "usage" -- for embeddings, output is a list
+        #    and would not have .get().
+        actual_base_price = await provider.calculate_actual_cost(body, result)
+        if actual_base_price is None:
+            actual_base_price = base_price  # fallback to estimate
+
+        if prepaid_mode:
+            # The reservation already took base_price. Keep the actual cost, capped
+            # at that hold, and return whatever is left.
+            charged = min(actual_base_price, prepaid_reserved or Decimal("0"))
+            if prepaid_reserved is not None and actual_base_price > prepaid_reserved:
+                logger.warning(
+                    "Prepaid actual $%s exceeds reserved $%s for %s; charging the reservation",
+                    actual_base_price,
+                    prepaid_reserved,
+                    prepaid_pubkey[:12] + "…",
+                )
+            remaining = await release(
+                prepaid_pubkey, prepaid_reserved or Decimal("0"), actual_base_price
             )
-        except ProviderError as e:
-            t_err = time.monotonic() - t_gen_start
-            stats.record_request(provider_name, t_err, False, error_msg=e.detail)
-            return await _provider_error(e.status_code, e.detail, provider_label=e.provider)
-    else:
-        # Synchronous provider -- use extracted data for the response body.
-        output = task_data
-
-    generation_s = time.monotonic() - t_gen_start  # Provider processing time
-
-    # 8. Calculate actual cost (if provider supports it)
-    #    x402 exact scheme requires settling the signed amount (final_price).
-    #    Actual cost is used only for Transaction Summary reporting.
-    #    Pass the full `result` (not `output`) so the provider can access
-    #    top-level fields like "usage" -- for embeddings, output is a list
-    #    and would not have .get().
-    actual_base_price = await provider.calculate_actual_cost(body, result)
-    if actual_base_price is None:
-        actual_base_price = base_price  # fallback to estimate
-
-    if prepaid_mode:
-        # The reservation already took base_price. Keep the actual cost, capped
-        # at that hold, and return whatever is left.
-        charged = min(actual_base_price, prepaid_reserved or Decimal("0"))
-        if prepaid_reserved is not None and actual_base_price > prepaid_reserved:
-            logger.warning(
-                "Prepaid actual $%s exceeds reserved $%s for %s; charging the reservation",
-                actual_base_price,
-                prepaid_reserved,
+            t_client = time.monotonic() - t_start
+            logger.info(
+                "Prepaid %s: -$%s from %s (remaining: $%s, %.1fs)",
+                provider_name,
+                charged,
                 prepaid_pubkey[:12] + "…",
+                remaining,
+                t_client,
             )
-        remaining = await release(
-            prepaid_pubkey, prepaid_reserved or Decimal("0"), actual_base_price
-        )
+            stats.record_request(provider_name, generation_s, True)
+            # Prepaid: record usage on the provider card (revenue=cost, profit=0).
+            # Bottom-line totals will exclude the revenue part to avoid
+            # double-counting with the topup that funded this balance.
+            stats.record_prepaid_usage(provider_name, charged)
+            # For sync providers where data was extracted from result (e.g.,
+            # embeddings), preserve top-level metadata (usage, model).
+            if not is_async and output is not result:
+                content = {k: v for k, v in result.items() if k != "data"}
+                content["data"] = output
+            else:
+                content = {"data": output}
+            return JSONResponse(
+                content=content,
+                headers={"X-Prepaid-Balance": str(remaining)},
+            )
+
+        # 9. Settle. Solana already settled before the provider call.
         t_client = time.monotonic() - t_start
-        logger.info(
-            "Prepaid %s: -$%s from %s (remaining: $%s, %.1fs)",
-            provider_name,
-            charged,
-            prepaid_pubkey[:12] + "…",
-            remaining,
-            t_client,
-        )
+
+        if upfront_settlement is not None:
+            stats.record_revenue(
+                provider_name,
+                Decimal(str(upfront_settlement.get("amount_usdc", 0))),
+                actual_base_price,
+            )
+            logger.info(
+                "Solana %s completed after upfront settle: cost=$%s (%.1fs)",
+                provider_name,
+                actual_base_price,
+                generation_s,
+            )
+        else:
+
+            async def background_settle() -> None:
+                """Settle payment and log financial summary in background."""
+                try:
+                    ctx = {
+                        "provider_name": provider_name,
+                        "estimated_cost": float(base_price),
+                        "provider_cost": float(actual_base_price),
+                        "generation_s": generation_s,
+                        "t_client": t_client,
+                        "commission_rate": config.gateway.commission,
+                        "gas_surcharge": config.gateway.gas_surcharge,
+                    }
+                    t_settle_start = time.monotonic()
+                    settlement = await payment_handler.settle(
+                        payment_sig,
+                        final_price,
+                        payment_network,
+                        extra_context=ctx,
+                    )
+                    settle_latency = time.monotonic() - t_settle_start
+
+                    if not settlement:
+                        logger.error(
+                            "Settlement returned None for %s — check logs above", payment_network
+                        )
+                    elif not settlement.get("success"):
+                        logger.error(
+                            "Settlement FAILED for %s: %s",
+                            payment_network,
+                            settlement.get("error_reason", "unknown"),
+                        )
+                    else:
+                        _record_onchain_settlement(
+                            provider_name, payment_network, settlement, settle_latency
+                        )
+                        stats.record_revenue(
+                            provider_name,
+                            Decimal(str(settlement.get("amount_usdc", 0))),
+                            actual_base_price,
+                        )
+                except Exception:
+                    logger.exception("Background settlement crashed for %s", payment_network)
+
+            task = asyncio.create_task(background_settle())
+            _pending_settlements.add(task)
+            task.add_done_callback(_pending_settlements.discard)
+
+        # 10. Return result to client
         stats.record_request(provider_name, generation_s, True)
-        # Prepaid: record usage on the provider card (revenue=cost, profit=0).
-        # Bottom-line totals will exclude the revenue part to avoid
-        # double-counting with the topup that funded this balance.
-        stats.record_prepaid_usage(provider_name, charged)
+        stats.record_overhead(payment_network, t_client - generation_s)
         # For sync providers where data was extracted from result (e.g.,
         # embeddings), preserve top-level metadata (usage, model).
         if not is_async and output is not result:
@@ -1001,87 +1064,100 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
             content = {"data": output}
         return JSONResponse(
             content=content,
-            headers={"X-Prepaid-Balance": str(remaining)},
+            headers={
+                "X-Timing-Verify": f"{verify_s:.2f}",
+                "X-Timing-Generation": f"{generation_s:.2f}",
+            },
         )
 
-    # 9. Settle. Solana already settled before the provider call.
-    t_client = time.monotonic() - t_start
+    if not is_async:
+        return await _respond(task_data)
 
-    if upfront_settlement is not None:
-        stats.record_revenue(
-            provider_name,
-            Decimal(str(upfront_settlement.get("amount_usdc", 0))),
-            actual_base_price,
-        )
+    task_id = task_data["id"]
+    poll_task = asyncio.create_task(provider.get_result(task_id))
+    try:
+        output = await asyncio.wait_for(asyncio.shield(poll_task), _HEARTBEAT_INTERVAL_S)
+    except TimeoutError:
         logger.info(
-            "Solana %s completed after upfront settle: cost=$%s (%.1fs)",
+            "Holding %s task %s open with heartbeats",
             provider_name,
-            actual_base_price,
-            generation_s,
+            task_id,
         )
-    else:
+        return StreamingResponse(
+            _stream_polled_job(poll_task, _respond, _provider_error, provider, t_gen_start),
+            media_type="application/json",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+    except TaskTimeoutError as e:
+        t_err = time.monotonic() - t_gen_start
+        stats.record_request(provider_name, t_err, False, error_msg=f"Timeout {e.timeout}s")
+        return await _provider_error(
+            504,
+            f"Task timed out after {e.timeout}s",
+            provider_label=provider.name,
+            task_id=e.task_id,
+        )
+    except ProviderError as e:
+        t_err = time.monotonic() - t_gen_start
+        stats.record_request(provider_name, t_err, False, error_msg=e.detail)
+        return await _provider_error(e.status_code, e.detail, provider_label=e.provider)
+    return await _respond(output)
 
-        async def background_settle() -> None:
-            """Settle payment and log financial summary in background."""
+
+async def _stream_polled_job(
+    poll_task: asyncio.Task[Any],
+    respond: Any,
+    provider_error: Any,
+    provider: BaseProvider,
+    t_gen_start: float,
+) -> Any:
+    """Send JSON whitespace until a polled job finishes, then its body.
+
+    The HTTP status is already 200 once the first pad goes out. A later
+    failure is the usual error JSON in that body.
+    """
+    try:
+        while not poll_task.done():
+            yield _HEARTBEAT_PAD
             try:
-                ctx = {
-                    "provider_name": provider_name,
-                    "estimated_cost": float(base_price),
-                    "provider_cost": float(actual_base_price),
-                    "generation_s": generation_s,
-                    "t_client": t_client,
-                    "commission_rate": config.gateway.commission,
-                    "gas_surcharge": config.gateway.gas_surcharge,
-                }
-                t_settle_start = time.monotonic()
-                settlement = await payment_handler.settle(
-                    payment_sig,
-                    final_price,
-                    payment_network,
-                    extra_context=ctx,
-                )
-                settle_latency = time.monotonic() - t_settle_start
-
-                if not settlement:
-                    logger.error(
-                        "Settlement returned None for %s — check logs above", payment_network
-                    )
-                elif not settlement.get("success"):
-                    logger.error(
-                        "Settlement FAILED for %s: %s",
-                        payment_network,
-                        settlement.get("error_reason", "unknown"),
-                    )
-                else:
-                    _record_onchain_settlement(
-                        provider_name, payment_network, settlement, settle_latency
-                    )
-                    stats.record_revenue(
-                        provider_name,
-                        Decimal(str(settlement.get("amount_usdc", 0))),
-                        actual_base_price,
-                    )
+                await asyncio.wait_for(asyncio.shield(poll_task), _HEARTBEAT_INTERVAL_S)
+            except TimeoutError:
+                continue
             except Exception:
-                logger.exception("Background settlement crashed for %s", payment_network)
+                break
+        try:
+            output = poll_task.result()
+        except TaskTimeoutError as e:
+            t_err = time.monotonic() - t_gen_start
+            stats.record_request(
+                provider.name,
+                t_err,
+                False,
+                error_msg=f"Timeout {e.timeout}s",
+            )
+            response = await provider_error(
+                504,
+                f"Task timed out after {e.timeout}s",
+                provider_label=provider.name,
+                task_id=e.task_id,
+            )
+        except ProviderError as e:
+            t_err = time.monotonic() - t_gen_start
+            stats.record_request(provider.name, t_err, False, error_msg=e.detail)
+            response = await provider_error(
+                e.status_code,
+                e.detail,
+                provider_label=e.provider,
+            )
+        else:
+            response = await respond(output)
+        yield response.body
+    finally:
+        if not poll_task.done():
+            poll_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await poll_task
 
-        task = asyncio.create_task(background_settle())
-        _pending_settlements.add(task)
-        task.add_done_callback(_pending_settlements.discard)
-
-    # 10. Return result to client
-    stats.record_request(provider_name, generation_s, True)
-    stats.record_overhead(payment_network, t_client - generation_s)
-    # For sync providers where data was extracted from result (e.g.,
-    # embeddings), preserve top-level metadata (usage, model).
-    if not is_async and output is not result:
-        content = {k: v for k, v in result.items() if k != "data"}
-        content["data"] = output
-    else:
-        content = {"data": output}
-    return JSONResponse(
-        content=content,
-        headers={
-            "X-Timing-Verify": f"{verify_s:.2f}",
-            "X-Timing-Generation": f"{generation_s:.2f}",
-        },
-    )

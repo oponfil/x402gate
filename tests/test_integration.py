@@ -858,6 +858,35 @@ class TestSolanaUpfrontSettlement:
         assert Decimal(body["prepaid_balance"]) == get_balance(SOL_PAYER)
 
     @respx.mock
+    def test_long_poll_sends_whitespace_before_json(self, client):
+        """A job that outlasts the heartbeat interval keeps the connection busy."""
+        reset()
+        _price_ok()
+        respx.post(WAVESPEED_SUBMIT).mock(
+            return_value=httpx.Response(
+                200,
+                json={"data": {"id": "task-1", "status": "processing"}},
+            )
+        )
+
+        async def slow_result(task_id: str) -> dict:
+            await asyncio.sleep(0.12)
+            return {"outputs": ["https://cdn.example/clip.mp4"]}
+
+        with (
+            patch("x402gate.app.payment_handler") as mock_ph,
+            patch("x402gate.app._HEARTBEAT_INTERVAL_S", 0.04),
+            patch.object(providers["wavespeed"], "get_result", side_effect=slow_result),
+        ):
+            _paid_handler(mock_ph, SOLANA_NETWORK, SOL_PAYER)
+            mock_ph.settle = AsyncMock(return_value=_settled_ok())
+            response = _post_wavespeed(client)
+
+        assert response.status_code == 200
+        assert response.content.startswith(b"\n")
+        assert response.json()["data"]["outputs"][0].endswith("clip.mp4")
+
+    @respx.mock
     def test_evm_provider_runs_before_settle(self, client):
         """Base still calls the provider before any settlement."""
         reset()
