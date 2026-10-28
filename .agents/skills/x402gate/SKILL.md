@@ -26,9 +26,9 @@ curl -H "Accept: application/json" https://x402gate.io/
 ```
 
 ## 1. Capabilities & Supported Providers
-1. **LLMs:** OpenRouter (300+ models, web search, embeddings, STT/Whisper), BlockRun.
+1. **LLMs:** OpenRouter (300+ models, web search, embeddings, STT/Whisper).
 2. **Image & Video:** WaveSpeed (60+ models like Flux, Sora), SpicyAPI (Flux, Wan, Seedance, Kling, and other image/video models via `POST /v1/spicyapi/jobs`; chat models via `POST /v1/spicyapi/chat/completions`).
-3. **TTS:** ElevenLabs (premium), MiniMax (emotional), Fish Audio (uncensored).
+3. **TTS:** ElevenLabs (premium), Fish Audio (uncensored).
 4. **Utilities:** CloudConvert (file conversion), SocialDownload (YouTube/TikTok).
 
 ## 2. Discovery (Find endpoints and schemas)

@@ -11,11 +11,9 @@ x402gate sits between your AI agent and AI service providers, adding [x402](http
 | [OpenRouter](https://openrouter.ai) | Managed | 300+ LLMs, embeddings, STT (GPT, Claude, Whisper…) | `/v1/openrouter/...` |
 | [WaveSpeed AI](https://wavespeed.ai) | Managed | 60+ image/video models (Flux, Wan, Kling, Sora…) | `/v1/wavespeed/...` |
 | [SpicyAPI](https://spicyapi.ai) | Managed | Image, video, and chat models (Flux, Wan, Seedance, DeepSeek, Grok…) | `/v1/spicyapi/jobs`, `/v1/spicyapi/chat/completions` |
-| [BlockRun](https://blockrun.ai) | Passthrough | 40+ LLMs (GPT, Claude, Gemini…) | `/v1/blockrun/...` |
 | [CloudConvert](https://cloudconvert.com) | Managed | File conversion (200+ formats) | `/v1/cloudconvert/...` |
 | [SocialDownload](https://rapidapi.com/nguyenmanhict-MuTUtGWD7K/api/social-download-all-in-one) | Managed | Download media from social networks | `/v1/socialdownload/...` |
 | [ElevenLabs](https://elevenlabs.io) | Managed | Premium TTS (1000+ voices, Multilingual v2, Flash) | `/v1/elevenlabs/...` |
-| [MiniMax](https://www.minimax.io) | Managed | High-quality TTS with emotional expression | `/v1/minimax/...` |
 | [Fish Audio](https://fish.audio) | Managed | Uncensored TTS (Fish Speech) | `/v1/fishaudio/...` |
 
 ## How It Works
@@ -45,26 +43,6 @@ Client                    x402gate                  WaveSpeed AI
 4. Gateway verifies the payment, then forwards the request and returns the result. On Base it settles after the provider succeeds. On Solana it settles first, because the signed transaction expires in about a minute.
 
 On Base, a failed or timed-out task is not settled and the client keeps the USDC. On Solana the payment is already settled, so a later provider failure credits that amount to the payer's prepaid balance.
-
-### Passthrough Providers (BlockRun)
-
-For x402-native providers like [BlockRun](https://blockrun.ai), x402gate acts as a **transparent proxy** — no payment handling, no commission. The client pays the provider directly:
-
-```
-Client                    x402gate                  BlockRun
-  │                          │                          │
-  ├─ POST /v1/blockrun/... ──►                          │
-  │                          ├─ forward request ────────►│
-  │                          │◄─ 402 ($0.001) ──────────┤
-  │◄─── 402 ($0.001) ───────┤  (passthrough, no markup)  │
-  │                          │                          │
-  ├─ POST + PAYMENT-SIGNATURE►                          │
-  │                          ├─ forward + signature ────►│
-  │                          │◄─ LLM response ──────────┤
-  │◄─── 200 + response ─────┤                          │
-```
-
-The payment goes directly to BlockRun's wallet — x402gate earns nothing but provides a unified "single window" experience.
 
 ### File Conversion (CloudConvert)
 
@@ -319,7 +297,7 @@ Requires `BASE_E2ETEST_PRIVATE_KEY` and/or `SOLANA_E2ETEST_PRIVATE_KEY` in `.env
 x402gate supports two provider types:
 
 - **Managed** — x402gate handles pricing, payment verification, and settlement (e.g., WaveSpeed)
-- **Passthrough** — transparent proxy for x402-native providers; client pays them directly (e.g., BlockRun)
+- **Passthrough** — transparent proxy for x402-native providers; the client pays that provider directly
 
 See [docs/add-provider.md](docs/add-provider.md) for a step-by-step guide.
 
@@ -330,7 +308,7 @@ See [docs/add-provider.md](docs/add-provider.md) for a step-by-step guide.
 - [Dashboard](docs/dashboard.md) — real-time metrics, logs, and revenue tracking
 - [Deployment](docs/deployment.md) — Railway, Docker, VPS guides
 - [Configuration](docs/configuration.md) — all config options
-- [TTS Providers](docs/tts.md) — ElevenLabs, MiniMax, Fish Audio
+- [TTS Providers](docs/tts.md) — ElevenLabs, Fish Audio
 - [STT (OpenRouter)](docs/stt.md) — Whisper and speech-to-text transcription
 - [SpicyAPI](https://docs.spicyapi.ai/docs/tasks) — image and video jobs (`POST /v1/spicyapi/jobs`) and chat (`POST /v1/spicyapi/chat/completions`)
 - [SocialDownload](docs/socialdownload.md) — download media from social networks

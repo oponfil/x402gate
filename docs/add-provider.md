@@ -74,6 +74,10 @@ PROVIDER_REGISTRY: dict[str, type[BaseProvider]] = {
     "tungsten": TungstenProvider,
     "cloudconvert": CloudConvertProvider,
     "socialdownload": SocialDownloadProvider,
+    "elevenlabs": ElevenLabsProvider,
+    "minimax": MinimaxProvider,
+    "fishaudio": FishAudioProvider,
+    "spicyapi": SpicyApiProvider,
     "your_provider": YourProvider,  # ← add this line
 }
 ```

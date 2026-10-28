@@ -85,7 +85,10 @@ Every variable referenced from active config is validated at startup. If you lea
 | `TUNGSTEN_CF_CLEARANCE` | No | Tungsten Cloudflare clearance cookie. Required only when Tungsten is enabled |
 | `CLOUDCONVERT_API_KEY` | Yes | CloudConvert API key |
 | `RAPIDAPI_KEY` | Yes | RapidAPI key for SocialDownload |
-| `SPICYAPI_API_KEY` | Yes | SpicyAPI key for image and video jobs |
+| `SPICYAPI_API_KEY` | Yes | SpicyAPI key for image, video, and chat |
+| `ELEVENLABS_API_KEY` | Yes | ElevenLabs text-to-speech key. Must be the secret that starts with `sk_` |
+| `FISHAUDIO_API_KEY` | Yes | Fish Audio text-to-speech key |
+| `MINIMAX_API_KEY` | No | MiniMax text-to-speech key. Required only when `providers.minimax.enabled` is true |
 | `BASE_PAY_TO_ADDRESS` | Yes | EVM wallet address for receiving USDC |
 | `BASE_FACILITATOR_PRIVATE_KEY` | Yes | EVM private key for on-chain settlement (needs ETH for gas) |
 | `SOLANA_PAY_TO_ADDRESS` | Solana | Solana wallet address for receiving USDC (base58) |

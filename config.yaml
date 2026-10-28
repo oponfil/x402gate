@@ -104,7 +104,7 @@ providers:
         seed: -1
   blockrun:
     type: passthrough
-    enabled: true
+    enabled: false  # hidden from the site and not routed; set true to restore
     base_url: "https://blockrun.ai/api"
     description: "40+ LLMs with live web search (GPT, Claude, Gemini…)"
     docs_url: "https://blockrun.ai/docs"
@@ -268,7 +268,7 @@ providers:
           stability: 0.7
           speed: 1.15
   minimax:
-    enabled: true
+    enabled: false  # hidden from the site and not routed; set true to restore
     base_url: "https://api.minimax.io"
     api_key: "${MINIMAX_API_KEY}"
     poll_timeout: 600
