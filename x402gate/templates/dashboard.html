@@ -138,6 +138,17 @@
             display: block;
         }
 
+        .metric.low strong {
+            color: #ffffff;
+            background: #da3633;
+            border-radius: 4px;
+            padding: 0 6px;
+        }
+
+        .card.low-balance {
+            border-color: #f85149;
+        }
+
         .card-error {
             margin-top: 10px;
             font-size: 0.8em;
@@ -453,13 +464,18 @@
                     const errHtml = p.last_error && p.status === 'error'
                         ? `<div class="card-error">${escHtml(p.last_error)}</div>`
                         : '';
+                    const lowCard = p.balance && p.balance.low ? ' low-balance' : '';
+                    const balanceHtml = p.balance && p.balance.label
+                        ? `<div class="metric${p.balance.low ? ' low' : ''}">Balance<strong>${escHtml(p.balance.label)}</strong></div>`
+                        : '';
                     return `
-                    <div class="card">
+                    <div class="card${lowCard}">
                         <div class="card-header">
                             <span class="card-name">${statusDot(p.status)} ${escHtml(name)}</span>
                             <span class="card-type">${type}</span>
                         </div>
                         <div class="card-metrics">
+                            ${balanceHtml}
                             <div class="metric">Requests<strong>${p.total_requests}</strong></div>
                             <div class="metric">Success<strong>${p.success_rate}%</strong></div>
                             <div class="metric">Avg job time<strong>${p.avg_latency_s}s</strong></div>

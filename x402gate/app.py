@@ -22,6 +22,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
 from x402gate.core import stats
+from x402gate.core.balances import fetch_balances
 from x402gate.core.config import AppConfig, load_config
 from x402gate.core.payment import PaymentHandler
 from x402gate.core.prepaid import (
@@ -505,8 +506,22 @@ async def dashboard() -> Response:
 
 @app.get("/v1/stats")
 async def get_stats() -> dict[str, Any]:
-    """Return current gateway statistics."""
-    return stats.get_stats()
+    """Return current gateway statistics, including upstream balances."""
+    snapshot = stats.get_stats()
+    try:
+        balances = await fetch_balances(
+            {
+                name: config.providers[name]
+                for name in snapshot["providers"]
+                if name in config.providers
+            }
+        )
+    except Exception:
+        logger.warning("Provider balance snapshot failed")
+        balances = {}
+    for card_name, card in snapshot["providers"].items():
+        card["balance"] = balances.get(card_name)
+    return snapshot
 
 
 @app.get("/v1/logs")

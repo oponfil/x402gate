@@ -74,12 +74,13 @@ Each provider is a key under `providers`:
 
 Store secrets in `.env` (see `.env.example`):
 
-Every variable referenced from active config is validated at startup. If you leave out `OPENROUTER_API_KEY`, `CLOUDCONVERT_API_KEY`, wallet keys, or any other secret referenced by payment settings or an enabled provider, the process exits immediately with a configuration error. Disabled providers may keep unresolved `${ENV_VAR}` placeholders until you enable them.
+Every variable referenced from active config is validated at startup. If you leave out `OPENROUTER_API_KEY`, `CLOUDCONVERT_API_KEY`, wallet keys, or any other secret referenced by payment settings or an enabled provider, the process exits immediately with a configuration error. Disabled providers may keep unresolved `${ENV_VAR}` placeholders until you enable them. A placeholder written as `${VAR:-}` is optional: when the variable is unset, the value is empty and startup continues.
 
 | Variable | Required | Description |
 |---|---|---|
 | `WAVESPEED_API_KEY` | Yes | WaveSpeed AI API key |
 | `OPENROUTER_API_KEY` | Yes | OpenRouter API key |
+| `OPENROUTER_MANAGEMENT_KEY` | No | OpenRouter management key, used only to show the account balance. Management keys cannot call models |
 | `TUNGSTEN_JWT_TOKEN` | No | Tungsten JWT cookie. Required only when `providers.tungsten.enabled` is true |
 | `TUNGSTEN_CF_CLEARANCE` | No | Tungsten Cloudflare clearance cookie. Required only when Tungsten is enabled |
 | `CLOUDCONVERT_API_KEY` | Yes | CloudConvert API key |

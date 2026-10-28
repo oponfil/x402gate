@@ -96,7 +96,10 @@ providers:
 @pytest.fixture
 def client(config_file):
     """Create a test client with mocked config path."""
-    with patch("x402gate.app.load_config") as mock_load:
+    with (
+        patch("x402gate.app.load_config") as mock_load,
+        patch("x402gate.app.fetch_balances", new=AsyncMock(return_value={})),
+    ):
         mock_load.return_value = real_load(config_file)
 
         with TestClient(app) as c:
@@ -528,6 +531,8 @@ class TestDashboard:
         assert "text/html" in response.headers["content-type"]
         assert "x402gate" in response.text
         assert "Dashboard" in response.text
+        assert "low-balance" in response.text
+        assert "p.balance" in response.text
 
     def test_stats_endpoint(self, client):
         """GET /v1/stats returns valid statistics JSON."""
@@ -538,6 +543,25 @@ class TestDashboard:
         assert "total_requests" in data
         assert "providers" in data
         assert "total_revenue_usd" in data
+        assert data["providers"]["openrouter"]["balance"] is None
+
+    def test_stats_includes_provider_balance(self, client):
+        """A fetched upstream balance is attached to that provider card."""
+        sample = {
+            "openrouter": {
+                "amount": "3.00",
+                "unit": "usd",
+                "label": "$3.00",
+                "low": True,
+            }
+        }
+        with patch("x402gate.app.fetch_balances", new=AsyncMock(return_value=sample)):
+            response = client.get("/v1/stats")
+        assert response.status_code == 200
+        balance = response.json()["providers"]["openrouter"]["balance"]
+        assert balance["label"] == "$3.00"
+        assert balance["low"] is True
+        assert response.json()["providers"]["wavespeed"]["balance"] is None
 
     def test_logs_endpoint(self, client):
         """GET /v1/logs returns a list of log entries."""

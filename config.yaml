@@ -41,6 +41,7 @@ providers:
     enabled: true
     base_url: "https://openrouter.ai/api/v1"
     api_key: "${OPENROUTER_API_KEY}"
+    balance_api_key: "${OPENROUTER_MANAGEMENT_KEY:-}"  # account wallet; management keys cannot call models
     poll_timeout: 600          # seconds, max wait for LLM response (10 min)
     models_cache_ttl: 86400    # seconds, how long to cache the list of models (1 day)
     max_stt_audio_mb: 25       # max STT audio upload in MB (OpenRouter Whisper limit)

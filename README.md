@@ -215,12 +215,12 @@ curl https://x402gate.io/
 
 ### Dashboard
 
-x402gate includes a built-in dashboard at `/dashboard` with real-time provider status, request metrics, revenue tracking, network settlement stats, prepaid balance, and live logs.
+x402gate includes a built-in dashboard at `/dashboard` with real-time provider status, request metrics, remaining provider balances, revenue tracking, network settlement stats, prepaid balance, and live logs. A balance turns red under $10, under 300 CloudConvert credits, or under 20% of the ElevenLabs character allowance. OpenRouter's account balance needs `OPENROUTER_MANAGEMENT_KEY`.
 
 | Endpoint | Description |
 |----------|-------------|
 | `GET /dashboard` | HTML dashboard with auto-refresh (5s) |
-| `GET /v1/stats` | JSON snapshot: uptime, per-provider metrics, revenue/cost/profit, network stats, prepaid balance |
+| `GET /v1/stats` | JSON snapshot: uptime, per-provider metrics, provider balances, revenue/cost/profit, network stats, prepaid balance |
 | `GET /v1/logs?limit=200` | Recent log entries (newest first, default 200) |
 
 Statistics are stored **in-memory** and reset on server restart. The log buffer retains the last 1 000 entries (configurable via `MAX_LOG_ENTRIES` in `x402gate/core/stats.py`). Providers that haven't received requests in 1 hour are marked as `unknown`.

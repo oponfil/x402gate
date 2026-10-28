@@ -36,6 +36,7 @@ Set these in the Railway dashboard under **Variables**:
 |---|---|---|
 | `WAVESPEED_API_KEY` | Yes | WaveSpeed AI API key |
 | `OPENROUTER_API_KEY` | Yes | OpenRouter API key |
+| `OPENROUTER_MANAGEMENT_KEY` | No | OpenRouter management key, used only to show the account balance. Management keys cannot call models |
 | `TUNGSTEN_JWT_TOKEN` | No | Tungsten JWT cookie. Required only when `providers.tungsten.enabled` is true |
 | `TUNGSTEN_CF_CLEARANCE` | No | Tungsten Cloudflare clearance cookie. Required only when Tungsten is enabled |
 | `CLOUDCONVERT_API_KEY` | Yes | CloudConvert API key |

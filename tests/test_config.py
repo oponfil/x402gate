@@ -175,6 +175,31 @@ class TestEnvInterpolation:
         with pytest.raises(ValueError, match="required but not set"):
             load_config(config_with_env)
 
+    def test_optional_env_is_empty_when_unset(self, tmp_path: Path):
+        """${VAR:-} stays empty when the variable is not set."""
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("""
+payment:
+  networks:
+    base:
+      type: "evm"
+      network: "eip155:8453"
+      pay_to: "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+      token_address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+      rpc_url: "https://mainnet.base.org"
+      facilitator_key: "0x0000000000000000000000000000000000000000000000000000000000000001"
+
+providers:
+  openrouter:
+    enabled: true
+    base_url: "https://openrouter.ai/api/v1"
+    api_key: "inference"
+    balance_api_key: "${TEST_MANAGEMENT_KEY:-}"
+""")
+        os.environ.pop("TEST_MANAGEMENT_KEY", None)
+        config = load_config(config_file)
+        assert config.providers["openrouter"].balance_api_key == ""
+
     def test_missing_provider_key_raises(self, config_with_env: Path):
         """Missing provider API key raises ValueError."""
         # Set payment vars but leave provider key unset

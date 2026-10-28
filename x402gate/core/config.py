@@ -18,19 +18,23 @@ def _interpolate_env(value: Any) -> Any:
     """Replace ${VAR} placeholders with environment variable values."""
     if not isinstance(value, str):
         return value
-    pattern = re.compile(r"\$\{(\w+)\}")
+    pattern = re.compile(r"\$\{(\w+)(:-)?\}")
     match = pattern.search(value)
     if not match:
         return value
     result = value
     for m in pattern.finditer(value):
         env_var = m.group(1)
+        optional = m.group(2) == ":-"
         # Fail fast on startup if any configured secret is missing.
         # This keeps broken deployments from advertising providers that
         # would only fail later on the first real request.
+        # ${VAR:-} is optional and becomes an empty string when unset.
         env_value = os.environ.get(env_var)
         if env_value is None:
-            raise ValueError(f"Environment variable '${{{env_var}}}' is required but not set")
+            if not optional:
+                raise ValueError(f"Environment variable '${{{env_var}}}' is required but not set")
+            env_value = ""
         result = result.replace(m.group(0), env_value)
     return result
 
@@ -114,6 +118,7 @@ class ProviderConfig(BaseModel):
     enabled: bool = True
     base_url: str
     api_key: str = ""
+    balance_api_key: str = ""  # optional key used only to read the account balance
     poll_interval: int = 2
     poll_timeout: int = 600
     docs_url: str = ""  # Link to provider API documentation
