@@ -6,9 +6,9 @@ call every provider on each poll.
 
 A balance is marked low when it is time to top up:
 
-- dollars: under $10
+- dollars: under $20
 - CloudConvert credits: under 300
-- ElevenLabs characters: under 20% of the current limit, or already used up
+- ElevenLabs characters: under 10,000 left
 """
 
 from __future__ import annotations
@@ -28,9 +28,9 @@ logger = logging.getLogger(__name__)
 
 _CACHE_TTL_S = 60.0
 _REQUEST_TIMEOUT_S = 8.0
-_LOW_USD = Decimal("10")
+_LOW_USD = Decimal("20")
 _LOW_CREDITS = Decimal("300")
-_LOW_CHARACTER_RATIO = Decimal("0.2")
+_LOW_CHARACTERS = Decimal("10000")
 
 _SUPPORTED = {
     "openrouter",
@@ -103,7 +103,7 @@ def _payload(amount: Decimal, unit: str, *, low: bool) -> dict[str, Any]:
 
 
 def _usd(amount: Decimal) -> dict[str, Any]:
-    """Dollar balance. Low when less than $10 is left."""
+    """Dollar balance. Low when less than $20 is left."""
     return _payload(amount, "usd", low=amount < _LOW_USD)
 
 
@@ -173,9 +173,7 @@ def parse_elevenlabs(body: dict[str, Any]) -> dict[str, Any]:
     subscription = body.get("subscription", body)
     limit = _decimal(subscription["character_limit"])
     remaining = limit - _decimal(subscription["character_count"])
-    ratio = remaining / limit if limit > 0 else Decimal("0")
-    low = remaining <= 0 or ratio < _LOW_CHARACTER_RATIO
-    return _payload(remaining, "characters", low=low)
+    return _payload(remaining, "characters", low=remaining < _LOW_CHARACTERS)
 
 
 def _failure_hint(response: httpx.Response) -> str:

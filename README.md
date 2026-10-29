@@ -193,7 +193,7 @@ curl https://x402gate.io/
 
 ### Dashboard
 
-x402gate includes a built-in dashboard at `/dashboard` with real-time provider status, request metrics, remaining provider balances, revenue tracking, network settlement stats, prepaid balance, and live logs. A balance turns red under $10, under 300 CloudConvert credits, or under 20% of the ElevenLabs character allowance. OpenRouter's account balance needs `OPENROUTER_MANAGEMENT_KEY`.
+x402gate includes a built-in dashboard at `/dashboard` with real-time provider status, request metrics, remaining provider balances, revenue tracking, network settlement stats, prepaid balance, and live logs. A balance turns red under $20, under 300 CloudConvert credits, or under 10,000 ElevenLabs characters. OpenRouter's account balance needs `OPENROUTER_MANAGEMENT_KEY`.
 
 | Endpoint | Description |
 |----------|-------------|

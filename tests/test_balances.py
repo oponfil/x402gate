@@ -87,7 +87,7 @@ class TestParsers:
     def test_fishaudio_credit_is_dollars(self):
         parsed = parse_fishaudio({"credit": "12.5"})
         assert parsed["label"] == "$12.50"
-        assert parsed["low"] is False
+        assert parsed["low"] is True
 
     def test_elevenlabs_characters_remaining(self):
         parsed = parse_elevenlabs({"character_limit": 100000, "character_count": 1000})
@@ -95,14 +95,14 @@ class TestParsers:
         assert parsed["unit"] == "characters"
         assert parsed["low"] is False
 
-    def test_elevenlabs_under_twenty_percent_is_low(self):
-        parsed = parse_elevenlabs({"character_limit": 100000, "character_count": 81000})
-        assert parsed["label"] == "19,000 chars"
+    def test_elevenlabs_under_ten_thousand_characters_is_low(self):
+        parsed = parse_elevenlabs({"character_limit": 100000, "character_count": 90001})
+        assert parsed["label"] == "9,999 chars"
         assert parsed["low"] is True
 
-    def test_elevenlabs_twenty_percent_is_enough(self):
-        parsed = parse_elevenlabs({"character_limit": 100000, "character_count": 80000})
-        assert parsed["label"] == "20,000 chars"
+    def test_elevenlabs_ten_thousand_characters_is_enough(self):
+        parsed = parse_elevenlabs({"character_limit": 100000, "character_count": 90000})
+        assert parsed["label"] == "10,000 chars"
         assert parsed["low"] is False
 
     def test_elevenlabs_used_up_is_low(self):
@@ -233,8 +233,12 @@ class TestFetch:
             parse_spicyapi({"code": 401, "data": {"available": "1"}})
 
     def test_low_threshold_constant(self):
-        """$10.00 is still enough; one cent under is low."""
+        """$20.00 is still enough; one cent under is low."""
         assert (
-            parse_openrouter({"data": {"total_credits": Decimal("10"), "total_usage": 0}})["low"]
+            parse_openrouter({"data": {"total_credits": Decimal("20"), "total_usage": 0}})["low"]
             is False
+        )
+        assert (
+            parse_openrouter({"data": {"total_credits": Decimal("19.99"), "total_usage": 0}})["low"]
+            is True
         )

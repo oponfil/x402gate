@@ -22,7 +22,7 @@ One card per registered provider + a `topup` system card. Each card shows:
 | **Success** | Success rate (%) |
 | **Avg job time** | Average request latency |
 | **Last activity** | Time since last request |
-| **Balance** | Remaining funds on that provider's API key, when the service exposes them. Dollars for WaveSpeed, SpicyAPI, and Fish Audio. OpenRouter shows the account wallet when `OPENROUTER_MANAGEMENT_KEY` is set. CloudConvert shows conversion credits. ElevenLabs shows characters left in the current period. Under $10, under 300 credits, or under 20% of the character limit, the value and the card border turn red. |
+| **Balance** | Remaining funds on that provider's API key, when the service exposes them. Dollars for WaveSpeed, SpicyAPI, and Fish Audio. OpenRouter shows the account wallet when `OPENROUTER_MANAGEMENT_KEY` is set. CloudConvert shows conversion credits. ElevenLabs shows characters left in the current period. Under $20, under 300 credits, or under 10,000 characters, the value and the card border turn red. |
 | **Revenue** | Total revenue (USD) |
 | **Profit** | Revenue − Cost − Gas |
 
