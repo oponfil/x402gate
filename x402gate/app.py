@@ -44,6 +44,7 @@ from x402gate.providers.cloudconvert import CloudConvertProvider
 from x402gate.providers.elevenlabs import ElevenLabsProvider
 from x402gate.providers.fishaudio import FishAudioProvider
 from x402gate.providers.minimax import MinimaxProvider
+from x402gate.providers.nanogpt import NanoGptProvider
 from x402gate.providers.openrouter import OpenRouterProvider
 from x402gate.providers.socialdownload import SocialDownloadProvider
 from x402gate.providers.spicyapi import SpicyApiProvider
@@ -128,6 +129,7 @@ async def _refund_settled_payment(payer: str, amount: Decimal) -> dict[str, str]
 PROVIDER_REGISTRY: dict[str, type[BaseProvider]] = {
     "wavespeed": WaveSpeedProvider,
     "openrouter": OpenRouterProvider,
+    "nanogpt": NanoGptProvider,
     "tungsten": TungstenProvider,
     "cloudconvert": CloudConvertProvider,
     "socialdownload": SocialDownloadProvider,
@@ -181,7 +183,7 @@ async def lifespan(app: FastAPI):
                 kwargs["web_search_tokens_per_result"] = gw.web_search_tokens_per_result
                 kwargs["default_web_search_max_results"] = gw.default_web_search_max_results
                 kwargs["web_search_cost_per_result"] = gw.web_search_cost_per_result
-            elif name == "spicyapi":
+            elif name == "nanogpt" or name == "spicyapi":
                 kwargs["default_max_tokens"] = config.gateway.default_max_tokens
             elif name == "tungsten":
                 kwargs["jwt_token"] = provider_config.jwt_token
@@ -283,6 +285,7 @@ async def service_info(request: Request) -> Response:
 
     provider_categories = {
         "openrouter": "LLM",
+        "nanogpt": "LLM",
         "blockrun": "LLM",
         "wavespeed": "Image & Video",
         "tungsten": "Image & Video",

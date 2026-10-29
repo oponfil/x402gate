@@ -34,6 +34,7 @@ _LOW_CHARACTERS = Decimal("10000")
 
 _SUPPORTED = {
     "openrouter",
+    "nanogpt",
     "wavespeed",
     "spicyapi",
     "cloudconvert",
@@ -143,6 +144,21 @@ def parse_openrouter_key(body: dict[str, Any]) -> dict[str, Any] | None:
     return _usd(min(amounts))
 
 
+def parse_nanogpt(body: dict[str, Any]) -> dict[str, Any]:
+    """NanoGPT spendable USD balance. The Nano balance is a separate wallet."""
+    if body.get("error"):
+        raise ValueError("nanogpt balance was not successful")
+    return _usd(_decimal(body["usd_balance"]))
+
+
+def nanogpt_balance_url(base_url: str) -> str:
+    """Balance lives beside the v1 API, not under it."""
+    root = base_url.rstrip("/")
+    if root.endswith("/v1"):
+        root = root[: -len("/v1")]
+    return f"{root}/check-balance"
+
+
 def parse_wavespeed(body: dict[str, Any]) -> dict[str, Any]:
     """WaveSpeed account balance in USD."""
     if body.get("code") not in (None, 200):
@@ -243,6 +259,22 @@ async def _read_openrouter(
     return parse_openrouter(credits)
 
 
+async def _read_nanogpt(
+    client: httpx.AsyncClient,
+    config: ProviderConfig,
+) -> dict[str, Any]:
+    """POST the account balance. NanoGPT does not expose it as a GET."""
+    response = await client.post(
+        nanogpt_balance_url(config.base_url),
+        headers={"x-api-key": config.api_key},
+    )
+    response.raise_for_status()
+    body = response.json()
+    if not isinstance(body, dict):
+        raise ValueError("balance response was not an object")
+    return parse_nanogpt(body)
+
+
 async def _read_elevenlabs(
     client: httpx.AsyncClient,
     config: ProviderConfig,
@@ -268,6 +300,8 @@ async def _read(
     """Fetch and parse one provider balance."""
     if name == "openrouter":
         return await _read_openrouter(client, config)
+    if name == "nanogpt":
+        return await _read_nanogpt(client, config)
     if name == "elevenlabs":
         return await _read_elevenlabs(client, config)
     headers = _bearer(config.api_key)

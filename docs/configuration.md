@@ -15,7 +15,7 @@ x402gate is configured via `config.yaml` in the project root. Secrets are stored
 | `port` | int | `4021` | Server port |
 | `commission` | float | `0.04` | Markup rate on provider prices (0.04 = 4%) |
 | `gas_surcharge` | float | `0.001` | Fixed gas surcharge ($0.001) added per request |
-| `default_max_tokens` | int | `2048` | Default `max_tokens` for OpenRouter chat when the client omits it. Applied in both x402 and prepaid mode |
+| `default_max_tokens` | int | `2048` | Default `max_tokens` for OpenRouter and NanoGPT chat when the client omits it. Applied in both x402 and prepaid mode |
 | `web_search_tokens_per_result` | int | `2048` | Estimated extra input tokens per web search result |
 | `default_web_search_max_results` | int | `3` | Default `max_results` for web search plugins when client omits it |
 | `web_search_cost_per_result` | float | `0.004` | Fixed cost per web search result ($0.004, OpenRouter Exa: $4/1000) |
@@ -80,6 +80,7 @@ Every variable referenced from active config is validated at startup. If you lea
 |---|---|---|
 | `WAVESPEED_API_KEY` | Yes | WaveSpeed AI API key |
 | `OPENROUTER_API_KEY` | Yes | OpenRouter API key |
+| `NANOGPT_API_KEY` | Yes | NanoGPT API key for chat completions |
 | `OPENROUTER_MANAGEMENT_KEY` | No | OpenRouter management key, used only to show the account balance. Management keys cannot call models |
 | `TUNGSTEN_JWT_TOKEN` | No | Tungsten JWT cookie. Required only when `providers.tungsten.enabled` is true |
 | `TUNGSTEN_CF_CLEARANCE` | No | Tungsten Cloudflare clearance cookie. Required only when Tungsten is enabled |

@@ -11,9 +11,11 @@ from x402gate.core import balances
 from x402gate.core.balances import (
     clear_balance_cache,
     fetch_balances,
+    nanogpt_balance_url,
     parse_cloudconvert,
     parse_elevenlabs,
     parse_fishaudio,
+    parse_nanogpt,
     parse_openrouter,
     parse_openrouter_key,
     parse_spicyapi,
@@ -60,6 +62,22 @@ class TestParsers:
         parsed = parse_openrouter({"data": {"total_credits": 4, "total_usage": 0}})
         assert parsed["label"] == "$4.00"
         assert parsed["low"] is True
+
+    def test_nanogpt_usd_balance(self):
+        parsed = parse_nanogpt(
+            {
+                "usd_balance": "129.46956147",
+                "nano_balance": "26.71801147",
+            }
+        )
+        assert parsed["label"] == "$129.47"
+        assert parsed["low"] is False
+        assert parse_nanogpt({"usd_balance": "19.99"})["low"] is True
+        assert parse_nanogpt({"usd_balance": "20"})["low"] is False
+        assert (
+            nanogpt_balance_url("https://api.nano-gpt.com/api/v1")
+            == "https://api.nano-gpt.com/api/check-balance"
+        )
 
     def test_wavespeed_balance(self):
         parsed = parse_wavespeed({"code": 200, "data": {"balance": 50.25}})
@@ -117,6 +135,16 @@ class TestFetch:
     def setup_method(self) -> None:
         """Drop balances cached by the previous test."""
         clear_balance_cache()
+
+    @respx.mock
+    async def test_fetches_nanogpt_with_the_api_key_header(self):
+        route = respx.post("https://api.nano-gpt.com/api/check-balance").mock(
+            return_value=httpx.Response(200, json={"usd_balance": "12.5", "nano_balance": "0"})
+        )
+        configs = {"nanogpt": _config("https://api.nano-gpt.com/api/v1", api_key="ng-key")}
+        result = await fetch_balances(configs)
+        assert result["nanogpt"]["label"] == "$12.50"
+        assert route.calls[0].request.headers["x-api-key"] == "ng-key"
 
     @respx.mock
     async def test_fetches_openrouter_and_caches(self):

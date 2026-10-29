@@ -48,6 +48,7 @@ jobs:
           # Dummy values for config loading (not used in unit tests)
           WAVESPEED_API_KEY: dummy
           OPENROUTER_API_KEY: dummy
+          NANOGPT_API_KEY: dummy
           BASE_PAY_TO_ADDRESS: "0x0000000000000000000000000000000000000000"
           BASE_FACILITATOR_PRIVATE_KEY: dummy
           SOLANA_PAY_TO_ADDRESS: "11111111111111111111111111111111"

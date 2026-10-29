@@ -68,6 +68,7 @@ The diagram is the Base order. On Solana, settle runs immediately after verify a
 | **Provider Base** | `x402gate/providers/base.py` | Abstract provider interface |
 | **WaveSpeed** | `x402gate/providers/wavespeed.py` | WaveSpeed AI (60+ image/video models) |
 | **OpenRouter** | `x402gate/providers/openrouter.py` | OpenRouter aggregator (LLM, embeddings, STT) |
+| **NanoGPT** | `x402gate/providers/nanogpt.py` | NanoGPT chat catalog (prices are USD per million tokens) |
 | **SpicyAPI** | `x402gate/providers/spicyapi.py` | Image and video jobs (quote, create, poll) and quoted chat (`jobs/stream`) |
 | **CloudConvert** | `x402gate/providers/cloudconvert.py` | File conversion (200+ formats, multipart upload) |
 | **SocialDownload** | `x402gate/providers/socialdownload.py` | Social media download via RapidAPI |
@@ -110,7 +111,7 @@ The standard `PaymentMiddlewareASGI` from the x402 library requires static route
 
 ### Actual Cost Tracking
 
-For token-based providers (OpenRouter chat/embeddings), the gateway tracks both estimated and actual costs:
+For token-based providers (OpenRouter chat/embeddings, NanoGPT chat), the gateway tracks both estimated and actual costs. OpenRouter catalog rates are USD per token. NanoGPT `pricing.prompt` and `pricing.completion` are USD per million tokens:
 
 - **Estimated cost** — ceiling calculated upfront from `max_tokens × completion_price + input_tokens × prompt_price`
 - **Actual cost** — computed after response from real `usage.prompt_tokens` and `usage.completion_tokens`

@@ -81,6 +81,23 @@ providers:
           data: "UklGRiYAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQIAAAAAAA=="
           format: "wav"
 
+  nanogpt:
+    enabled: true
+    base_url: "https://api.nano-gpt.com/api/v1"
+    api_key: "${NANOGPT_API_KEY}"
+    poll_timeout: 600          # seconds, max wait for LLM response (10 min)
+    models_cache_ttl: 86400    # seconds, how long to cache the list of models (1 day)
+    description: "600+ chat models, including uncensored and abliterated"
+    docs_url: "https://docs.nano-gpt.com/api-reference/endpoint/chat-completion"
+    example_request:
+      model: "chat/completions"
+      body:
+        model: "deepseek/deepseek-v4.1-flash-1017"
+        messages:
+          - role: user
+            content: "If AI ruled the world, what would be the first law it passes? Be creative and funny."
+        max_tokens: 2048
+
   wavespeed:
     enabled: true
     base_url: "https://api.wavespeed.ai/api/v3"

@@ -9,6 +9,7 @@ x402gate sits between your AI agent and AI service providers, adding [x402](http
 | Provider | Type | What | Endpoint |
 |----------|------|------|----------|
 | [OpenRouter](https://openrouter.ai) | Managed | 300+ LLMs, embeddings, STT (GPT, Claude, Whisper…) | `/v1/openrouter/...` |
+| [NanoGPT](https://nano-gpt.com) | Managed | 600+ chat models, including uncensored and abliterated | `/v1/nanogpt/chat/completions` |
 | [WaveSpeed AI](https://wavespeed.ai) | Managed | 60+ image/video models (Flux, Wan, Kling, Sora…) | `/v1/wavespeed/...` |
 | [SpicyAPI](https://spicyapi.ai) | Managed | Image, video, and chat models (Flux, Wan, Seedance, DeepSeek, Grok…) | `/v1/spicyapi/jobs`, `/v1/spicyapi/chat/completions` |
 | [CloudConvert](https://cloudconvert.com) | Managed | File conversion (200+ formats) | `/v1/cloudconvert/...` |
@@ -170,7 +171,7 @@ Client                    x402gate
   │◄─── 200 + result ────────┤
 ```
 
-Commission and gas are charged **once at top-up**. Subsequent requests deduct the provider's actual cost, up to the estimate reserved before the call. OpenRouter chat uses the same `max_tokens` ceiling as a direct x402 payment, so a prepaid request cannot run past the reserved amount. If the provider fails, the reservation is returned to the balance.
+Commission and gas are charged **once at top-up**. Subsequent requests deduct the provider's actual cost, up to the estimate reserved before the call. OpenRouter and NanoGPT chat use the same `max_tokens` ceiling as a direct x402 payment, so a prepaid request cannot run past the reserved amount. If the provider fails, the reservation is returned to the balance.
 
 Supports both **Solana** (Ed25519) and **Base/EVM** (EIP-191) wallets — auto-detected by address format.
 
@@ -193,7 +194,7 @@ curl https://x402gate.io/
 
 ### Dashboard
 
-x402gate includes a built-in dashboard at `/dashboard` with real-time provider status, request metrics, remaining provider balances, revenue tracking, network settlement stats, prepaid balance, and live logs. A balance turns red under $20, under 300 CloudConvert credits, or under 10,000 ElevenLabs characters. OpenRouter's account balance needs `OPENROUTER_MANAGEMENT_KEY`.
+x402gate includes a built-in dashboard at `/dashboard` with real-time provider status, request metrics, remaining provider balances, revenue tracking, network settlement stats, prepaid balance, and live logs. A balance turns red under $20, under 300 CloudConvert credits, or under 10,000 ElevenLabs characters. OpenRouter's account balance needs `OPENROUTER_MANAGEMENT_KEY`. NanoGPT shows the USD balance on its API key.
 
 | Endpoint | Description |
 |----------|-------------|
