@@ -411,6 +411,7 @@
 
     <script>
         const PROVIDER_TYPES = JSON.parse('{{ provider_types_json }}');
+        const PROVIDER_CATEGORIES = JSON.parse('{{ provider_categories_json }}');
 
         function formatUptime(seconds) {
             const d = Math.floor(seconds / 86400);
@@ -433,27 +434,26 @@
             return `<span class="status-dot status-${status}"></span>`;
         }
 
-        const PROVIDER_CATEGORIES = {
-            'LLM': ['openrouter', 'nanogpt'],
-            'Image & Video': ['wavespeed', 'tungsten', 'spicyapi'],
-            'Text-to-Speech': ['elevenlabs', 'fishaudio'],
-            'Utility': ['cloudconvert', 'socialdownload'],
-        };
-
         function renderProviders(providers) {
             const grid = document.getElementById('provider-grid');
             const allNames = Object.keys(providers);
-
-            // Build categorized output
-            const categorized = {};
-            for (const [cat, members] of Object.entries(PROVIDER_CATEGORIES)) {
-                const found = members.filter(m => allNames.includes(m));
-                if (found.length) categorized[cat] = found;
+            const categoryOrder = [];
+            for (const category of Object.values(PROVIDER_CATEGORIES)) {
+                if (!categoryOrder.includes(category)) categoryOrder.push(category);
             }
-            // Uncategorized providers (e.g. topup, future ones)
-            const known = Object.values(PROVIDER_CATEGORIES).flat();
-            const other = allNames.filter(n => !known.includes(n)).sort();
-            if (other.length) categorized['System'] = other;
+            if (!categoryOrder.includes('System')) categoryOrder.push('System');
+
+            const categorized = {};
+            for (const category of categoryOrder) {
+                const listed = Object.entries(PROVIDER_CATEGORIES)
+                    .filter(([name, cat]) => cat === category && allNames.includes(name))
+                    .map(([name]) => name);
+                const extra = allNames
+                    .filter(name => (PROVIDER_CATEGORIES[name] || 'System') === category && !listed.includes(name))
+                    .sort();
+                const found = listed.concat(extra);
+                if (found.length) categorized[category] = found;
+            }
 
             let html = '';
             for (const [cat, names] of Object.entries(categorized)) {

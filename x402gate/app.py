@@ -121,11 +121,35 @@ async def _refund_settled_payment(payer: str, amount: Decimal) -> dict[str, str]
     }
 
 
-# ---------------------------------------------------------------------------
-# Provider registry: maps config name → provider class.
-# Passthrough providers don't need a class — they're handled generically.
-# To add a new managed provider, add one line here and create the class.
-# ---------------------------------------------------------------------------
+# One map for the landing page and the dashboard. Anything missing is System.
+PROVIDER_CATEGORIES: dict[str, str] = {
+    "openrouter": "LLM",
+    "nanogpt": "LLM",
+    "blockrun": "LLM",
+    "wavespeed": "Image & Video",
+    "tungsten": "Image & Video",
+    "spicyapi": "Image & Video",
+    "elevenlabs": "Text-to-Speech",
+    "minimax": "Text-to-Speech",
+    "fishaudio": "Text-to-Speech",
+    "cloudconvert": "Utility",
+    "socialdownload": "Utility",
+}
+
+
+def category_order() -> list[str]:
+    """Category headings in map order, with System last for topup and unknowns."""
+    order: list[str] = []
+    for category in PROVIDER_CATEGORIES.values():
+        if category not in order:
+            order.append(category)
+    if "System" not in order:
+        order.append("System")
+    return order
+
+
+# Provider registry: config name → provider class.
+# A passthrough provider needs no class. A managed provider needs one line here.
 PROVIDER_REGISTRY: dict[str, type[BaseProvider]] = {
     "wavespeed": WaveSpeedProvider,
     "openrouter": OpenRouterProvider,
@@ -283,20 +307,6 @@ async def service_info(request: Request) -> Response:
     provider_info: list[dict[str, Any]] = []
     examples: list[dict[str, Any]] = []
 
-    provider_categories = {
-        "openrouter": "LLM",
-        "nanogpt": "LLM",
-        "blockrun": "LLM",
-        "wavespeed": "Image & Video",
-        "tungsten": "Image & Video",
-        "spicyapi": "Image & Video",
-        "elevenlabs": "Text-to-Speech",
-        "minimax": "Text-to-Speech",
-        "fishaudio": "Text-to-Speech",
-        "cloudconvert": "Utility",
-        "socialdownload": "Utility",
-    }
-
     for name, pcfg in config.providers.items():
         if not pcfg.enabled:
             continue
@@ -305,7 +315,7 @@ async def service_info(request: Request) -> Response:
             {
                 "name": name,
                 "type": ptype,
-                "category": provider_categories.get(name, "System"),
+                "category": PROVIDER_CATEGORIES.get(name, "System"),
                 "description": pcfg.description or "",
                 "docs_url": pcfg.docs_url or "",
             }
@@ -363,6 +373,7 @@ async def service_info(request: Request) -> Response:
         "networks": networks,
         "commission": f"{commission_pct}% + ${gas_fee} gas",
         "provider_info": provider_info,
+        "category_order": category_order(),
         "provider_docs": provider_docs,
         "prepaid": prepaid,
         "examples": examples,
@@ -503,6 +514,7 @@ async def dashboard() -> Response:
     template = env.get_template(template_path.name)
     html = template.render(
         provider_types_json=json.dumps(provider_types),
+        provider_categories_json=json.dumps(PROVIDER_CATEGORIES),
     )
     return HTMLResponse(content=html)
 
