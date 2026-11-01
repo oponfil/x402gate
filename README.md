@@ -202,7 +202,7 @@ x402gate includes a built-in dashboard at `/dashboard` with real-time provider s
 | `GET /v1/stats` | JSON snapshot: uptime, per-provider metrics, provider balances, revenue/cost/profit, network stats, prepaid balance |
 | `GET /v1/logs?limit=200` | Recent log entries (newest first, default 200) |
 
-Statistics are stored **in-memory** and reset on server restart. The log buffer retains the last 1 000 entries (configurable via `MAX_LOG_ENTRIES` in `x402gate/core/stats.py`). Providers that haven't received requests in 1 hour are marked as `unknown`.
+Statistics are stored **in-memory** and reset on server restart. The log buffer retains the last 1 000 entries (configurable via `MAX_LOG_ENTRIES` in `x402gate/core/stats.py`). Providers that haven't received requests in 4 hours are marked as `unknown`.
 
 ## Supported Networks
 

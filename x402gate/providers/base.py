@@ -65,8 +65,10 @@ class BaseProvider(ABC):
         Args:
             path: API path (e.g. 'wavespeed-ai/flux-dev').
             body: Request body dict.
-            prepaid: If True, skip cost-limiting defaults (e.g. max_tokens)
-                since actual usage will be charged post-request.
+            prepaid: True for prepaid-balance requests. Providers must still
+                apply cost limits such as default max_tokens, because the
+                gateway reserves the get_price() estimate before the call
+                and never charges more than that reservation.
 
         Returns:
             Provider response including task ID and status.
