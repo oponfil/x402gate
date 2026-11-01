@@ -24,6 +24,7 @@ from x402gate.core.audio_duration import (
     get_audio_duration_seconds,
 )
 from x402gate.core.config import ProviderConfig
+from x402gate.core.proxy import safe_to_resend
 from x402gate.providers.base import BaseProvider, ProviderError
 
 logger = logging.getLogger(__name__)
@@ -508,13 +509,13 @@ class OpenRouterProvider(BaseProvider):
                             "Content-Type": "application/json",
                         },
                     )
-            except httpx.TimeoutException:
+            except httpx.TimeoutException as exc:
                 last_error = ProviderError(
                     provider=self.name,
                     detail=f"OpenRouter request timed out after {self._config.poll_timeout}s",
                     status_code=504,
                 )
-                if attempt < max_retries:
+                if attempt < max_retries and safe_to_resend(exc):
                     delay = retry_delay * (2**attempt)
                     logger.warning(
                         "OpenRouter timeout (attempt %d/%d), retrying in %.1fs",

@@ -457,6 +457,37 @@ class TestSubmit:
                 await provider.submit("chat/completions", body)
 
     @pytest.mark.asyncio
+    async def test_read_timeout_is_not_resent(self, provider):
+        """A request that timed out after it was sent may be running; resending bills twice."""
+        body = {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "Hi"}]}
+
+        with (
+            patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post,
+            patch("x402gate.providers.openrouter.asyncio.sleep", new_callable=AsyncMock),
+            pytest.raises(ProviderError) as caught,
+        ):
+            mock_post.side_effect = httpx.ReadTimeout("slow")
+            await provider.submit("chat/completions", body)
+
+        assert mock_post.call_count == 1
+        assert caught.value.status_code == 504
+
+    @pytest.mark.asyncio
+    async def test_connect_timeout_is_retried(self, provider, chat_completion_response):
+        """A request that never reached OpenRouter is safe to send again."""
+        body = {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "Hi"}]}
+
+        with (
+            patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post,
+            patch("x402gate.providers.openrouter.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            mock_post.side_effect = [httpx.ConnectTimeout("no route"), chat_completion_response]
+            result = await provider.submit("chat/completions", body)
+
+        assert mock_post.call_count == 2
+        assert result["usage"]["total_tokens"] == 18
+
+    @pytest.mark.asyncio
     async def test_no_task_id_in_response(self, provider, chat_completion_response):
         """Response should not contain 'id' field that triggers polling."""
         body = {

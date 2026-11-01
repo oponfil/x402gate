@@ -24,6 +24,16 @@ class ProxyError(Exception):
         super().__init__(f"Proxy error {status_code}: {detail}")
 
 
+def safe_to_resend(exc: httpx.TimeoutException) -> bool:
+    """Return True when a timed-out request never reached the provider.
+
+    A connect or pool timeout fails before anything is sent. A read or write
+    timeout comes after: the provider may already be running, and billing,
+    the job, so sending it again could pay for it twice.
+    """
+    return isinstance(exc, (httpx.ConnectTimeout, httpx.PoolTimeout))
+
+
 class TaskTimeoutError(Exception):
     """Raised when task polling exceeds the timeout."""
 
@@ -44,8 +54,9 @@ async def proxy_request(
 ) -> dict[str, Any]:
     """Forward a request body to the provider API as-is.
 
-    Retries on 5xx server errors (up to max_retries times) with exponential
-    backoff.  4xx client errors fail immediately.
+    Retries on 5xx server errors and on timeouts before the request was sent
+    (up to max_retries times) with exponential backoff. 4xx client errors and
+    read timeouts fail immediately: a read timeout may mean the task exists.
 
     Args:
         base_url: Provider API base URL (e.g. https://api.wavespeed.ai/api/v3).
@@ -76,12 +87,12 @@ async def proxy_request(
                         "Content-Type": "application/json",
                     },
                 )
-        except httpx.TimeoutException:
+        except httpx.TimeoutException as exc:
             last_error = ProxyError(
                 status_code=504,
                 detail=f"Request to {url} timed out after {request_timeout}s",
             )
-            if attempt < max_retries:
+            if attempt < max_retries and safe_to_resend(exc):
                 delay = retry_delay * (2**attempt)
                 logger.warning(
                     "Proxy timeout (attempt %d/%d), retrying in %.1fs: %s",

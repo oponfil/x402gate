@@ -216,6 +216,40 @@ class TestSubmit:
             await provider.submit("chat/completions", body)
         assert caught.value.status_code == 400
 
+    @pytest.mark.asyncio
+    async def test_read_timeout_is_not_resent(self, provider):
+        """A request that timed out after it was sent may be running; resending bills twice."""
+        body = {"model": "demo/model", "messages": [{"role": "user", "content": "Hi"}]}
+        with (
+            patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post,
+            patch("x402gate.providers.nanogpt.asyncio.sleep", new_callable=AsyncMock),
+            pytest.raises(ProviderError) as caught,
+        ):
+            mock_post.side_effect = httpx.ReadTimeout("slow")
+            await provider.submit("chat/completions", body)
+        assert mock_post.call_count == 1
+        assert caught.value.status_code == 504
+
+    @pytest.mark.asyncio
+    async def test_connect_timeout_is_retried(self, provider):
+        """A request that never reached NanoGPT is safe to send again."""
+        body = {"model": "demo/model", "messages": [{"role": "user", "content": "Hi"}]}
+        ok = httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "Hello"}}],
+                "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6},
+            },
+        )
+        with (
+            patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post,
+            patch("x402gate.providers.nanogpt.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            mock_post.side_effect = [httpx.ConnectTimeout("no route"), ok]
+            result = await provider.submit("chat/completions", body)
+        assert mock_post.call_count == 2
+        assert result["choices"][0]["message"]["content"] == "Hello"
+
 
 class TestActualCost:
     """Token counts from the completion, with cache reads at the cache rate."""
