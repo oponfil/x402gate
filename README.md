@@ -15,6 +15,7 @@ x402gate sits between your AI agent and AI service providers, adding [x402](http
 | [CloudConvert](https://cloudconvert.com) | Managed | File conversion (200+ formats) | `/v1/cloudconvert/...` |
 | [SocialDownload](https://rapidapi.com/nguyenmanhict-MuTUtGWD7K/api/social-download-all-in-one) | Managed | Download media from social networks | `/v1/socialdownload/...` |
 | [ElevenLabs](https://elevenlabs.io) | Managed | Premium TTS (1000+ voices, Multilingual v2, Flash) | `/v1/elevenlabs/...` |
+| [MiniMax](https://www.minimax.io) | Managed | High-quality TTS with emotional expression | `/v1/minimax/...` |
 | [Fish Audio](https://fish.audio) | Managed | Uncensored TTS (Fish Speech) | `/v1/fishaudio/...` |
 
 ## How It Works
@@ -323,7 +324,7 @@ See [docs/add-provider.md](docs/add-provider.md) for a step-by-step guide.
 - [Dashboard](docs/dashboard.md) — real-time metrics, logs, and revenue tracking
 - [Deployment](docs/deployment.md) — Railway, Docker, VPS guides
 - [Configuration](docs/configuration.md) — all config options
-- [TTS Providers](docs/tts.md) — ElevenLabs, Fish Audio
+- [TTS Providers](docs/tts.md) — ElevenLabs, MiniMax, Fish Audio
 - [STT (OpenRouter)](docs/stt.md) — Whisper and speech-to-text transcription
 - [SpicyAPI](https://docs.spicyapi.ai/docs/tasks) — image and video jobs (`POST /v1/spicyapi/jobs`) and chat (`POST /v1/spicyapi/chat/completions`)
 - [SocialDownload](docs/socialdownload.md) — download media from social networks

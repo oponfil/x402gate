@@ -15,7 +15,7 @@ AI agents need to pay for services. Today that means:
 
 ## The Solution: x402gate
 
-[x402gate](https://x402gate.io) is a **production gateway** that wraps 7 AI service providers behind the [x402 payment protocol](https://x402.org). Any agent with a USDC wallet on Base (or Solana) can:
+[x402gate](https://x402gate.io) is a **production gateway** that wraps 8 AI service providers behind the [x402 payment protocol](https://x402.org). Any agent with a USDC wallet on Base (or Solana) can:
 
 1. **Discover** available services via `GET /` (JSON manifest) or `GET /v1/providers`
 2. **Request** any AI service → receive `HTTP 402` with the USDC price
@@ -32,6 +32,7 @@ AI agents need to pay for services. Today that means:
 | CloudConvert | File conversion (200+ formats) | $0.03 |
 | SocialDownload | Media download from social networks | $0.005 |
 | ElevenLabs | Premium text-to-speech | $0.15–$0.30 per 1k chars |
+| MiniMax | Text-to-speech with emotional expression | $0.06–$0.10 per 1k chars |
 | Fish Audio | Text-to-speech | $0.015 per 1k UTF-8 bytes |
 
 ### Key Design Principles

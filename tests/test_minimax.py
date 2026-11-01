@@ -80,6 +80,14 @@ class TestGetPrice:
         assert price == expected
 
     @pytest.mark.asyncio
+    async def test_config_pricing_overrides_defaults(self):
+        """Rates from config.yaml pricing are used instead of the defaults."""
+        provider = _make_provider(pricing={"per_1k_chars_turbo": 0.5, "per_1k_chars_hd": 2})
+        body = {"text": "a" * 1000}
+        assert await provider.get_price("speech-2.8-turbo", body) == Decimal("0.5")
+        assert await provider.get_price("speech-2.8-hd", body) == Decimal("2")
+
+    @pytest.mark.asyncio
     async def test_cyrillic_counts_as_characters(self):
         """Cyrillic = characters, not bytes."""
         provider = _make_provider()

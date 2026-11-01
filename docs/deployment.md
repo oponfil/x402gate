@@ -45,7 +45,7 @@ Set these in the Railway dashboard under **Variables**:
 | `SPICYAPI_API_KEY` | Yes | SpicyAPI key for image, video, and chat |
 | `ELEVENLABS_API_KEY` | Yes | ElevenLabs text-to-speech key. Must be the secret that starts with `sk_` |
 | `FISHAUDIO_API_KEY` | Yes | Fish Audio text-to-speech key |
-| `MINIMAX_API_KEY` | No | MiniMax text-to-speech key. Required only when `providers.minimax.enabled` is true |
+| `MINIMAX_API_KEY` | Yes | MiniMax text-to-speech key |
 | `BASE_PAY_TO_ADDRESS` | Yes | EVM address for USDC payments |
 | `BASE_FACILITATOR_PRIVATE_KEY` | Yes | Private key for on-chain settlement (EVM) |
 | `SOLANA_PAY_TO_ADDRESS` | Solana | Solana wallet for USDC payments |

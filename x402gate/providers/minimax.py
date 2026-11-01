@@ -28,15 +28,19 @@ _DEFAULT_PRICE_PER_1K_HD = Decimal("0.10")
 _ONE_THOUSAND = Decimal("1000")
 
 
-def _rate_for_model(model: str) -> Decimal:
+def _rate_for_model(
+    model: str,
+    turbo: Decimal = _DEFAULT_PRICE_PER_1K_TURBO,
+    hd: Decimal = _DEFAULT_PRICE_PER_1K_HD,
+) -> Decimal:
     """Return price per 1K characters based on model name.
 
     Defaults to the expensive HD rate.  Only uses the cheaper turbo
     rate when the model name explicitly contains ``turbo``.
     """
     if "turbo" in model.lower():
-        return _DEFAULT_PRICE_PER_1K_TURBO
-    return _DEFAULT_PRICE_PER_1K_HD
+        return turbo
+    return hd
 
 
 class MinimaxProvider(BaseProvider):
@@ -69,7 +73,7 @@ class MinimaxProvider(BaseProvider):
 
         # model from body, or from URL path (e.g. "speech-2.8-hd") — never empty
         model = inputs.get("model", model_path)
-        rate = _rate_for_model(model)
+        rate = _rate_for_model(model, self._price_turbo, self._price_hd)
         price = Decimal(char_count) / _ONE_THOUSAND * rate
 
         logger.info(

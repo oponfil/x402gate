@@ -285,7 +285,7 @@ providers:
           stability: 0.7
           speed: 1.15
   minimax:
-    enabled: false  # hidden from the site and not routed; set true to restore
+    enabled: true
     base_url: "https://api.minimax.io"
     api_key: "${MINIMAX_API_KEY}"
     poll_timeout: 600

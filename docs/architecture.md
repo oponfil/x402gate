@@ -74,8 +74,8 @@ The diagram is the Base order. On Solana, settle runs immediately after verify a
 | **SocialDownload** | `x402gate/providers/socialdownload.py` | Social media download via RapidAPI |
 | **ElevenLabs** | `x402gate/providers/elevenlabs.py` | Premium text-to-speech |
 | **Fish Audio** | `x402gate/providers/fishaudio.py` | Text-to-speech with voice cloning |
+| **MiniMax** | `x402gate/providers/minimax.py` | Text-to-speech with emotional expression |
 | **Tungsten** | `x402gate/providers/tungsten.py` | Image generation. Disabled in config (`enabled: false`) |
-| **MiniMax** | `x402gate/providers/minimax.py` | Text-to-speech. Disabled in config (`enabled: false`) |
 | **App** | `x402gate/app.py` | FastAPI routes, lifecycle, provider registry |
 | **Entry** | `x402gate/main.py` | Uvicorn server startup |
 
@@ -83,7 +83,7 @@ The diagram is the Base order. On Solana, settle runs immediately after verify a
 
 ### Dynamic Route Registration
 
-Provider routes (`/v1/{provider}/{path}`) are generated automatically from `config.yaml` at startup. A provider with `enabled: false` is not routed and is omitted from the public manifest. Tungsten, MiniMax, and the BlockRun passthrough are disabled this way. Adding a passthrough provider requires only a config entry — no code changes. Adding a managed provider requires a config entry plus a provider class registered in `PROVIDER_REGISTRY`.
+Provider routes (`/v1/{provider}/{path}`) are generated automatically from `config.yaml` at startup. A provider with `enabled: false` is not routed and is omitted from the public manifest. Tungsten and the BlockRun passthrough are disabled this way. Adding a passthrough provider requires only a config entry — no code changes. Adding a managed provider requires a config entry plus a provider class registered in `PROVIDER_REGISTRY`.
 
 ### Transparent Proxy
 
