@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from x402gate.core.config import ProviderConfig
+from x402gate.providers.base import ProviderError
 from x402gate.providers.socialdownload import (
     SocialDownloadProvider,
     _select_best_media,
@@ -220,6 +221,37 @@ class TestSubmit:
 
             with pytest.raises(Exception, match="RapidAPI error"):
                 await provider.submit("download", {"url": "https://www.youtube.com/watch?v=test"})
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("item", "expected"),
+        [
+            ({"error": "URL not supported"}, "RapidAPI returned error: URL not supported"),
+            (
+                {"error": True, "message": "Unable to extract media"},
+                "RapidAPI returned error: Unable to extract media",
+            ),
+            ({"error": True, "msg": "Private video"}, "RapidAPI returned error: Private video"),
+            ({"error": True}, 'RapidAPI returned error: {"error": true}'),
+        ],
+    )
+    async def test_submit_error_item_keeps_the_message(self, item, expected):
+        """A 200 response with an error item reports RapidAPI's own message."""
+        provider = _make_provider()
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = [item]
+
+        with patch("x402gate.providers.socialdownload.httpx.AsyncClient") as mock_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_response
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            with pytest.raises(ProviderError) as exc_info:
+                await provider.submit("download", {"url": "https://www.youtube.com/watch?v=test"})
+
+        assert exc_info.value.detail == expected
 
     @pytest.mark.asyncio
     async def test_submit_no_suitable_media(self):

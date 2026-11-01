@@ -11,6 +11,7 @@ the response has no {"data": {"id": ..., "status": ...}} structure.
 
 from __future__ import annotations
 
+import json
 import logging
 from decimal import Decimal
 from typing import Any
@@ -21,6 +22,23 @@ from x402gate.core.config import ProviderConfig
 from x402gate.providers.base import BaseProvider, ProviderError
 
 logger = logging.getLogger(__name__)
+
+
+def _error_message(item: dict[str, Any]) -> str:
+    """Return the human-readable text of a RapidAPI error item.
+
+    ``error`` is sometimes the message itself and sometimes just ``true``
+    next to a separate message field. With no text at all, the item is
+    returned as JSON so the cause is still visible.
+    """
+    error = item.get("error")
+    if isinstance(error, str) and error.strip():
+        return error
+    for key in ("message", "msg", "detail"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return json.dumps(item, ensure_ascii=False, default=str)[:300]
 
 
 def _select_best_media(api_response: list[dict]) -> dict[str, Any] | None:
@@ -184,7 +202,7 @@ class SocialDownloadProvider(BaseProvider):
         if first.get("error"):
             raise ProviderError(
                 provider=self.name,
-                detail=f"RapidAPI returned error: {first.get('error')}",
+                detail=f"RapidAPI returned error: {_error_message(first)}",
             )
 
         best = _select_best_media(api_response)
