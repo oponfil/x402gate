@@ -106,11 +106,16 @@ When using prepaid balance, send these headers **instead of** `PAYMENT-SIGNATURE
 
 ### Response Header
 
-Successful prepaid responses include the remaining balance:
+Successful prepaid responses include the remaining balance and the cost of the request:
 
 | Header | Description |
 |--------|-------------|
 | `X-Prepaid-Balance` | Remaining prepaid balance after deduction (e.g. `0.0535824`) |
+| `X-Prepaid-Cost` | Actual cost deducted for this request in USD (e.g. `0.0123`); `0` if nothing was deducted |
+
+A provider error after the reservation also carries `X-Prepaid-Cost: 0`, because the full hold goes back to the balance. Use `X-Prepaid-Cost` rather than the difference between two `X-Prepaid-Balance` values: parallel requests from one wallet interleave their balances.
+
+A polled job that runs longer than 20 seconds is kept open with whitespace heartbeats. Its headers go out with the first heartbeat, before the cost is known, so neither header is present on that response.
 
 ### Signing Message Format
 

@@ -938,9 +938,11 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
         """Return a provider error, giving held funds back."""
         if upfront_settlement is not None:
             extra.update(await _refund_settled_payment(payer, final_price))
+        response = _error_response(status_code, detail, provider=provider_label, **extra)
         if prepaid_reserved is not None:
-            await release(prepaid_pubkey, prepaid_reserved, Decimal("0"))
-        return _error_response(status_code, detail, provider=provider_label, **extra)
+            _, charged = await release(prepaid_pubkey, prepaid_reserved, Decimal("0"))
+            response.headers["X-Prepaid-Cost"] = str(charged)
+        return response
 
     # 6. Forward request to provider
     body["_caller"] = (prepaid_pubkey or payer or "x402")[:12]
@@ -981,7 +983,6 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
         if prepaid_mode:
             # The reservation already took base_price. Keep the actual cost, capped
             # at that hold, and return whatever is left.
-            charged = min(actual_base_price, prepaid_reserved or Decimal("0"))
             if prepaid_reserved is not None and actual_base_price > prepaid_reserved:
                 logger.warning(
                     "Prepaid actual $%s exceeds reserved $%s for %s; charging the reservation",
@@ -989,7 +990,7 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
                     prepaid_reserved,
                     prepaid_pubkey[:12] + "…",
                 )
-            remaining = await release(
+            remaining, charged = await release(
                 prepaid_pubkey, prepaid_reserved or Decimal("0"), actual_base_price
             )
             t_client = time.monotonic() - t_start
@@ -1015,7 +1016,10 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
                 content = {"data": output}
             return JSONResponse(
                 content=content,
-                headers={"X-Prepaid-Balance": str(remaining)},
+                headers={
+                    "X-Prepaid-Balance": str(remaining),
+                    "X-Prepaid-Cost": str(charged),
+                },
             )
 
         # 9. Settle. Solana already settled before the provider call.

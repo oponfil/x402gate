@@ -105,8 +105,8 @@ async def reserve(pubkey: str, amount: Decimal) -> bool:
         return True
 
 
-async def release(pubkey: str, reserved: Decimal, actual: Decimal) -> Decimal:
-    """Settle a reservation and return the new balance.
+async def release(pubkey: str, reserved: Decimal, actual: Decimal) -> tuple[Decimal, Decimal]:
+    """Settle a reservation and return the new balance and the charge.
 
     Charges ``min(actual, reserved)`` and puts the rest back. A failed
     provider call releases the whole hold by passing ``actual`` of 0.
@@ -117,7 +117,8 @@ async def release(pubkey: str, reserved: Decimal, actual: Decimal) -> Decimal:
         actual: Provider cost to keep. Negative values are treated as 0.
 
     Returns:
-        New total balance.
+        ``(new_balance, charged)``: the new total balance and the amount
+        kept from the reservation.
     """
     if reserved < 0:
         reserved = Decimal("0")
@@ -136,7 +137,7 @@ async def release(pubkey: str, reserved: Decimal, actual: Decimal) -> Decimal:
             pubkey[:12] + "…",
             new_balance,
         )
-        return new_balance
+        return new_balance, charged
 
 
 def get_balance(pubkey: str) -> Decimal:

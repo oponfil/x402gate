@@ -755,6 +755,7 @@ class TestSolanaUpfrontSettlement:
         assert mock_ph.settle.await_args.args[1] == expected
         assert mock_ph.settle.await_args.args[2] == SOLANA_NETWORK
         assert "refunded_to_prepaid" not in response.json()
+        assert "x-prepaid-cost" not in response.headers
 
     @respx.mock
     def test_failed_settle_does_not_call_provider(self, client):
@@ -815,6 +816,7 @@ class TestSolanaUpfrontSettlement:
             response = _post_wavespeed(client)
 
         assert response.status_code == 502
+        assert "x-prepaid-cost" not in response.headers
         body = response.json()
         assert Decimal(body["refunded_to_prepaid"]) == get_balance(SOL_PAYER)
         assert Decimal(body["prepaid_balance"]) == get_balance(SOL_PAYER)
@@ -1076,6 +1078,65 @@ class TestPrepaidReservation:
 
         assert response.status_code == 502
         assert get_balance(pubkey) == Decimal("1.00")
+        assert response.headers["x-prepaid-cost"] == "0"
+
+    @respx.mock
+    def test_cost_header_is_the_actual_charge(self, client):
+        """X-Prepaid-Cost is the actual cost, and the balance drops by exactly that."""
+        reset()
+        kp = Keypair()
+        pubkey = str(kp.pubkey())
+        asyncio.run(deposit(pubkey, Decimal("1.00")))
+        respx.post(WAVESPEED_PRICE).mock(
+            return_value=httpx.Response(200, json={"data": {"unit_price": 0.003}})
+        )
+        respx.post(WAVESPEED_SUBMIT).mock(
+            return_value=httpx.Response(200, json={"data": {"output": {"images": ["ok"]}}})
+        )
+
+        async def _cheaper(body, result):
+            return Decimal("0.0012")
+
+        providers["wavespeed"].calculate_actual_cost = _cheaper
+        response = client.post(
+            "/v1/wavespeed/wavespeed-ai/flux-dev",
+            json={"prompt": "a cat"},
+            headers=_prepaid_headers(kp, "wavespeed/wavespeed-ai/flux-dev"),
+        )
+
+        assert response.status_code == 200
+        assert response.headers["x-prepaid-cost"] == "0.0012"
+        cost = Decimal(response.headers["x-prepaid-cost"])
+        assert Decimal(response.headers["x-prepaid-balance"]) == Decimal("1.00") - cost
+        assert get_balance(pubkey) == Decimal("1.00") - cost
+
+    @respx.mock
+    def test_cost_header_falls_back_to_estimate(self, client):
+        """Without an actual cost, X-Prepaid-Cost is the estimated base price."""
+        reset()
+        kp = Keypair()
+        pubkey = str(kp.pubkey())
+        asyncio.run(deposit(pubkey, Decimal("1.00")))
+        respx.post(WAVESPEED_PRICE).mock(
+            return_value=httpx.Response(200, json={"data": {"unit_price": 0.003}})
+        )
+        respx.post(WAVESPEED_SUBMIT).mock(
+            return_value=httpx.Response(200, json={"data": {"output": {"images": ["ok"]}}})
+        )
+
+        async def _unknown(body, result):
+            return None
+
+        providers["wavespeed"].calculate_actual_cost = _unknown
+        response = client.post(
+            "/v1/wavespeed/wavespeed-ai/flux-dev",
+            json={"prompt": "a cat"},
+            headers=_prepaid_headers(kp, "wavespeed/wavespeed-ai/flux-dev"),
+        )
+
+        assert response.status_code == 200
+        assert Decimal(response.headers["x-prepaid-cost"]) == Decimal("0.003")
+        assert get_balance(pubkey) == Decimal("1.00") - Decimal("0.003")
 
     @respx.mock
     def test_actual_cost_above_reservation_does_not_go_negative(self, client):
@@ -1104,6 +1165,7 @@ class TestPrepaidReservation:
         assert response.status_code == 200
         assert get_balance(pubkey) == Decimal("0")
         assert Decimal(response.headers["x-prepaid-balance"]) == Decimal("0")
+        assert Decimal(response.headers["x-prepaid-cost"]) == Decimal("0.002")
 
     @respx.mock
     def test_concurrent_requests_spend_the_balance_once(self, client):

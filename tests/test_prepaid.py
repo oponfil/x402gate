@@ -83,20 +83,30 @@ class TestReservation:
     async def test_release_charges_actual_and_returns_the_rest(self):
         await deposit("ABC123", Decimal("1.50"))
         assert await reserve("ABC123", Decimal("1.00")) is True
-        balance = await release("ABC123", Decimal("1.00"), Decimal("0.40"))
+        balance, charged = await release("ABC123", Decimal("1.00"), Decimal("0.40"))
         assert balance == Decimal("1.10")
+        assert charged == Decimal("0.40")
 
     async def test_release_caps_charge_at_the_reservation(self):
         await deposit("ABC123", Decimal("0.002"))
         assert await reserve("ABC123", Decimal("0.002")) is True
-        balance = await release("ABC123", Decimal("0.002"), Decimal("0.01"))
+        balance, charged = await release("ABC123", Decimal("0.002"), Decimal("0.01"))
         assert balance == Decimal("0")
+        assert charged == Decimal("0.002")
 
     async def test_release_of_zero_actual_restores_the_hold(self):
         await deposit("ABC123", Decimal("1.00"))
         assert await reserve("ABC123", Decimal("0.25")) is True
-        balance = await release("ABC123", Decimal("0.25"), Decimal("0"))
+        balance, charged = await release("ABC123", Decimal("0.25"), Decimal("0"))
         assert balance == Decimal("1.00")
+        assert charged == Decimal("0")
+
+    async def test_release_treats_negative_actual_as_zero(self):
+        await deposit("ABC123", Decimal("1.00"))
+        assert await reserve("ABC123", Decimal("0.25")) is True
+        balance, charged = await release("ABC123", Decimal("0.25"), Decimal("-0.10"))
+        assert balance == Decimal("1.00")
+        assert charged == Decimal("0")
 
     async def test_concurrent_reserves_spend_once(self):
         await deposit("ABC123", Decimal("0.003"))
