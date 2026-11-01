@@ -204,11 +204,35 @@ class MinimaxProvider(BaseProvider):
         }
         content_type = mime_map.get(audio_fmt, "audio/mpeg")
 
-        return {
+        output: dict[str, Any] = {
             "audio_base64": audio_b64,
             "content_type": content_type,
             "characters": len(text),
+            "model": model,
         }
+        # MiniMax bills its own character count, which can differ from len(text).
+        extra_info = result.get("extra_info")
+        usage_chars = extra_info.get("usage_characters") if isinstance(extra_info, dict) else None
+        if isinstance(usage_chars, int) and not isinstance(usage_chars, bool) and usage_chars >= 0:
+            output["usage_characters"] = usage_chars
+        return output
+
+    async def calculate_actual_cost(
+        self, body: dict[str, Any], result: dict[str, Any]
+    ) -> Decimal | None:
+        """Price the characters MiniMax reports it billed.
+
+        The gateway caps a prepaid charge at the get_price() estimate.
+
+        Returns:
+            Cost in USD, or None when MiniMax sent no usage_characters.
+        """
+        usage_chars = result.get("usage_characters")
+        if usage_chars is None:
+            return None
+        model = result.get("model") or body.get("model", "")
+        rate = _rate_for_model(str(model), self._price_turbo, self._price_hd)
+        return Decimal(usage_chars) / _ONE_THOUSAND * rate
 
     async def get_result(self, task_id: str) -> dict[str, Any]:
         """Not used — this is a synchronous provider."""

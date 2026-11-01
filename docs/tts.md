@@ -45,6 +45,7 @@ All three providers return the same JSON structure:
 | `content_type` | string | MIME type (`audio/mpeg`, `audio/wav`, etc.) |
 | `characters` | int | Number of characters processed |
 | `utf8_bytes` | int | UTF-8 byte count (Fish Audio only) |
+| `usage_characters` | int | Characters MiniMax says it billed (MiniMax only, when MiniMax reports it). In prepaid mode this count at the model's rate is what gets deducted, never more than the reserved estimate. x402 payments still settle the quoted price |
 | `model` | string | Model used for generation |
 
 ---
@@ -65,7 +66,7 @@ All three providers return the same JSON structure:
 POST /v1/elevenlabs/{voice_id}
 ```
 
-The `voice_id` is passed as part of the URL path (same as ElevenLabs native API). Find voice IDs at [elevenlabs.io/voice-library](https://elevenlabs.io/voice-library).
+The `voice_id` is passed as part of the URL path (same as ElevenLabs native API). Find voice IDs at [elevenlabs.io/voice-library](https://elevenlabs.io/voice-library). The path must be a plain voice ID: 1-64 letters, digits, `_` or `-`. Anything else (a slash, `..`, a query string) gets HTTP 400 before any payment.
 
 ```json
 {

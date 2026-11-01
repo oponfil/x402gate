@@ -113,3 +113,25 @@ class TestPriceCache:
         key = PriceCache._make_key("model-a", {"_file_bytes": b"hello world" * 1000})
         assert "hello" not in key
         assert len(key) < 80
+
+
+class TestPriceCacheBound:
+    """Unpaid requests cannot grow the cache without limit."""
+
+    def test_oldest_entry_is_dropped_at_the_cap(self):
+        cache = PriceCache(ttl=60, max_entries=2)
+        cache.set("p/a", {"x": 1}, Decimal("1"))
+        cache.set("p/a", {"x": 2}, Decimal("2"))
+        cache.set("p/a", {"x": 3}, Decimal("3"))
+        assert cache.get("p/a", {"x": 1}) is None
+        assert cache.get("p/a", {"x": 2}) == Decimal("2")
+        assert cache.get("p/a", {"x": 3}) == Decimal("3")
+
+    def test_reset_entry_moves_to_newest(self):
+        cache = PriceCache(ttl=60, max_entries=2)
+        cache.set("p/a", {"x": 1}, Decimal("1"))
+        cache.set("p/a", {"x": 2}, Decimal("2"))
+        cache.set("p/a", {"x": 1}, Decimal("1"))
+        cache.set("p/a", {"x": 3}, Decimal("3"))
+        assert cache.get("p/a", {"x": 1}) == Decimal("1")
+        assert cache.get("p/a", {"x": 2}) is None

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import re
 from decimal import Decimal
 from typing import Any
 
@@ -25,11 +26,27 @@ logger = logging.getLogger(__name__)
 _DEFAULT_PRICE_PER_1K_STANDARD = Decimal("0.30")
 _DEFAULT_PRICE_PER_1K_TURBO = Decimal("0.15")
 
+# The URL path is the voice_id and is placed in the upstream URL. Anything
+# beyond a plain id ("../sound-generation", "abc?x=1", "abc/def") could reach
+# another paid ElevenLabs endpoint at the TTS price, so only plain ids pass.
+_VOICE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
 
 def _is_turbo_model(model_id: str) -> bool:
     """Check if the model is a turbo/flash variant (half-price)."""
     lower = model_id.lower()
     return "turbo" in lower or "flash" in lower
+
+
+def _require_voice_id(path: str, provider_name: str) -> str:
+    """Return the voice_id from the URL path, or raise ProviderError 400."""
+    if not isinstance(path, str) or not _VOICE_ID_RE.fullmatch(path):
+        raise ProviderError(
+            provider=provider_name,
+            detail="Path must be a voice_id: 1-64 letters, digits, '_' or '-'",
+            status_code=400,
+        )
+    return path
 
 
 class ElevenLabsProvider(BaseProvider):
@@ -59,6 +76,8 @@ class ElevenLabsProvider(BaseProvider):
         Returns:
             Base price in USD.
         """
+        # Checked before payment, so a bad path is never paid for.
+        _require_voice_id(model_path, self.name)
         text = require_text(inputs, self.name)
         char_count = len(text)
 
@@ -99,8 +118,9 @@ class ElevenLabsProvider(BaseProvider):
         """
         text = require_text(body, self.name)
 
-        # voice_id comes from the URL path
-        voice_id = path
+        # voice_id comes from the URL path; checked again in case submit()
+        # is reached without get_price().
+        voice_id = _require_voice_id(path, self.name)
         model_id = body.get("model_id", "")
         output_format = body.get("output_format", "mp3_44100_128")
 

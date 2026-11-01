@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import json
+import time
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
 from x402gate.core.config import ProviderConfig
-from x402gate.core.proxy import TaskTimeoutError
-from x402gate.providers.base import ProviderError
+from x402gate.core.proxy import UPSTREAM_CREDENTIALS_DETAIL, TaskTimeoutError
+from x402gate.providers import spicyapi
+from x402gate.providers.base import ProviderError, outcome_unknown
 from x402gate.providers.spicyapi import SpicyApiProvider
 
 _BODY = {
@@ -146,6 +150,65 @@ class TestGetPrice:
         assert exc.value.status_code == 503
 
 
+class TestPriceCache:
+    """Unpaid quotes must not grow the provider's memory without bound."""
+
+    def test_prices_are_capped_oldest_first(self, monkeypatch):
+        """Past the cap, the oldest prices are dropped to make room."""
+        monkeypatch.setattr(spicyapi, "_CACHE_MAX_ENTRIES", 3)
+        provider = _provider()
+
+        for index in range(5):
+            provider._remember_price(f"key{index}", Decimal(index))
+
+        assert list(provider._priced) == ["key2", "key3", "key4"]
+
+    def test_stale_prices_are_pruned(self):
+        """A price older than the TTL is dropped on the next insert and not served."""
+        provider = _provider()
+        old = time.monotonic() - spicyapi._PRICED_TTL_SECONDS - 1
+        provider._priced["old"] = (Decimal("0.01"), old)
+
+        assert provider._price_for("old") is None
+        provider._remember_price("new", Decimal("0.02"))
+
+        assert list(provider._priced) == ["new"]
+
+    @pytest.mark.asyncio
+    async def test_quotes_are_capped(self, monkeypatch):
+        """Unexpired quotes are capped too."""
+        monkeypatch.setattr(spicyapi, "_CACHE_MAX_ENTRIES", 2)
+        provider = _provider()
+        provider._client.request.return_value = _quote()
+
+        for index in range(3):
+            await provider.get_price("jobs", {**_BODY, "input": {"prompt": f"p{index}"}})
+
+        assert len(provider._quotes) == 2
+        assert len(provider._priced) == 2
+
+    def test_cache_key_is_a_hash(self):
+        """A large chat body is not kept whole as a cache key."""
+        key = SpicyApiProvider._cache_key({"model": "m", "input": {"prompt": "x" * 100_000}})
+        assert len(key) == 64
+
+    @pytest.mark.asyncio
+    async def test_submit_without_a_price_on_record_is_refused(self):
+        """An evicted price never lets the job run at an unchecked price."""
+        provider = _provider()
+        provider._client.request.return_value = _quote()
+        await provider.get_price("jobs", _BODY)
+        provider._priced.clear()
+        provider._client.request.reset_mock()
+
+        with pytest.raises(ProviderError, match="no longer on record") as exc:
+            await provider.submit("jobs", _BODY)
+
+        assert exc.value.status_code == 409
+        assert not outcome_unknown(exc.value)
+        provider._client.request.assert_not_awaited()
+
+
 class TestSubmit:
     """Tests for SpicyApiProvider.submit()."""
 
@@ -247,6 +310,7 @@ class TestSubmit:
             _task("queued", task_id="job_retried"),
         ]
 
+        await provider.get_price("jobs", _BODY)
         result = await provider.submit("jobs", _BODY)
 
         assert result["data"]["id"] == "job_retried"
@@ -277,7 +341,6 @@ class TestGetResult:
                 output={"assets": [{"url": "https://cdn.example/clip.mp4"}]},
             ),
         ]
-        provider._priced["ignored"] = Decimal("0.01")
 
         result = await provider.get_result("job_1")
 
@@ -298,8 +361,9 @@ class TestGetResult:
         provider._client.request.return_value = _task(
             "expired", errorCode="timeout", errorMessage="deadline passed"
         )
-        with pytest.raises(ProviderError, match="deadline passed"):
+        with pytest.raises(ProviderError, match="deadline passed") as exc:
             await provider.get_result("job_1")
+        assert not outcome_unknown(exc.value)
         assert await provider.calculate_actual_cost({}, {"data": {"id": "job_1"}}) is None
 
     @pytest.mark.asyncio
@@ -309,6 +373,550 @@ class TestGetResult:
         with pytest.raises(TaskTimeoutError):
             await provider.get_result("job_1")
         provider._client.request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_and_5xx_keep_polling_with_backoff(self):
+        """A 429 or 5xx while polling is not a job failure; polling backs off."""
+        provider = _provider()
+        provider._sleep = AsyncMock()
+        provider._client.request.side_effect = [
+            _response(429, {"code": 429, "msg": "rate limited"}),
+            _response(503, {"code": 503, "msg": "busy"}),
+            _task("succeeded", cost="0.008"),
+        ]
+
+        result = await provider.get_result("job_1")
+
+        assert result["state"] == "succeeded"
+        delays = [call.args[0] for call in provider._sleep.await_args_list]
+        assert delays == [1.0, 2.0]
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_until_deadline_is_an_unknown_outcome(self, monkeypatch):
+        """Being rate limited until the poll timeout keeps the payment."""
+        clock = {"now": 1000.0}
+
+        async def fake_sleep(seconds: float) -> None:
+            clock["now"] += seconds
+
+        monkeypatch.setattr(
+            spicyapi, "time", SimpleNamespace(monotonic=lambda: clock["now"], time=time.time)
+        )
+        provider = _provider(poll_timeout=60)
+        provider._sleep = fake_sleep
+        provider._client.request.return_value = _response(429, {"code": 429, "msg": "slow down"})
+
+        with pytest.raises(TaskTimeoutError) as exc:
+            await provider.get_result("job_1")
+
+        assert outcome_unknown(exc.value)
+        assert clock["now"] == 1060.0
+
+    @pytest.mark.asyncio
+    async def test_envelope_rate_limit_and_non_json_keep_polling(self):
+        """A 200 carrying code 429/5xx or a non-JSON page is a transient hiccup."""
+        provider = _provider()
+        provider._sleep = AsyncMock()
+        not_json = _response(200, {})
+        not_json.json.side_effect = ValueError("not json")
+        provider._client.request.side_effect = [
+            _response(200, {"code": 429, "msg": "rate limited"}),
+            _response(200, {"code": "500", "msg": "internal"}),
+            not_json,
+            _task("succeeded", cost="0.008"),
+        ]
+
+        result = await provider.get_result("job_1")
+
+        assert result["state"] == "succeeded"
+        delays = [call.args[0] for call in provider._sleep.await_args_list]
+        assert delays == [1.0, 2.0, 4.0]
+
+    @pytest.mark.asyncio
+    async def test_envelope_rate_limit_until_deadline_is_an_unknown_outcome(self, monkeypatch):
+        """A 200/429 envelope until the poll timeout keeps the payment."""
+        clock = {"now": 1000.0}
+
+        async def fake_sleep(seconds: float) -> None:
+            clock["now"] += seconds
+
+        monkeypatch.setattr(
+            spicyapi, "time", SimpleNamespace(monotonic=lambda: clock["now"], time=time.time)
+        )
+        provider = _provider(poll_timeout=60)
+        provider._sleep = fake_sleep
+        provider._client.request.return_value = _response(200, {"code": 429, "msg": "slow down"})
+
+        with pytest.raises(TaskTimeoutError) as exc:
+            await provider.get_result("job_1")
+
+        assert outcome_unknown(exc.value)
+
+    @pytest.mark.asyncio
+    async def test_other_envelope_error_still_fails(self):
+        """A 200 with a non-transient envelope code stays a known failure."""
+        provider = _provider()
+        provider._client.request.return_value = _response(
+            200, {"code": 400, "msg": "task id invalid"}
+        )
+
+        with pytest.raises(ProviderError, match="task id invalid") as exc:
+            await provider.get_result("job_1")
+
+        assert not outcome_unknown(exc.value)
+
+
+def _fake_clock(monkeypatch) -> dict[str, float]:
+    """Make spicyapi's monotonic clock advance only when the provider sleeps."""
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(
+        spicyapi, "time", SimpleNamespace(monotonic=lambda: clock["now"], time=time.time)
+    )
+    return clock
+
+
+def _non_json(status: int = 200) -> MagicMock:
+    response = _response(status, {})
+    response.json.side_effect = ValueError("not json")
+    response.text = "<html>bad gateway</html>"
+    return response
+
+
+async def _priced_provider() -> SpicyApiProvider:
+    """A provider whose next request is the createTask after a stored quote."""
+    provider = _provider()
+    provider._sleep = AsyncMock()
+    provider._client.request.return_value = _quote(unit="per_second")
+    await provider.get_price("jobs", _BODY)
+    provider._client.request.reset_mock(return_value=True)
+    return provider
+
+
+def _create_calls(provider: SpicyApiProvider) -> list:
+    return [
+        call
+        for call in provider._client.request.await_args_list
+        if call.args[1].endswith("/api/v1/jobs/createTask")
+    ]
+
+
+class TestEnvelopeTransient:
+    """Envelope codes are HTTP statuses or five digits that start with one."""
+
+    @pytest.mark.parametrize("code", [429, "503", 500, 599, 42901, 50001, "50301"])
+    def test_rate_limit_and_server_codes_are_transient(self, code):
+        assert spicyapi._envelope_transient(_response(200, {"code": code}))
+
+    @pytest.mark.parametrize("code", [200, None, 400, 404, 40001, 40401, 40201, 40901, 60001, "x"])
+    def test_client_and_success_codes_are_not_transient(self, code):
+        assert not spicyapi._envelope_transient(_response(200, {"code": code}))
+
+    def test_unreadable_body_is_transient(self):
+        assert spicyapi._envelope_transient(_non_json())
+
+    @pytest.mark.asyncio
+    async def test_five_digit_client_code_while_polling_is_not_retried(self):
+        """A 200 with 40001 fails at once instead of polling until the deadline."""
+        provider = _provider()
+        provider._sleep = AsyncMock()
+        provider._client.request.return_value = _response(
+            200, {"code": 40001, "msg": "taskId is malformed"}
+        )
+
+        with pytest.raises(ProviderError, match="malformed") as exc:
+            await provider.get_result("job_1")
+
+        assert exc.value.status_code == 400
+        assert not outcome_unknown(exc.value)
+        assert provider._client.request.await_count == 1
+
+
+class TestCreateTaskOutcome:
+    """A createTask that may have made the task keeps the payment."""
+
+    @pytest.mark.asyncio
+    async def test_read_timeout_then_connect_errors_is_unknown(self):
+        """The first attempt may have created the task; the last one says nothing."""
+        provider = await _priced_provider()
+        provider._client.request.side_effect = [
+            httpx.ReadTimeout("read timed out"),
+            httpx.ConnectError("refused"),
+            httpx.ConnectError("refused"),
+        ]
+
+        with pytest.raises(ProviderError) as exc:
+            await provider.submit("jobs", _BODY)
+
+        assert outcome_unknown(exc.value)
+        keys = {call.kwargs["headers"]["Idempotency-Key"] for call in _create_calls(provider)}
+        assert len(_create_calls(provider)) == 3
+        assert len(keys) == 1
+
+    @pytest.mark.asyncio
+    async def test_read_error_then_5xx_is_unknown(self):
+        provider = await _priced_provider()
+        provider._client.request.side_effect = [
+            httpx.ReadError("connection reset"),
+            _response(503, {"code": 503, "msg": "busy"}),
+            _response(500, {"code": 500, "msg": "internal"}),
+        ]
+
+        with pytest.raises(ProviderError) as exc:
+            await provider.submit("jobs", _BODY)
+
+        assert outcome_unknown(exc.value)
+
+    @pytest.mark.asyncio
+    async def test_write_timeout_then_stale_quote_is_not_sent_again(self):
+        """After a create that may have landed, 40901 does not start a second job."""
+        provider = await _priced_provider()
+        provider._client.request.side_effect = [
+            httpx.WriteTimeout("write timed out"),
+            _response(409, {"code": 40901, "msg": "quote no longer matches"}),
+        ]
+
+        with pytest.raises(ProviderError, match="40901") as exc:
+            await provider.submit("jobs", _BODY)
+
+        assert outcome_unknown(exc.value)
+        assert provider._client.request.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_gateway_timeout_is_unknown(self):
+        provider = await _priced_provider()
+        provider._client.request.return_value = _response(524, {"code": 524, "msg": "timeout"})
+
+        with pytest.raises(ProviderError) as exc:
+            await provider.submit("jobs", _BODY)
+
+        assert outcome_unknown(exc.value)
+
+    @pytest.mark.asyncio
+    async def test_connect_errors_and_5xx_alone_are_known_failures(self):
+        """Connections that never opened and plain 5xx answers refund the client."""
+        provider = await _priced_provider()
+        provider._client.request.side_effect = [
+            httpx.ConnectError("refused"),
+            httpx.ConnectTimeout("connect timed out"),
+            _response(503, {"code": 503, "msg": "busy"}),
+        ]
+
+        with pytest.raises(ProviderError) as exc:
+            await provider.submit("jobs", _BODY)
+
+        assert exc.value.status_code == 503
+        assert not outcome_unknown(exc.value)
+
+    @pytest.mark.asyncio
+    async def test_read_timeout_then_success_returns_the_task(self):
+        """A retry with the same Idempotency-Key that returns the task is a success."""
+        provider = await _priced_provider()
+        provider._client.request.side_effect = [
+            httpx.ReadTimeout("read timed out"),
+            _task("queued", task_id="job_replayed"),
+        ]
+
+        result = await provider.submit("jobs", _BODY)
+
+        assert result["data"]["id"] == "job_replayed"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "answer",
+        [
+            _non_json(),
+            _response(200, ["not", "an", "object"]),
+            _response(200, {"code": 500, "msg": "internal"}),
+            _response(200, {"code": 42901, "msg": "slow down"}),
+            _response(200, {"code": 200, "msg": "success"}),
+            _response(200, {"code": 200, "data": {"state": "queued"}}),
+            _response(202, {"code": 200, "data": {"taskId": "", "state": "queued"}}),
+        ],
+        ids=[
+            "non-json",
+            "not-an-object",
+            "code-500",
+            "code-42901",
+            "no-data",
+            "no-task-id",
+            "empty-task-id",
+        ],
+    )
+    async def test_unreadable_2xx_is_unknown(self, answer):
+        """SpicyAPI accepted the call, so the task may exist and bill."""
+        provider = await _priced_provider()
+        provider._client.request.return_value = answer
+
+        with pytest.raises(ProviderError) as exc:
+            await provider.submit("jobs", _BODY)
+
+        assert exc.value.status_code == 502
+        assert outcome_unknown(exc.value)
+        assert len(_create_calls(provider)) == 1
+
+    @pytest.mark.asyncio
+    async def test_2xx_with_client_error_code_is_a_known_failure(self):
+        """A 4xxxx code is SpicyAPI refusing the job before it made one."""
+        provider = await _priced_provider()
+        provider._client.request.return_value = _response(
+            200, {"code": 40001, "msg": "input.prompt is required"}
+        )
+
+        with pytest.raises(ProviderError, match="prompt is required") as exc:
+            await provider.submit("jobs", _BODY)
+
+        assert exc.value.status_code == 400
+        assert not outcome_unknown(exc.value)
+
+    @pytest.mark.asyncio
+    async def test_2xx_with_low_balance_code_is_unavailable(self):
+        provider = await _priced_provider()
+        provider._client.request.return_value = _response(
+            200, {"code": 40201, "msg": "insufficient balance"}
+        )
+
+        with pytest.raises(ProviderError, match="cannot accept this charge") as exc:
+            await provider.submit("jobs", _BODY)
+
+        assert exc.value.status_code == 503
+        assert not outcome_unknown(exc.value)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "answer",
+        [
+            _response(200, {"code": 40301, "msg": "forbidden"}),
+            _response(403, {"code": 403, "msg": "forbidden"}),
+        ],
+        ids=["envelope-40301", "http-403"],
+    )
+    async def test_forbidden_create_is_a_gateway_credentials_error(self, answer):
+        """A client would read a 403 as its own credentials being bad."""
+        provider = await _priced_provider()
+        provider._client.request.return_value = answer
+
+        with pytest.raises(ProviderError) as exc:
+            await provider.submit("jobs", _BODY)
+
+        assert exc.value.status_code == 502
+        assert exc.value.detail == UPSTREAM_CREDENTIALS_DETAIL
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("state", ["pending", "processing", ""])
+    async def test_unlisted_create_state_is_pending(self, state):
+        """Only a state SpicyAPI documents as failed refunds an accepted task."""
+        provider = await _priced_provider()
+        provider._client.request.return_value = _task(state, task_id="job_new")
+
+        result = await provider.submit("jobs", _BODY)
+
+        assert result["data"]["id"] == "job_new"
+        assert result["data"]["status"] == "processing"
+
+    @pytest.mark.asyncio
+    async def test_2xx_with_stale_quote_code_quotes_again(self):
+        provider = await _priced_provider()
+        provider._client.request.side_effect = [
+            _response(200, {"code": 40901, "msg": "quote expired"}),
+            _quote(quote_id="q2", unit="per_second"),
+            _task("queued", task_id="job_retried"),
+        ]
+
+        result = await provider.submit("jobs", _BODY)
+
+        assert result["data"]["id"] == "job_retried"
+        assert [call.kwargs["json"]["quoteId"] for call in _create_calls(provider)] == [
+            "quote_1",
+            "q2",
+        ]
+
+
+class TestPollAfterAcceptance:
+    """The task was accepted, so losing sight of it keeps the payment."""
+
+    @pytest.mark.asyncio
+    async def test_brief_404_is_tolerated(self):
+        """A new task may not be readable yet."""
+        provider = _provider()
+        provider._sleep = AsyncMock()
+        provider._client.request.side_effect = [
+            _response(404, {"code": 404, "msg": "task not found"}),
+            _response(404, {"code": 404, "msg": "task not found"}),
+            _task("succeeded", cost="0.008"),
+        ]
+
+        result = await provider.get_result("job_1")
+
+        assert result["state"] == "succeeded"
+
+    @pytest.mark.asyncio
+    async def test_many_quick_404s_within_grace_keep_polling(self, monkeypatch):
+        """A poll count alone is a few seconds; the grace is also time based."""
+        clock = _fake_clock(monkeypatch)
+
+        async def fake_sleep(seconds: float) -> None:
+            clock["now"] += 1
+
+        provider = _provider(poll_timeout=60)
+        provider._sleep = fake_sleep
+        provider._client.request.side_effect = [
+            *[_response(404, {"code": 404, "msg": "task not found"}) for _ in range(10)],
+            _task("succeeded", cost="0.008"),
+        ]
+
+        result = await provider.get_result("job_1")
+
+        assert result["state"] == "succeeded"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "answer",
+        [
+            _response(404, {"code": 404, "msg": "task not found"}),
+            _response(200, {"code": 40401, "msg": "task not found"}),
+        ],
+        ids=["http-404", "envelope-40401"],
+    )
+    async def test_404_past_grace_is_unknown(self, monkeypatch, answer):
+        clock = _fake_clock(monkeypatch)
+
+        async def fake_sleep(seconds: float) -> None:
+            clock["now"] += 5
+
+        provider = _provider(poll_timeout=300)
+        provider._sleep = fake_sleep
+        provider._client.request.return_value = answer
+
+        with pytest.raises(ProviderError, match="no longer finds task job_1") as exc:
+            await provider.get_result("job_1")
+
+        assert exc.value.status_code == 502
+        assert outcome_unknown(exc.value)
+        assert clock["now"] - 1000.0 >= spicyapi._NOT_FOUND_GRACE_S
+
+    @pytest.mark.asyncio
+    async def test_404_count_resets_when_the_task_is_seen(self, monkeypatch):
+        clock = _fake_clock(monkeypatch)
+
+        async def fake_sleep(seconds: float) -> None:
+            clock["now"] += 5
+
+        missing = _response(404, {"code": 404, "msg": "task not found"})
+        provider = _provider(poll_timeout=300)
+        provider._sleep = fake_sleep
+        provider._client.request.side_effect = [
+            *[missing] * 4,
+            _task("running"),
+            *[missing] * 4,
+            _task("succeeded", cost="0.008"),
+        ]
+
+        result = await provider.get_result("job_1")
+
+        assert result["state"] == "succeeded"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "answer",
+        [
+            _response(401, {"code": 401, "msg": "invalid api key"}),
+            _response(403, {"code": 403, "msg": "forbidden"}),
+            _response(402, {"code": 40201, "msg": "insufficient balance"}),
+            _response(200, {"code": 40101, "msg": "invalid api key"}),
+        ],
+        ids=["401", "403", "402", "envelope-40101"],
+    )
+    async def test_rejected_key_while_polling_is_unknown(self, answer):
+        provider = _provider()
+        provider._client.request.return_value = answer
+
+        with pytest.raises(ProviderError) as exc:
+            await provider.get_result("job_1")
+
+        assert exc.value.status_code == 502
+        assert exc.value.detail == UPSTREAM_CREDENTIALS_DETAIL
+        assert outcome_unknown(exc.value)
+
+    @pytest.mark.asyncio
+    async def test_redirect_while_polling_is_unknown(self):
+        provider = _provider()
+        provider._client.request.return_value = _response(302, {})
+
+        with pytest.raises(ProviderError, match="redirected") as exc:
+            await provider.get_result("job_1")
+
+        assert outcome_unknown(exc.value)
+
+    @pytest.mark.asyncio
+    async def test_network_errors_keep_polling(self):
+        provider = _provider()
+        provider._sleep = AsyncMock()
+        provider._client.request.side_effect = [
+            httpx.ReadTimeout("read timed out"),
+            httpx.ConnectError("refused"),
+            _task("succeeded", cost="0.008"),
+        ]
+
+        result = await provider.get_result("job_1")
+
+        assert result["state"] == "succeeded"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "record",
+        [{"taskId": "job_1"}, {"taskId": "job_1", "state": "pending"}],
+        ids=["missing-state", "pending"],
+    )
+    async def test_unlisted_state_keeps_polling(self, record):
+        """A record without a terminal state may be a job still running."""
+        provider = _provider()
+        provider._sleep = AsyncMock()
+        provider._client.request.side_effect = [
+            _response(200, {"code": 200, "data": record}),
+            _task("succeeded", cost="0.008"),
+        ]
+
+        result = await provider.get_result("job_1")
+
+        assert result["state"] == "succeeded"
+
+    @pytest.mark.asyncio
+    async def test_unlisted_state_until_the_deadline_keeps_the_payment(self, monkeypatch):
+        provider = _provider(poll_timeout=10)
+        provider._sleep = AsyncMock()
+        clock = iter(float(second) for second in range(100))
+        monkeypatch.setattr(spicyapi.time, "monotonic", lambda: next(clock))
+        provider._client.request.return_value = _response(
+            200, {"code": 200, "data": {"taskId": "job_1", "state": "processing"}}
+        )
+
+        with pytest.raises(TaskTimeoutError):
+            await provider.get_result("job_1")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("state", ["failed", "canceled", "cancelled", "expired"])
+    async def test_failed_states_are_known_failures(self, state):
+        provider = _provider()
+        provider._client.request.return_value = _task(state, errorMessage="gave up")
+
+        with pytest.raises(ProviderError, match="gave up") as exc:
+            await provider.get_result("job_1")
+
+        assert exc.value.status_code == 502
+        assert not outcome_unknown(exc.value)
+
+    @pytest.mark.asyncio
+    async def test_success_envelope_without_data_keeps_polling(self):
+        provider = _provider()
+        provider._sleep = AsyncMock()
+        provider._client.request.side_effect = [
+            _response(200, {"code": 200, "msg": "success"}),
+            _task("succeeded", cost="0.008"),
+        ]
+
+        result = await provider.get_result("job_1")
+
+        assert result["state"] == "succeeded"
 
 
 _CHAT = {
@@ -436,6 +1044,50 @@ class TestChat:
         assert await provider.calculate_actual_cost(_CHAT, result) == Decimal("0.001")
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "record",
+        [
+            _response(200, {"code": 40401, "msg": "task not found"}),
+            _response(200, {"code": 50001, "msg": "internal"}),
+            _non_json(),
+        ],
+        ids=["envelope-40401", "envelope-50001", "non-json"],
+    )
+    async def test_unreadable_cost_record_keeps_the_completion(self, record):
+        """The chat already ran and billed; a bad record falls back to the quote."""
+        provider = _provider()
+        provider._sleep = AsyncMock()
+        provider._client.request.side_effect = [
+            _quote(cost="0.0098895", quote_id="qchat", unit="per_1k_tokens"),
+            record,
+            record,
+            record,
+        ]
+        _attach_stream(provider, [_StreamResponse(200, _chat_lines())])
+
+        await provider.get_price("chat/completions", _CHAT)
+        result = await provider.submit("chat/completions", _CHAT)
+
+        assert result["choices"][0]["message"]["content"] == "Hello there."
+        assert await provider.calculate_actual_cost(_CHAT, result) == Decimal("0.0098895")
+
+    @pytest.mark.asyncio
+    async def test_cost_record_readable_on_a_later_try_is_used(self):
+        provider = _provider()
+        provider._sleep = AsyncMock()
+        provider._client.request.side_effect = [
+            _quote(cost="0.0098895", quote_id="qchat", unit="per_1k_tokens"),
+            _response(200, {"code": 40401, "msg": "task not found"}),
+            _task("succeeded", task_id="job_chat", cost="0.001", settled=True),
+        ]
+        _attach_stream(provider, [_StreamResponse(200, _chat_lines())])
+
+        await provider.get_price("chat/completions", _CHAT)
+        result = await provider.submit("chat/completions", _CHAT)
+
+        assert await provider.calculate_actual_cost(_CHAT, result) == Decimal("0.001")
+
+    @pytest.mark.asyncio
     async def test_submit_sends_the_quoted_price(self):
         """The stream call carries the quote the client was shown."""
         provider = _provider()
@@ -485,6 +1137,59 @@ class TestChat:
         with pytest.raises(ProviderError, match="refused") as exc:
             await provider.submit("chat/completions", _CHAT)
         assert exc.value.status_code == 400
+        assert not outcome_unknown(exc.value)
+
+    @pytest.mark.asyncio
+    async def test_error_after_output_keeps_payment(self):
+        """A mid-stream error after text was billed is an unknown outcome, not re-sent."""
+        provider = _provider()
+        provider._client.request.return_value = _quote(unit="per_1k_tokens")
+        opened: list[int] = []
+        lines = [
+            'data: {"choices":[{"index":0,"delta":{"content":"Hello"}}]}',
+            "event: error",
+            'data: {"error":{"code":"upstream","message":"model no longer available"}}',
+        ]
+
+        def open_stream(*args: object, **kwargs: object) -> _StreamContext:
+            opened.append(1)
+            return _StreamContext(_StreamResponse(200, lines))
+
+        provider._client.stream = open_stream
+
+        await provider.get_price("chat/completions", _CHAT)
+        with pytest.raises(ProviderError, match="after output") as exc:
+            await provider.submit("chat/completions", _CHAT)
+
+        assert outcome_unknown(exc.value)
+        assert len(opened) == 1
+
+    @pytest.mark.asyncio
+    async def test_stream_cut_off_after_output_keeps_payment(self):
+        """A stream that closes without finish_reason after text is an unknown outcome."""
+        provider = _provider()
+        provider._client.request.return_value = _quote(unit="per_1k_tokens")
+        lines = ['data: {"choices":[{"index":0,"delta":{"content":"Hel"}}]}']
+        _attach_stream(provider, [_StreamResponse(200, lines)])
+
+        await provider.get_price("chat/completions", _CHAT)
+        with pytest.raises(ProviderError, match="before the answer finished") as exc:
+            await provider.submit("chat/completions", _CHAT)
+
+        assert outcome_unknown(exc.value)
+
+    @pytest.mark.asyncio
+    async def test_empty_stream_is_a_known_failure(self):
+        """A stream that closes before any output refunds the client."""
+        provider = _provider()
+        provider._client.request.return_value = _quote(unit="per_1k_tokens")
+        _attach_stream(provider, [_StreamResponse(200, [": keepalive"])])
+
+        await provider.get_price("chat/completions", _CHAT)
+        with pytest.raises(ProviderError, match="before the answer finished") as exc:
+            await provider.submit("chat/completions", _CHAT)
+
+        assert not outcome_unknown(exc.value)
 
     @pytest.mark.asyncio
     async def test_retries_stream_when_quote_is_stale(self):

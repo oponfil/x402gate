@@ -272,3 +272,19 @@ class TestEvmSignatureVerification:
             )
             is False
         )
+
+
+class TestEvmAddressCase:
+    """EVM balances do not depend on how the address is capitalized."""
+
+    @pytest.mark.asyncio
+    async def test_checksummed_and_lowercase_share_a_balance(self):
+        await deposit("0xAbCdEf0000000000000000000000000000000001", Decimal("1"))
+        assert get_balance("0xabcdef0000000000000000000000000000000001") == Decimal("1")
+        assert await reserve("0XABCDEF0000000000000000000000000000000001", Decimal("0.4"))
+        assert get_balance("0xAbCdEf0000000000000000000000000000000001") == Decimal("0.6")
+
+    @pytest.mark.asyncio
+    async def test_solana_keys_stay_case_sensitive(self):
+        await deposit("AbC111", Decimal("1"))
+        assert get_balance("abc111") == Decimal("0")

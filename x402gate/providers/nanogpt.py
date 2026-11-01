@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -16,46 +17,44 @@ from typing import Any
 import httpx
 
 from x402gate.core.config import ProviderConfig
-from x402gate.core.proxy import safe_to_resend
 from x402gate.providers.base import BaseProvider, ProviderError
+from x402gate.providers.openrouter import (
+    estimate_chat_input_tokens,
+    has_nested_key,
+    output_ceiling,
+    parse_billed_json,
+    post_billed_request,
+    reject_non_text_output,
+)
 
 logger = logging.getLogger(__name__)
 
-_CHAT_CHARS_PER_TOKEN = Decimal("2.7")
 _MILLION = Decimal("1000000")
 _THOUSAND = Decimal("1000")
 _CHAT_PATH = "chat/completions"
+
+# A ``:thinking:<n>`` budget: ASCII digits, nine at most, far above any real
+# budget and well inside Python's int-string limit.
+_BUDGET_DIGITS = re.compile(r"[0-9]{1,9}")
+
+# Tiers billed at or below the standard rate. "fast" and "priority" bill a
+# higher rate the catalog does not list.
+_PRICED_SERVICE_TIERS = frozenset({"auto", "default", "flex"})
+
+# Per-request add-ons NanoGPT bills on top of tokens, by the flag that
+# switches them on: YouTube transcripts ($0.01 each), URL scraping ($0.0015
+# per URL) and the advisor model (its own billed phase).
+_UNPRICED_ADDONS = {
+    "youtube_transcripts": "YouTube transcripts",
+    "scraping": "URL scraping",
+    "advisor": "The advisor model",
+}
 
 
 def _apply_cost_floor(cost: Decimal) -> Decimal:
     if cost < Decimal("0.000001"):
         return Decimal("0.000001")
     return cost
-
-
-def _content_chars(content: Any) -> int:
-    """Count characters in a string or a list of chat content parts."""
-    if content is None:
-        return 0
-    if isinstance(content, str):
-        return len(content)
-    if isinstance(content, list):
-        return sum(_content_chars(part) for part in content)
-    if isinstance(content, dict):
-        if "text" in content:
-            return _content_chars(content["text"])
-        return len(str(content))
-    return len(str(content))
-
-
-def _estimate_input_tokens(messages: list[Any]) -> int:
-    total = 0
-    for message in messages:
-        if isinstance(message, dict):
-            total += _content_chars(message.get("content", ""))
-        else:
-            total += len(str(message))
-    return max(int(Decimal(total) / _CHAT_CHARS_PER_TOKEN), 1)
 
 
 def _upstream_body(body: dict[str, Any]) -> dict[str, Any]:
@@ -82,27 +81,73 @@ def _per_thousand(value: Any) -> Decimal:
     return _money(value, "per-thousand price") / _THOUSAND
 
 
+def _model_suffixes(body: dict[str, Any]) -> list[str]:
+    return str(body.get("model", "")).lower().split(":")[1:]
+
+
+def _flag_on(value: Any) -> bool:
+    """True when a feature flag may switch the feature on.
+
+    Any truthy value counts ("true", 1), not just True, since NanoGPT may
+    accept loose values. An object counts unless its ``enabled`` is falsy.
+    """
+    if isinstance(value, dict):
+        return bool(value) and bool(value.get("enabled", True))
+    return bool(value)
+
+
 def _web_search_enabled(body: dict[str, Any]) -> bool:
     """True when the request asks NanoGPT to run a billed web search."""
-    model_id = str(body.get("model", ""))
-    suffixes = model_id.split(":")[1:]
-    if any(part == "online" or part.startswith("online/") for part in suffixes):
+    if any(part == "online" or part.startswith("online/") for part in _model_suffixes(body)):
         return True
-    for key in ("web_search", "webSearch", "linkup"):
-        value = body.get(key)
-        if value is True:
-            return True
-        if isinstance(value, dict) and value.get("enabled") is True:
-            return True
+    if any(_flag_on(body.get(key)) for key in ("web_search", "webSearch", "linkup")):
+        return True
     options = body.get("web_search_options")
-    return isinstance(options, dict) and bool(options)
+    return bool(options)
+
+
+def _memory_enabled(body: dict[str, Any]) -> bool:
+    """True when the request asks for NanoGPT Context Memory, billed separately."""
+    if any(part == "memory" or part.startswith("memory-") for part in _model_suffixes(body)):
+        return True
+    return _flag_on(body.get("memory"))
+
+
+def _suffix_thinking_budget(body: dict[str, Any]) -> int:
+    """Thinking budget from a ``:thinking:<tokens>`` model suffix.
+
+    The suffix fallback in ``_model_info`` prices the base model, so the
+    budget is passed to ``output_ceiling``, which counts it like a body
+    budget: on top of a max_tokens at or below it, inside a larger one.
+    """
+    suffixes = _model_suffixes(body)
+    budget = 0
+    for part, following in zip(suffixes, suffixes[1:], strict=False):
+        if part != "thinking":
+            continue
+        if _BUDGET_DIGITS.fullmatch(following):
+            budget = max(budget, int(following))
+        elif following.isdigit():
+            # "²", "٣" or a huge run: int() would fail or NanoGPT may read it
+            # differently, so the budget cannot be priced.
+            raise ProviderError(
+                provider="nanogpt",
+                detail="The :thinking:<tokens> budget must be 1 to 9 ASCII digits",
+                status_code=400,
+            )
+    return budget
 
 
 def _caching_requested(body: dict[str, Any]) -> bool:
-    if body.get("caching") is True:
+    if has_nested_key(body.get("messages"), "cache_control"):
         return True
-    prompt_caching = body.get("prompt_caching")
-    return isinstance(prompt_caching, dict) and prompt_caching.get("enabled") is True
+    return _flag_on(body.get("caching")) or _flag_on(body.get("prompt_caching"))
+
+
+def _positive_int_or_none(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return None
+    return value
 
 
 def _positive_int(value: Any, field: str) -> int:
@@ -141,7 +186,7 @@ class NanoGptProvider(BaseProvider):
             )
 
     def _reject_unpriced_options(self, body: dict[str, Any]) -> None:
-        if body.get("stream") is True:
+        if body.get("stream"):
             raise ProviderError(
                 provider=self.name,
                 detail="Streaming is not supported. Send the request with stream set to false.",
@@ -157,6 +202,40 @@ class NanoGptProvider(BaseProvider):
                 ),
                 status_code=400,
             )
+        for flag, feature in _UNPRICED_ADDONS.items():
+            if _flag_on(body.get(flag)):
+                raise ProviderError(
+                    provider=self.name,
+                    detail=(
+                        f"{feature} is not priced by x402gate because NanoGPT bills it "
+                        f"on top of tokens. Send the request without {flag}."
+                    ),
+                    status_code=400,
+                )
+        tier = body.get("service_tier")
+        if tier is not None and (not isinstance(tier, str) or tier not in _PRICED_SERVICE_TIERS):
+            raise ProviderError(
+                provider=self.name,
+                detail=(
+                    f"service_tier '{tier}' is billed above the catalog rate and is not "
+                    "priced by x402gate. Use auto, default or flex."
+                ),
+                status_code=400,
+            )
+        reject_non_text_output(body, self.name)
+        if _memory_enabled(body):
+            raise ProviderError(
+                provider=self.name,
+                detail=(
+                    "Context Memory is not priced by x402gate because NanoGPT bills it "
+                    "on top of tokens. Send the request without :memory or memory."
+                ),
+                status_code=400,
+            )
+        messages = body.get("messages")
+        if isinstance(messages, list):
+            # Rejects content parts (files, video) the estimate cannot price.
+            estimate_chat_input_tokens(body, self.name)
 
     async def _fetch_models_list(self) -> None:
         """Load the detailed text catalog. Prices are USD per million tokens."""
@@ -223,7 +302,8 @@ class NanoGptProvider(BaseProvider):
             return self._models_cache[model_id]
 
         # Routing suffixes (:thinking, :abliteration, :cheap) are not always
-        # their own catalog rows. The price is the underlying model.
+        # their own catalog rows. The price is the underlying model. Suffixes
+        # that add a separate charge (:online, :memory) are refused before this.
         candidate = model_id
         while ":" in candidate:
             candidate = candidate.rsplit(":", 1)[0]
@@ -286,15 +366,16 @@ class NanoGptProvider(BaseProvider):
         if raw_n is None:
             raw_n = 1
         completions = _positive_int(raw_n, "n")
-        raw_max = inputs.get("max_tokens")
-        max_tokens = max(
-            raw_max if isinstance(raw_max, int) and raw_max > 0 else 0,
+        max_tokens = output_ceiling(
+            inputs,
             self._default_max_tokens,
+            self.name,
+            extra_budget=_suffix_thinking_budget(inputs),
         )
 
         model_info = await self._model_info(model_id)
         prompt_rate, completion_rate, pricing = self._rates(model_id, model_info)
-        input_tokens = _estimate_input_tokens(messages)
+        input_tokens = estimate_chat_input_tokens(inputs, self.name)
         input_rate = prompt_rate
         if _caching_requested(inputs) and pricing.get("cacheWriteInputPer1kTokens") is not None:
             input_rate = max(input_rate, _per_thousand(pricing["cacheWriteInputPer1kTokens"]))
@@ -332,69 +413,32 @@ class NanoGptProvider(BaseProvider):
                 raw_max,
                 self._default_max_tokens,
             )
+        if "max_completion_tokens" in body and (
+            _positive_int_or_none(body["max_completion_tokens"]) is None
+        ):
+            # get_price only counts a positive integer; drop anything else.
+            body = {k: v for k, v in body.items() if k != "max_completion_tokens"}
+        # Off by default upstream; pinned off so transcripts are never billed.
+        body = {**body, "youtube_transcripts": False}
 
-        url = f"{self._config.base_url.rstrip('/')}/{path.lstrip('/')}"
-        payload = _upstream_body(body)
-        max_retries = 2
-        retry_delay = 2.0
-        last_error: ProviderError | None = None
-
-        for attempt in range(1 + max_retries):
-            try:
-                async with httpx.AsyncClient(timeout=float(self._config.poll_timeout)) as client:
-                    resp = await client.post(
-                        url,
-                        json=payload,
-                        headers={
-                            "Authorization": f"Bearer {self._config.api_key}",
-                            "Content-Type": "application/json",
-                        },
-                    )
-            except httpx.TimeoutException as exc:
-                last_error = ProviderError(
-                    provider=self.name,
-                    detail=f"NanoGPT request timed out after {self._config.poll_timeout}s",
-                    status_code=504,
-                )
-                if attempt < max_retries and safe_to_resend(exc):
-                    await asyncio.sleep(retry_delay * (2**attempt))
-                    continue
-                raise last_error from None
-            except Exception as exc:
-                raise ProviderError(
-                    provider=self.name,
-                    detail=f"Failed to submit request: {exc}",
-                ) from exc
-
-            if resp.status_code >= 500 and attempt < max_retries:
-                last_error = ProviderError(
-                    provider=self.name,
-                    detail=f"NanoGPT API error: {resp.text}",
-                    status_code=resp.status_code,
-                )
-                await asyncio.sleep(retry_delay * (2**attempt))
-                continue
-            if resp.status_code >= 400:
-                raise ProviderError(
-                    provider=self.name,
-                    detail=f"NanoGPT API error: {resp.text}",
-                    status_code=resp.status_code,
-                )
-
-            result = resp.json()
-            usage = result.get("usage", {})
-            logger.info(
-                "NanoGPT request completed: model=%s, tokens=%s",
-                body.get("model", "unknown"),
-                usage.get("total_tokens", "?"),
-            )
-            return result
-
-        raise last_error or ProviderError(
-            provider=self.name,
-            detail="All retries exhausted",
-            status_code=502,
+        resp = await post_billed_request(
+            f"{self._config.base_url.rstrip('/')}/{path.strip('/')}",
+            _upstream_body(body),
+            api_key=self._config.api_key,
+            request_timeout=float(self._config.poll_timeout),
+            provider_name=self.name,
+            label="NanoGPT",
         )
+        result = parse_billed_json(resp, self.name)
+        usage = result.get("usage")
+        if not isinstance(usage, dict):
+            usage = {}
+        logger.info(
+            "NanoGPT request completed: model=%s, tokens=%s",
+            body.get("model", "unknown"),
+            usage.get("total_tokens", "?"),
+        )
+        return result
 
     async def get_result(self, task_id: str) -> dict[str, Any]:
         """Not used. NanoGPT returns the completion in the submit response."""

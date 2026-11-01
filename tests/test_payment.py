@@ -8,7 +8,14 @@ from unittest.mock import Mock
 import pytest
 
 from x402gate.core.config import NetworkConfig
-from x402gate.core.payment import PaymentHandler, _settlement_failure_reason
+from x402gate.core.payment import (
+    InFlightAmounts,
+    PaymentClaims,
+    PaymentHandler,
+    _settlement_failure_reason,
+    payment_key,
+    settlement_state,
+)
 
 
 @pytest.fixture
@@ -146,3 +153,135 @@ class TestEvmBalanceCheck:
             Decimal("1"),
         )
         assert result is False
+
+
+def _encoded(payload: dict) -> str:
+    """Base64-encode an x402 payment payload the way clients send it."""
+    import base64
+
+    return base64.b64encode(json.dumps(payload).encode()).decode()
+
+
+class TestPaymentKey:
+    """One payment maps to one id however it is encoded."""
+
+    def test_evm_key_uses_payer_and_nonce(self):
+        auth = {"from": "0xAbC", "nonce": "0xDEAD", "value": "1"}
+        first = _encoded(
+            {"accepted": {"network": "eip155:8453"}, "payload": {"authorization": auth}}
+        )
+        auth_lower = {"from": "0xabc", "nonce": "0xdead", "value": "1"}
+        second = _encoded(
+            {
+                "payload": {"authorization": auth_lower, "signature": "0x1"},
+                "accepted": {"network": "eip155:8453"},
+            }
+        )
+        assert payment_key(first) == payment_key(second) == "eip155:8453:0xabc:dead"
+
+    def test_solana_key_hashes_the_transaction(self):
+        import base64
+
+        tx = base64.b64encode(b"tx-bytes").decode()
+        sig = _encoded({"accepted": {"network": "solana:x"}, "payload": {"transaction": tx}})
+        other = _encoded({"accepted": {"network": "solana:x"}, "payload": {"transaction": "eHg="}})
+        assert payment_key(sig).startswith("solana:x:")
+        assert payment_key(sig) != payment_key(other)
+
+    def test_unreadable_header_still_gets_a_key(self):
+        assert payment_key("not base64 at all").startswith("raw:")
+
+
+class TestPaymentClaims:
+    """A payment can be claimed by one request at a time."""
+
+    def test_second_claim_fails_until_release(self):
+        claims = PaymentClaims()
+        assert claims.claim("k")
+        assert not claims.claim("k")
+        claims.release("k")
+        assert claims.claim("k")
+
+    def test_hold_blocks_until_it_expires(self, monkeypatch):
+        import x402gate.core.payment as payment
+
+        now = [100.0]
+        monkeypatch.setattr(payment.time, "monotonic", lambda: now[0])
+        claims = PaymentClaims()
+        assert claims.claim("k")
+        claims.release("k", hold_s=60)
+        now[0] = 159.0
+        assert not claims.claim("k")
+        now[0] = 161.0
+        assert claims.claim("k")
+
+
+class TestPaymentKeyNonceSpelling:
+    """The SDK reads the nonce with bytes.fromhex, so spellings are one nonce."""
+
+    def test_nonce_spellings_share_a_key(self):
+        def key(nonce: str) -> str:
+            auth = {"from": "0xAbC", "nonce": nonce}
+            return payment_key(
+                _encoded(
+                    {"accepted": {"network": "eip155:8453"}, "payload": {"authorization": auth}}
+                )
+            )
+
+        assert key("0xABCD") == key("abcd") == key("ab cd") == "eip155:8453:0xabc:abcd"
+
+
+class TestSettlementState:
+    """Settle results are ok, failed, or unknown when they may still land."""
+
+    def test_states(self):
+        assert settlement_state({"success": True}) == "ok"
+        assert settlement_state({"success": False}) == "failed"
+        assert settlement_state({"success": False, "pending": True}) == "unknown"
+        assert settlement_state(None) == "unknown"
+
+
+class TestInFlightAmounts:
+    """Promised Base amounts add up per payer, case-insensitively."""
+
+    def test_add_and_remove(self):
+        amounts = InFlightAmounts()
+        assert amounts.add("0xAB", Decimal("1")) == Decimal("1")
+        assert amounts.add("0xab", Decimal("2")) == Decimal("3")
+        amounts.remove("0xAB", Decimal("1"))
+        assert amounts.add("0xab", Decimal("0")) == Decimal("2")
+        amounts.remove("0xab", Decimal("5"))
+        assert amounts.add("0xab", Decimal("0")) == Decimal("0")
+
+
+class TestPriceFetchBackoff:
+    """A failed CoinGecko fetch is not retried on every settlement."""
+
+    @pytest.mark.asyncio
+    async def test_failure_is_not_retried_at_once(self, monkeypatch):
+        import x402gate.core.payment as payment
+
+        calls = []
+
+        def boom():
+            calls.append(1)
+            raise RuntimeError("down")
+
+        monkeypatch.setattr(payment, "_fetch_prices_sync", boom)
+        monkeypatch.setitem(payment._price_cache, "ethereum", 0.0)
+        monkeypatch.setitem(payment._price_cache, "solana", 0.0)
+        monkeypatch.setitem(payment._price_cache, "failed_at", 0.0)
+        await payment._refresh_prices()
+        await payment._refresh_prices()
+        assert len(calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_empty_answer_counts_as_failure(self, monkeypatch):
+        import x402gate.core.payment as payment
+
+        monkeypatch.setattr(payment, "_fetch_prices_sync", lambda: {"status": {"error_code": 429}})
+        monkeypatch.setitem(payment._price_cache, "ethereum", 0.0)
+        monkeypatch.setitem(payment._price_cache, "solana", 0.0)
+        monkeypatch.setitem(payment._price_cache, "failed_at", 0.0)
+        await payment._refresh_prices()
+        assert payment._price_cache["failed_at"] > 0

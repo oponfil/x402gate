@@ -13,7 +13,15 @@ from decimal import Decimal
 from typing import Any
 
 from x402gate.core.config import ProviderConfig
-from x402gate.core.proxy import ProxyError, TaskTimeoutError, poll_result, proxy_request
+from x402gate.core.proxy import (
+    UPSTREAM_CREDENTIALS_DETAIL,
+    ProxyError,
+    TaskTimeoutError,
+    UpstreamMayHaveRun,
+    poll_result,
+    proxy_request,
+    rejected_credentials,
+)
 from x402gate.providers.base import BaseProvider, ProviderError
 
 logger = logging.getLogger(__name__)
@@ -55,6 +63,8 @@ class WaveSpeedProvider(BaseProvider):
                 path="model/pricing",
                 body=pricing_body,
                 api_key=self._config.api_key,
+                # A price quote starts no job, so a 5xx can be retried.
+                idempotent=True,
             )
 
             data = result.get("data", result)
@@ -73,6 +83,7 @@ class WaveSpeedProvider(BaseProvider):
         except ProviderError:
             raise
         except Exception as e:
+            self._raise_if_key_rejected(e)
             raise ProviderError(
                 provider=self.name,
                 detail=f"Failed to fetch pricing: {e}",
@@ -98,7 +109,8 @@ class WaveSpeedProvider(BaseProvider):
             WaveSpeed response dict with task ID and status.
 
         Raises:
-            ProviderError: If the submission fails.
+            ProviderError: If the submission fails, or WaveSpeed accepted it
+                without a task id to poll.
         """
         try:
             result = await proxy_request(
@@ -107,18 +119,40 @@ class WaveSpeedProvider(BaseProvider):
                 body=body,
                 api_key=self._config.api_key,
             )
-            logger.info(
-                "WaveSpeed task submitted for %s: %s",
-                path,
-                result.get("data", {}).get("id", "unknown"),
-            )
+            # Read the body the way app.py does to tell async from sync.
+            data = result.get("data", result)
+            is_task = isinstance(data, dict) and "id" in data and "status" in data
+            is_sync = isinstance(data, dict) and ("outputs" in data or "output" in data)
+            if not (is_task or is_sync):
+                # With neither a task id nor an output the gateway has nothing
+                # to poll or deliver, so this is no success. WaveSpeed answered
+                # 2xx, so a task may still exist: the payment is kept.
+                raise ProviderError(
+                    provider=self.name,
+                    detail=f"WaveSpeed accepted the request but returned no task id: "
+                    f"{str(result)[:200]}",
+                ) from UpstreamMayHaveRun("No task id in the submit response")
+            logger.info("WaveSpeed task submitted for %s: %s", path, data.get("id", "sync"))
             return result
 
+        except ProviderError:
+            raise
         except Exception as e:
+            self._raise_if_key_rejected(e)
             raise ProviderError(
                 provider=self.name,
                 detail=f"Failed to submit task: {e}",
             ) from e
+
+    def _raise_if_key_rejected(self, exc: Exception) -> None:
+        """Turn an upstream 401/402/403 into a 502 that hides WaveSpeed's text.
+
+        A 402 passed on would read to x402 clients as the gateway asking for
+        payment, and 401/403 would tell them our key is bad.
+        """
+        if isinstance(exc, ProxyError) and rejected_credentials(exc.status_code):
+            logger.error("WaveSpeed rejected our key (%d): %s", exc.status_code, exc.detail)
+            raise ProviderError(provider=self.name, detail=UPSTREAM_CREDENTIALS_DETAIL) from exc
 
     async def get_result(self, task_id: str) -> dict[str, Any]:
         """Poll WaveSpeed for task completion.

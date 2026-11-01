@@ -1,5 +1,7 @@
 """Unit tests for OpenRouter provider."""
 
+import json
+import time
 from decimal import Decimal
 from unittest.mock import AsyncMock, patch
 
@@ -8,8 +10,34 @@ import pytest
 
 from tests.helpers import make_wav_b64
 from x402gate.core.config import ProviderConfig
-from x402gate.providers.base import ProviderError
-from x402gate.providers.openrouter import OpenRouterProvider
+from x402gate.providers import openrouter
+from x402gate.providers.base import ProviderError, outcome_unknown
+from x402gate.providers.openrouter import OpenRouterProvider, estimate_chat_input_tokens
+
+MINI_PROMPT = Decimal("0.00000015")
+MINI_COMPLETION = Decimal("0.0000006")
+
+
+def _chat_tokens(chars: int) -> int:
+    return max(int(Decimal(chars) / Decimal("2.7")), 1)
+
+
+def _ascii_tokens(text: str) -> int:
+    """Chat estimate for ASCII text: 2.7 characters per token, a digit one token."""
+    digits = sum(ch.isdigit() for ch in text)
+    return max((len(text) - digits) * 10 // 27 + digits, 1)
+
+
+def _mini_price(input_tokens: int, max_tokens: int = 1024) -> Decimal:
+    return Decimal(input_tokens) * MINI_PROMPT + Decimal(max_tokens) * MINI_COMPLETION
+
+
+def _catalog(*models: dict) -> httpx.Response:
+    return httpx.Response(status_code=200, json={"data": list(models)})
+
+
+def _chat_body(**extra) -> dict:
+    return {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": "Hi"}], **extra}
 
 
 @pytest.fixture
@@ -417,8 +445,287 @@ class TestGetPrice:
         assert price == expected
 
 
+class TestRequestChecks:
+    """Path and body checks that run in get_price, before payment."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", ["completions", "responses", "images/generations", "x"])
+    async def test_rejects_unpriced_paths(self, provider, path):
+        with (
+            patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get,
+            pytest.raises(ProviderError) as caught,
+        ):
+            await provider.get_price(path, _chat_body())
+        assert caught.value.status_code == 400
+        mock_get.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_chat_path_cannot_be_priced_as_an_embedding(self, provider):
+        """A body with input and no messages on chat/completions was billed as ~1 token."""
+        body = {"model": "openai/gpt-4o-mini", "input": "x" * 100_000, "prompt": "y" * 100_000}
+        with pytest.raises(ProviderError) as caught:
+            await provider.get_price("chat/completions", body)
+        assert caught.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_chat_with_input_key_is_priced_as_chat(self, provider, model_info_response):
+        body = _chat_body(input="z" * 270)
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = model_info_response
+            price = await provider.get_price("chat/completions", body)
+        assert price == _mini_price(_chat_tokens(272))
+        assert mock_get.call_args.args[0].endswith("/models")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {"model": "openai/text-embedding-3-small"},
+            {"model": "openai/text-embedding-3-small", "input": ""},
+            {"model": "openai/text-embedding-3-small", "input": "a", "messages": []},
+        ],
+    )
+    async def test_embeddings_need_input_only(self, provider, body):
+        with pytest.raises(ProviderError) as caught:
+            await provider.get_price("embeddings", body)
+        assert caught.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_missing_model_is_rejected(self, provider):
+        """OpenRouter would fall back to the account default model, which is unpriced."""
+        with pytest.raises(ProviderError, match="Missing model id"):
+            await provider.get_price(
+                "chat/completions", {"messages": [{"role": "user", "content": "Hi"}]}
+            )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [True, "true", 1, {"x": 1}])
+    async def test_rejects_any_truthy_stream(self, provider, stream):
+        with (
+            patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get,
+            pytest.raises(ProviderError, match="Streaming is not supported") as caught,
+        ):
+            await provider.get_price("chat/completions", _chat_body(stream=stream))
+        assert caught.value.status_code == 400
+        mock_get.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stream_false_is_fine(self, provider, model_info_response):
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = model_info_response
+            price = await provider.get_price("chat/completions", _chat_body(stream=False))
+        assert price == _mini_price(1)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            {"plugins": [{"id": "file-parser"}]},
+            {"plugins": ["web"]},
+            {"plugins": {"id": "web"}},
+            {"plugins": [{"id": "web", "engine": "native"}]},
+            {"web_search_options": {"search_context_size": "high"}},
+        ],
+    )
+    async def test_rejects_unpriced_plugins_and_native_search(self, provider, extra):
+        with pytest.raises(ProviderError) as caught:
+            await provider.get_price("chat/completions", _chat_body(**extra))
+        assert caught.value.status_code == 400
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("part_type", ["file", "video_url", None])
+    async def test_rejects_unpriced_content_parts(self, provider, part_type):
+        part = {"type": part_type, "file": {"file_data": "https://example.com/a.pdf"}}
+        body = {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": [part]}]}
+        with pytest.raises(ProviderError, match="not supported") as caught:
+            await provider.get_price("chat/completions", body)
+        assert caught.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_rejects_routers_without_a_fixed_price(self, provider):
+        catalog = _catalog(
+            {"id": "openrouter/auto", "pricing": {"prompt": "-1", "completion": "-1"}}
+        )
+        body = _chat_body(model="openrouter/auto")
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = catalog
+            with pytest.raises(ProviderError, match="no fixed price") as caught:
+                await provider.get_price("chat/completions", body)
+        assert caught.value.status_code == 400
+
+
+class TestChatInputEstimate:
+    """Everything the model reads is counted, not only messages[].content."""
+
+    @pytest.mark.asyncio
+    async def test_tools_are_counted(self, provider, model_info_response):
+        tools = [{"type": "function", "function": {"name": "f", "description": "d" * 5000}}]
+        body = _chat_body(tools=tools)
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = model_info_response
+            price = await provider.get_price("chat/completions", body)
+
+        tools_chars = len(json.dumps(tools, separators=(",", ":")))
+        assert price == _mini_price(_chat_tokens(len("Hi") + tools_chars))
+
+    @pytest.mark.asyncio
+    async def test_prompt_tool_calls_and_response_format_are_counted(
+        self, provider, model_info_response
+    ):
+        tool_calls = [{"id": "c1", "function": {"name": "f", "arguments": "a" * 300}}]
+        schema = {"type": "json_schema", "json_schema": {"schema": {"d": "s" * 200}}}
+        body = {
+            "model": "openai/gpt-4o-mini",
+            "messages": [{"role": "assistant", "content": None, "tool_calls": tool_calls}],
+            "prompt": "p" * 400,
+            "response_format": schema,
+        }
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = model_info_response
+            price = await provider.get_price("chat/completions", body)
+
+        chars = (
+            len(json.dumps(tool_calls, separators=(",", ":")))
+            + 400
+            + len(json.dumps(schema, separators=(",", ":")))
+        )
+        assert price == _mini_price(_chat_tokens(chars))
+
+    @pytest.mark.asyncio
+    async def test_text_parts_count_only_their_text(self, provider, model_info_response):
+        content = [{"type": "text", "text": "What is quantum computing?"}]
+        body = {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": content}]}
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = model_info_response
+            price = await provider.get_price("chat/completions", body)
+        assert price == _mini_price(_chat_tokens(len("What is quantum computing?")))
+
+    @pytest.mark.asyncio
+    async def test_image_parts_add_a_fixed_allowance(self, provider, model_info_response):
+        """An image costs a per-image allowance; its base64 bytes are not priced as text."""
+        image = {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64," + "A" * 500_000},
+        }
+        content = [{"type": "text", "text": "Describe"}, image, image]
+        body = {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": content}]}
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = model_info_response
+            price = await provider.get_price("chat/completions", body)
+        assert price == _mini_price(_chat_tokens(len("Describe")) + 2 * 4800)
+
+    @pytest.mark.asyncio
+    async def test_max_completion_tokens_is_priced(self, provider, model_info_response):
+        body = _chat_body(max_completion_tokens=50_000)
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = model_info_response
+            price = await provider.get_price("chat/completions", body)
+        assert price == _mini_price(1, max_tokens=50_000)
+
+    @pytest.mark.asyncio
+    async def test_cache_control_uses_the_cache_write_rate(self, provider):
+        catalog = _catalog(
+            {
+                "id": "anthropic/claude",
+                "pricing": {
+                    "prompt": "0.000003",
+                    "completion": "0.000015",
+                    "input_cache_write": "0.00000375",
+                },
+            }
+        )
+        content = [{"type": "text", "text": "x" * 2700, "cache_control": {"type": "ephemeral"}}]
+        body = {"model": "anthropic/claude", "messages": [{"role": "user", "content": content}]}
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = catalog
+            price = await provider.get_price("chat/completions", body)
+        assert price == Decimal(1000) * Decimal("0.00000375") + Decimal(1024) * Decimal("0.000015")
+
+    @pytest.mark.asyncio
+    async def test_per_request_fee_is_added(self, provider):
+        catalog = _catalog(
+            {
+                "id": "perplexity/sonar",
+                "pricing": {"prompt": "0.000001", "completion": "0.000001", "request": "0.005"},
+            }
+        )
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = catalog
+            price = await provider.get_price(
+                "chat/completions", _chat_body(model="perplexity/sonar")
+            )
+        assert price == Decimal("0.000001") + Decimal(1024) * Decimal("0.000001") + Decimal("0.005")
+
+
+class TestWebPluginPricing:
+    """max_results is clamped and the plugin is pinned to the priced engine."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("max_results", "priced"),
+        [(None, 3), (-100, 3), (0, 3), ("50", 3), (True, 3), (1, 1), (7, 7), (10_000, 10)],
+    )
+    async def test_max_results_is_clamped(self, provider, model_info_response, max_results, priced):
+        plugin = {"id": "web"} if max_results is None else {"id": "web", "max_results": max_results}
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = model_info_response
+            price = await provider.get_price("chat/completions", _chat_body(plugins=[plugin]))
+        plugins_json = json.dumps([plugin], separators=(",", ":"))
+        tokens = _ascii_tokens("Hi" + plugins_json) + priced * 2048
+        assert price == _mini_price(tokens) + Decimal(priced) * Decimal("0.004")
+
+
+class TestModelsFallback:
+    """A cheap primary model cannot route to an expensive fallback for free."""
+
+    @pytest.mark.asyncio
+    async def test_prices_the_most_expensive_candidate(self, provider, model_info_response):
+        body = _chat_body(models=["openai/gpt-4o"])
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = model_info_response
+            price = await provider.get_price("chat/completions", body)
+
+        tokens = _chat_tokens(len("Hi") + len('["openai/gpt-4o"]'))
+        expensive = Decimal(tokens) * Decimal("0.0000025") + Decimal(1024) * Decimal("0.00001")
+        assert price == expensive
+
+    @pytest.mark.asyncio
+    async def test_models_without_model_is_priced(self, provider, model_info_response):
+        body = {
+            "models": ["openai/gpt-4o-mini", "openai/gpt-4o"],
+            "messages": [{"role": "user", "content": "Hi"}],
+        }
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = model_info_response
+            price = await provider.get_price("chat/completions", body)
+        assert price > _mini_price(1) * 10
+
+    @pytest.mark.asyncio
+    async def test_unknown_fallback_is_rejected(self, provider, model_info_response):
+        body = _chat_body(models=["missing/model"])
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = model_info_response
+            with pytest.raises(ProviderError, match="not found"):
+                await provider.get_price("chat/completions", body)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("models", ["openai/gpt-4o", [1], [""]])
+    async def test_malformed_models_is_rejected(self, provider, models):
+        with pytest.raises(ProviderError, match="models must be") as caught:
+            await provider.get_price("chat/completions", _chat_body(models=models))
+        assert caught.value.status_code == 400
+
+
 class TestSubmit:
     """Tests for OpenRouterProvider.submit()."""
+
+    @pytest.fixture(autouse=True)
+    def warm_catalog(self, provider, model_info_response):
+        """submit reads the catalog get_price already loaded to cap the endpoint price."""
+        for model in model_info_response.json()["data"]:
+            provider._models_cache[model["id"]] = model
+        provider._fetched_catalogs.add("")
+        provider._cache_updated_at = time.time()
 
     @pytest.mark.asyncio
     async def test_forwards_request(self, provider, chat_completion_response):
@@ -488,6 +795,96 @@ class TestSubmit:
         assert result["usage"]["total_tokens"] == 18
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "failure", [httpx.ConnectError("refused"), httpx.PoolTimeout("pool full")]
+    )
+    async def test_unopened_connection_is_retried_then_refunded(self, provider, failure):
+        """Nothing reached OpenRouter, so it is retried and a final failure is known."""
+        with (
+            patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post,
+            patch("x402gate.providers.openrouter.asyncio.sleep", new_callable=AsyncMock),
+            pytest.raises(ProviderError) as caught,
+        ):
+            mock_post.side_effect = failure
+            await provider.submit("chat/completions", _chat_body())
+        assert mock_post.call_count == 3
+        assert not outcome_unknown(caught.value)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [500, 502, 503])
+    async def test_server_error_is_not_resent_and_is_a_known_failure(self, provider, status):
+        """The call got an answer and may have run, so it is never sent twice."""
+        with (
+            patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post,
+            patch("x402gate.providers.openrouter.asyncio.sleep", new_callable=AsyncMock),
+            pytest.raises(ProviderError) as caught,
+        ):
+            mock_post.return_value = httpx.Response(status, json={"error": {"message": "down"}})
+            await provider.submit("chat/completions", _chat_body())
+        assert mock_post.call_count == 1
+        assert caught.value.status_code == status
+        assert not outcome_unknown(caught.value)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("status", "text"),
+        [
+            (504, "Gateway Timeout"),
+            (520, ""),
+            (524, "A timeout occurred"),
+            (502, '{"error":{"message":"Upstream request timed out"}}'),
+            (500, "<html>504 Gateway Time-out</html>"),
+        ],
+    )
+    async def test_gateway_timeout_is_an_unknown_outcome(self, provider, status, text):
+        """The request was forwarded and may have billed: kept, not resent."""
+        with (
+            patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post,
+            patch("x402gate.providers.openrouter.asyncio.sleep", new_callable=AsyncMock),
+            pytest.raises(ProviderError) as caught,
+        ):
+            mock_post.return_value = httpx.Response(status, text=text)
+            await provider.submit("chat/completions", _chat_body())
+        assert mock_post.call_count == 1
+        assert outcome_unknown(caught.value)
+
+    @pytest.mark.asyncio
+    async def test_redirect_is_a_known_failure(self, provider):
+        """httpx does not follow redirects, so the model never ran."""
+        with (
+            patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post,
+            pytest.raises(ProviderError) as caught,
+        ):
+            mock_post.return_value = httpx.Response(301, headers={"location": "/elsewhere"})
+            await provider.submit("chat/completions", _chat_body())
+        assert caught.value.status_code == 502
+        assert not outcome_unknown(caught.value)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [401, 402, 403])
+    async def test_rejected_key_is_not_passed_to_the_client(self, provider, status):
+        """A 402 from OpenRouter is about our credit, not an x402 payment request."""
+        with (
+            patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post,
+            pytest.raises(ProviderError) as caught,
+        ):
+            mock_post.return_value = httpx.Response(status, text="Insufficient credits")
+            await provider.submit("chat/completions", _chat_body())
+        assert caught.value.status_code == 502
+        assert "Insufficient credits" in caught.value.detail
+        assert not outcome_unknown(caught.value)
+
+    @pytest.mark.asyncio
+    async def test_read_timeout_is_an_unknown_outcome(self, provider):
+        with (
+            patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post,
+            pytest.raises(ProviderError) as caught,
+        ):
+            mock_post.side_effect = httpx.ReadTimeout("slow")
+            await provider.submit("chat/completions", _chat_body())
+        assert outcome_unknown(caught.value)
+
+    @pytest.mark.asyncio
     async def test_no_task_id_in_response(self, provider, chat_completion_response):
         """Response should not contain 'id' field that triggers polling."""
         body = {
@@ -537,6 +934,79 @@ class TestSubmit:
 
         sent_body = mock_post.call_args.kwargs["json"]
         assert sent_body["max_tokens"] == 1024
+
+    @pytest.mark.asyncio
+    async def test_refuses_unpriced_path(self, provider):
+        with (
+            patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post,
+            pytest.raises(ProviderError) as caught,
+        ):
+            await provider.submit("responses", _chat_body())
+        assert caught.value.status_code == 400
+        assert not outcome_unknown(caught.value)
+        mock_post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_refuses_stream(self, provider):
+        with (
+            patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post,
+            pytest.raises(ProviderError) as caught,
+        ):
+            await provider.submit("chat/completions", _chat_body(stream="yes"))
+        assert caught.value.status_code == 400
+        mock_post.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "response",
+        [
+            httpx.Response(200, text='data: {"choices": []}\n\ndata: [DONE]\n\n'),
+            httpx.Response(200, json=["not", "an", "object"]),
+        ],
+    )
+    async def test_unreadable_success_body_is_an_unknown_outcome(self, provider, response):
+        """OpenRouter billed the call, so the payment must be kept, not refunded."""
+        with (
+            patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post,
+            pytest.raises(ProviderError) as caught,
+        ):
+            mock_post.return_value = response
+            await provider.submit("chat/completions", _chat_body())
+        assert caught.value.status_code == 502
+        assert outcome_unknown(caught.value)
+        assert mock_post.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_web_plugin_is_pinned_to_the_priced_values(
+        self, provider, chat_completion_response
+    ):
+        body = _chat_body(plugins=[{"id": "web", "max_results": 500}])
+        with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = chat_completion_response
+            await provider.submit("chat/completions", body)
+        sent = mock_post.call_args.kwargs["json"]
+        assert sent["plugins"] == [{"id": "web", "max_results": 10, "engine": "exa"}]
+
+    @pytest.mark.asyncio
+    async def test_drops_unpriced_max_completion_tokens(self, provider, chat_completion_response):
+        body = _chat_body(max_completion_tokens="100000")
+        with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = chat_completion_response
+            await provider.submit("chat/completions", body)
+        sent = mock_post.call_args.kwargs["json"]
+        assert "max_completion_tokens" not in sent
+        assert sent["max_tokens"] == 1024
+
+    @pytest.mark.asyncio
+    async def test_chat_with_input_audio_key_is_still_capped(
+        self, provider, chat_completion_response
+    ):
+        """A top-level input_audio key used to skip the max_tokens cap on chat."""
+        body = _chat_body(input_audio={"data": "AAAA", "format": "wav"})
+        with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = chat_completion_response
+            await provider.submit("chat/completions", body)
+        assert mock_post.call_args.kwargs["json"]["max_tokens"] == 1024
 
     @pytest.mark.asyncio
     async def test_stt_submit_strips_internal_keys(self, provider):
@@ -626,18 +1096,36 @@ class TestCalculateActualCost:
         assert cost == Decimal("0.0002")
 
     @pytest.mark.asyncio
-    async def test_chat_ignores_usage_cost(self, provider, model_info_response):
-        """Chat responses should use token counts even when usage.cost is present."""
-        body = {"model": "openai/gpt-4o-mini"}
+    async def test_chat_prefers_usage_cost(self, provider):
+        """usage.cost is what OpenRouter charged: fallback model, provider and cache included."""
+        body = {"model": "openai/gpt-4o-mini", "models": ["openai/gpt-4o"]}
         result = {
             "choices": [{"message": {"content": "Hello"}}],
             "usage": {
                 "prompt_tokens": 10,
                 "completion_tokens": 50,
                 "total_tokens": 60,
-                "cost": 0.999,
+                "cost": 0.0123,
             },
         }
+
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            cost = await provider.calculate_actual_cost(body, result)
+
+        assert cost == Decimal("0.0123")
+        mock_get.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "usage_extra",
+        [{"cost": -1}, {"cost": True}, {"cost": "abc"}, {"cost": 0.5, "is_byok": True}],
+    )
+    async def test_unusable_usage_cost_falls_back_to_catalog(
+        self, provider, model_info_response, usage_extra
+    ):
+        """A negative, non-numeric or BYOK usage.cost is not the real charge."""
+        body = {"model": "openai/gpt-4o-mini"}
+        result = {"usage": {"prompt_tokens": 10, "completion_tokens": 50, **usage_extra}}
 
         with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
             mock_get.return_value = model_info_response
@@ -645,6 +1133,20 @@ class TestCalculateActualCost:
 
         expected = Decimal(10) * Decimal("0.00000015") + Decimal(50) * Decimal("0.0000006")
         assert cost == expected
+
+    @pytest.mark.asyncio
+    async def test_negative_web_results_do_not_lower_the_actual_cost(
+        self, provider, model_info_response
+    ):
+        body = {"model": "openai/gpt-4o-mini", "plugins": [{"id": "web", "max_results": -50}]}
+        result = {"usage": {"prompt_tokens": 10, "completion_tokens": 50}}
+
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = model_info_response
+            cost = await provider.calculate_actual_cost(body, result)
+
+        tokens = Decimal(10) * Decimal("0.00000015") + Decimal(50) * Decimal("0.0000006")
+        assert cost == tokens + Decimal(3) * Decimal("0.004")
 
     @pytest.mark.asyncio
     async def test_stt_duration_fallback_without_cost(
@@ -659,3 +1161,385 @@ class TestCalculateActualCost:
             cost = await provider.calculate_actual_cost(body, result)
 
         assert cost == Decimal("0.006")  # 60 seconds * $0.0001 per second
+
+
+class TestNonTextOutput:
+    """Image and audio output bill above the text rate, so they are refused before payment."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            {"modalities": ["image", "text"]},
+            {"modalities": ["text", "audio"]},
+            {"modalities": "image"},
+            {"audio": {"voice": "alloy", "format": "wav"}},
+        ],
+    )
+    async def test_rejects_image_and_audio_output(self, provider, extra):
+        with (
+            patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get,
+            pytest.raises(ProviderError, match="output") as caught,
+        ):
+            await provider.get_price("chat/completions", _chat_body(**extra))
+        assert caught.value.status_code == 400
+        mock_get.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_text_only_modalities_is_fine(self, provider, model_info_response):
+        body = _chat_body(modalities=["text"])
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = model_info_response
+            price = await provider.get_price("chat/completions", body)
+        assert price == _mini_price(_chat_tokens(len("Hi") + len('["text"]')))
+
+
+class TestReasoningBudget:
+    """Thinking counts inside a cap above the budget, on top of a cap at or below it."""
+
+    @staticmethod
+    def _input_tokens(body: dict) -> int:
+        text = "Hi" + "".join(
+            json.dumps(body[key], separators=(",", ":"))
+            for key in ("reasoning", "thinking")
+            if key in body
+        )
+        return _ascii_tokens(text)
+
+    async def _price(self, provider, model_info_response, body):
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = model_info_response
+            return await provider.get_price("chat/completions", body)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "extra",
+        [{"reasoning": {"max_tokens": 32_000}}, {"thinking": {"budget_tokens": 32_000}}],
+    )
+    async def test_budget_is_added_without_an_explicit_cap(
+        self, provider, model_info_response, extra
+    ):
+        """The injected default max_tokens is raised upstream to fit the budget."""
+        body = _chat_body(**extra)
+        price = await self._price(provider, model_info_response, body)
+        assert price == _mini_price(self._input_tokens(body), max_tokens=1024 + 32_000)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            {"max_tokens": 16_000, "reasoning": {"max_tokens": 8000}},
+            {"max_tokens": 16_000, "thinking": {"type": "enabled", "budget_tokens": 8000}},
+            {"max_completion_tokens": 16_000, "reasoning": {"max_tokens": 8000}},
+        ],
+    )
+    async def test_cap_above_the_budget_bounds_the_output(
+        self, provider, model_info_response, extra
+    ):
+        """Thinking counts inside max_tokens, so 16000 is not priced as 24000."""
+        body = _chat_body(**extra)
+        price = await self._price(provider, model_info_response, body)
+        assert price == _mini_price(self._input_tokens(body), max_tokens=16_000)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("cap", [4000, 8000])
+    async def test_cap_at_or_below_the_budget_adds_it(self, provider, model_info_response, cap):
+        """Anthropic needs max_tokens above the budget, so the upstream raises the cap."""
+        body = _chat_body(max_tokens=cap, reasoning={"max_tokens": 8000})
+        price = await self._price(provider, model_info_response, body)
+        assert price == _mini_price(self._input_tokens(body), max_tokens=cap + 8000)
+
+    @pytest.mark.asyncio
+    async def test_small_cap_is_raised_to_the_default_first(self, provider, model_info_response):
+        """submit raises max_tokens to the 1024 default, which is above a 500 budget."""
+        body = _chat_body(max_tokens=600, reasoning={"max_tokens": 500})
+        price = await self._price(provider, model_info_response, body)
+        assert price == _mini_price(self._input_tokens(body), max_tokens=1024)
+
+    @pytest.mark.asyncio
+    async def test_each_forwarded_cap_is_checked(self, provider, model_info_response):
+        """A max_completion_tokens at the budget may be the cap the upstream honours."""
+        body = _chat_body(
+            max_tokens=9000, max_completion_tokens=8000, reasoning={"max_tokens": 8000}
+        )
+        price = await self._price(provider, model_info_response, body)
+        assert price == _mini_price(self._input_tokens(body), max_tokens=16_000)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("budget", ["32000", -1, True, 1.5])
+    async def test_malformed_budget_is_rejected(self, provider, budget):
+        body = _chat_body(reasoning={"max_tokens": budget})
+        with pytest.raises(ProviderError, match="reasoning.max_tokens") as caught:
+            await provider.get_price("chat/completions", body)
+        assert caught.value.status_code == 400
+
+
+class TestImagePricing:
+    """Each image is reserved at the larger of the token allowance and the catalog image rate."""
+
+    @pytest.mark.asyncio
+    async def test_catalog_image_rate_wins_when_higher(self, provider):
+        catalog = _catalog(
+            {
+                "id": "vision/model",
+                "pricing": {"prompt": "0.000001", "completion": "0.000002", "image": "0.02"},
+            }
+        )
+        image = {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}
+        body = {"model": "vision/model", "messages": [{"role": "user", "content": [image]}]}
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = catalog
+            price = await provider.get_price("chat/completions", body)
+        # 4800 tokens x $1/M = $0.0048 < $0.02 catalog rate.
+        assert price == Decimal("0.000001") + Decimal("0.02") + Decimal(1024) * Decimal("0.000002")
+
+
+class TestEndpointPriceCap:
+    """Client routing that picks endpoints gets max_price; default routing keeps its fallback."""
+
+    @pytest.fixture(autouse=True)
+    def warm_catalog(self, provider, model_info_response, embedding_model_info_response):
+        for response in (model_info_response, embedding_model_info_response):
+            for model in response.json()["data"]:
+                provider._models_cache[model["id"]] = model
+        provider._fetched_catalogs.update({"", "embeddings"})
+        provider._cache_updated_at = time.time()
+
+    async def _sent(self, provider, chat_completion_response, path, body):
+        with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = chat_completion_response
+            await provider.submit(path, body)
+        return mock_post.call_args.kwargs["json"]
+
+    @pytest.mark.asyncio
+    async def test_default_routing_gets_no_cap(self, provider, chat_completion_response):
+        """A cap would stop OpenRouter falling back to a pricier endpoint."""
+        sent = await self._sent(
+            provider, chat_completion_response, "chat/completions", _chat_body()
+        )
+        assert "provider" not in sent
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "routing",
+        [
+            {},
+            {"allow_fallbacks": True},
+            {"data_collection": "allow"},
+            {"zdr": False},
+            {"require_parameters": False, "allow_fallbacks": True},
+            {"order": [], "sort": None},
+            {"max_price": {"prompt": 0.1}},
+        ],
+    )
+    async def test_neutral_routing_is_forwarded_unchanged(
+        self, provider, chat_completion_response, routing
+    ):
+        body = _chat_body(provider=routing)
+        sent = await self._sent(provider, chat_completion_response, "chat/completions", body)
+        assert sent["provider"] == routing
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "routing",
+        [
+            {"order": ["pricey-host"]},
+            {"only": ["pricey-host"]},
+            {"ignore": ["cheap-host"]},
+            {"sort": "throughput"},
+            {"quantizations": ["fp16"]},
+            {"allow_fallbacks": False},
+            {"require_parameters": True},
+            # Privacy filters drop endpoints on every request, like ignore.
+            {"data_collection": "deny"},
+            {"zdr": True},
+            {"zdr": True, "preferred_min_throughput": 100},
+        ],
+    )
+    async def test_steering_routing_gets_the_catalog_cap(
+        self, provider, chat_completion_response, routing
+    ):
+        body = _chat_body(provider=routing)
+        sent = await self._sent(provider, chat_completion_response, "chat/completions", body)
+        assert sent["provider"] == {
+            **routing,
+            "max_price": {"prompt": 0.15, "completion": 0.6, "request": 0.0},
+        }
+
+    @pytest.mark.asyncio
+    async def test_cap_covers_the_priciest_fallback(self, provider, chat_completion_response):
+        body = _chat_body(models=["openai/gpt-4o"], provider={"sort": "latency"})
+        sent = await self._sent(provider, chat_completion_response, "chat/completions", body)
+        assert sent["provider"]["max_price"] == {"prompt": 2.5, "completion": 10.0, "request": 0.0}
+
+    @pytest.mark.asyncio
+    async def test_merges_into_client_routing(self, provider, chat_completion_response):
+        """Client routing is kept, a lower client cap wins, a higher one is lowered."""
+        routing = {
+            "order": ["pricey-host"],
+            "sort": "throughput",
+            "max_price": {"prompt": 0.1, "completion": 99, "image": 1},
+        }
+        body = _chat_body(provider=routing)
+        sent = await self._sent(provider, chat_completion_response, "chat/completions", body)
+        assert sent["provider"] == {
+            "order": ["pricey-host"],
+            "sort": "throughput",
+            "max_price": {"prompt": 0.1, "completion": 0.6, "image": 1, "request": 0.0},
+        }
+        assert body["provider"]["max_price"]["completion"] == 99  # caller's dict untouched
+
+    @pytest.mark.asyncio
+    async def test_embeddings_follow_the_same_rule(self, provider, chat_completion_response):
+        body = {"model": "openai/text-embedding-3-small", "input": "hello"}
+        sent = await self._sent(provider, chat_completion_response, "embeddings", body)
+        assert "provider" not in sent
+        body = {**body, "provider": {"order": ["pricey-host"]}}
+        sent = await self._sent(provider, chat_completion_response, "embeddings", body)
+        assert sent["provider"]["max_price"]["prompt"] == 0.02
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("routing", ["openai", ["openai"], {"max_price": 5}])
+    async def test_malformed_routing_is_rejected(self, provider, routing):
+        with pytest.raises(ProviderError, match="provider must be") as caught:
+            await provider.get_price("chat/completions", _chat_body(provider=routing))
+        assert caught.value.status_code == 400
+
+
+class TestCatalogFallbackCost:
+    """Without usage.cost the fallback prices what OpenRouter may have billed."""
+
+    @pytest.mark.asyncio
+    async def test_prices_the_served_fallback_model(self, provider, model_info_response):
+        body = _chat_body(models=["openai/gpt-4o"])
+        result = {"model": "openai/gpt-4o", "usage": {"prompt_tokens": 10, "completion_tokens": 50}}
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = model_info_response
+            cost = await provider.calculate_actual_cost(body, result)
+        assert cost == Decimal(10) * Decimal("0.0000025") + Decimal(50) * Decimal("0.00001")
+
+    @pytest.mark.asyncio
+    async def test_unnamed_served_model_uses_the_priciest_candidate(
+        self, provider, model_info_response
+    ):
+        body = _chat_body(models=["openai/gpt-4o"])
+        result = {"model": "openai/gpt-4o-2024-08-06", "usage": {"prompt_tokens": 10}}
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = model_info_response
+            cost = await provider.calculate_actual_cost(body, result)
+        assert cost == Decimal(10) * Decimal("0.0000025")
+
+    @pytest.mark.asyncio
+    async def test_served_primary_model_keeps_its_own_rate(self, provider, model_info_response):
+        body = _chat_body(models=["openai/gpt-4o"])
+        result = {"model": "openai/gpt-4o-mini", "usage": {"prompt_tokens": 10}}
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = model_info_response
+            cost = await provider.calculate_actual_cost(body, result)
+        assert cost == Decimal(10) * MINI_PROMPT
+
+    @pytest.mark.asyncio
+    async def test_cache_breakpoint_uses_the_write_rate(self, provider):
+        catalog = _catalog(
+            {
+                "id": "anthropic/claude",
+                "pricing": {
+                    "prompt": "0.000003",
+                    "completion": "0.000015",
+                    "input_cache_write": "0.00000375",
+                },
+            }
+        )
+        content = [{"type": "text", "text": "x", "cache_control": {"type": "ephemeral"}}]
+        body = {"model": "anthropic/claude", "messages": [{"role": "user", "content": content}]}
+        result = {"usage": {"prompt_tokens": 1000, "completion_tokens": 10, "is_byok": True}}
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = catalog
+            cost = await provider.calculate_actual_cost(body, result)
+        assert cost == Decimal(1000) * Decimal("0.00000375") + Decimal(10) * Decimal("0.000015")
+
+
+class TestInputTokenEstimate:
+    """Dense text is weighed by character class so it cannot be priced below its bill."""
+
+    @staticmethod
+    def _tokens(text: str) -> int:
+        body = {"model": "m", "messages": [{"role": "user", "content": text}]}
+        return estimate_chat_input_tokens(body, "openrouter")
+
+    def test_ascii_prose_is_unchanged(self):
+        text = "The quick brown fox jumps over the lazy dog. " * 40
+        assert self._tokens(text) == _chat_tokens(len(text))
+
+    def test_digits_count_one_token_each(self):
+        """Many tokenizers split numbers into single digits."""
+        assert self._tokens("1234567890" * 100) == 1000
+
+    @pytest.mark.parametrize("char", ["\U00020000", "\U0002a6d6", "\U0001f600"])
+    def test_astral_characters_are_at_least_three_tokens(self, char):
+        """CJK Extension B and emoji bill 2-3 tokens each."""
+        assert self._tokens(char * 1000) >= 3000
+
+    def test_russian_is_priced_within_a_sane_factor(self):
+        """Cyrillic bills about 0.3-0.6 tokens per character; it is not priced far above."""
+        text = "Привет! Сегодня отличная погода, и мы пойдём гулять в парк у реки. " * 20
+        tokens = self._tokens(text)
+        assert 0.5 * len(text) <= tokens <= 0.8 * len(text)
+
+    def test_common_cjk_is_one_and_a_half_tokens(self):
+        assert self._tokens("你好世界" * 100) == 600
+
+    @pytest.mark.parametrize(
+        ("text", "tokens"),
+        [
+            ("\x01" * 100, 100),  # control codes: one byte each
+            ("e" + "́" * 99, 198),  # stacked combining marks: two bytes each
+            ("" * 100, 300),  # private use: three bytes each
+        ],
+    )
+    def test_characters_no_vocabulary_holds_bill_per_byte(self, text, tokens):
+        assert self._tokens(text) == tokens
+
+    def test_cjk_extension_a_is_at_least_three_tokens(self):
+        """The BMP twin of the Extension B attack."""
+        assert self._tokens("\u3400\u4dbf\u3aaa" * 1000) >= 9000
+
+    @pytest.mark.parametrize("mark", ["\u05b0", "\u05b8", "\u064e", "\u0670", "\u0483"])
+    def test_stacked_two_byte_marks_are_at_least_two_tokens(self, mark):
+        """Hebrew points, Arabic harakat and Cyrillic marks stack without limit."""
+        assert self._tokens("a" + mark * 1000) >= 2000
+
+    @pytest.mark.parametrize("char", ["\U000e0041", "\U000e0101", "\U000f0000", "\U0010fffd"])
+    def test_rare_astral_characters_are_four_tokens(self, char):
+        assert self._tokens(char * 1000) == 4000
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Привет! Сегодня отличная погода, и мы пойдём гулять в парк у реки.",
+            "Καλημέρα, πώς είσαι σήμερα;",
+            "你好，今天天气很好。",
+            "こんにちは、元気ですか。",
+            "안녕하세요, 오늘 날씨가 좋네요.",
+        ],
+    )
+    def test_normal_text_has_no_rare_characters(self, text):
+        """The per-byte classes never touch ordinary prose."""
+        assert openrouter._COMBINING_MARKS.search(text) is None
+        assert openrouter._RARE_THREE_BYTE.search(text) is None
+        assert openrouter._RARE_FOUR_BYTE.search(text) is None
+
+    def test_tool_definitions_use_the_same_weights(self):
+        tools = [{"type": "function", "function": {"name": "f", "description": "\U00020000" * 500}}]
+        body = {"model": "m", "messages": [{"role": "user", "content": "Hi"}], "tools": tools}
+        assert estimate_chat_input_tokens(body, "openrouter") >= 1500
+
+    def test_inline_audio_keeps_the_plain_size_rule(self):
+        """Base64 audio is not tokenized text; its digits are not weighed as digits."""
+        part = {"type": "input_audio", "input_audio": {"data": "QUJD0123" * 100, "format": "wav"}}
+        body = {"model": "m", "messages": [{"role": "user", "content": [part]}]}
+        serialized = json.dumps(part, separators=(",", ":"))
+        assert estimate_chat_input_tokens(body, "openrouter") == _chat_tokens(len(serialized))
+
+    def test_lone_surrogate_does_not_raise(self):
+        assert self._tokens("a\ud800b") >= 1

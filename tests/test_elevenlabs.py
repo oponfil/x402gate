@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from x402gate.core.config import ProviderConfig
+from x402gate.providers.base import ProviderError
 from x402gate.providers.elevenlabs import ElevenLabsProvider, _is_turbo_model
 
 
@@ -162,6 +163,71 @@ class TestSubmit:
 
             with pytest.raises(Exception, match="ElevenLabs error"):
                 await provider.submit("voice123", {"text": "Hello"})
+
+
+# ---------------------------------------------------------------------------
+# voice_id validation
+# ---------------------------------------------------------------------------
+
+# FastAPI decodes the path, so "..%2fsound-generation" arrives as
+# "../sound-generation"; both spellings are covered.
+_BAD_VOICE_IDS = [
+    "..%2fsound-generation",
+    "../sound-generation",
+    "%2e%2e%2fsound-generation",
+    "..",
+    "abc?x=1",
+    "abc/def",
+    "abc#frag",
+    "abc def",
+    "",
+    "a" * 65,
+]
+
+
+class TestVoiceIdValidation:
+    """The voice_id path must not reach any other ElevenLabs endpoint."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("voice_id", _BAD_VOICE_IDS)
+    async def test_get_price_rejects_bad_voice_id(self, voice_id):
+        """Rejected before payment with a 400."""
+        provider = _make_provider()
+        with pytest.raises(ProviderError) as exc_info:
+            await provider.get_price(voice_id, {"text": "Hello"})
+        assert exc_info.value.status_code == 400
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("voice_id", _BAD_VOICE_IDS)
+    async def test_submit_rejects_bad_voice_id(self, voice_id):
+        """submit() never calls upstream with a bad voice_id."""
+        provider = _make_provider()
+        with patch("x402gate.providers.elevenlabs.httpx.AsyncClient") as mock_cls:
+            with pytest.raises(ProviderError) as exc_info:
+                await provider.submit(voice_id, {"text": "Hello"})
+            mock_cls.assert_not_called()
+        assert exc_info.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_normal_voice_id_reaches_tts_url(self):
+        """A plain id is priced and sent to /v1/text-to-speech/{voice_id}."""
+        provider = _make_provider()
+        voice_id = "21m00Tcm4TlvDq8ikWAM"
+        assert await provider.get_price(voice_id, {"text": "a" * 1000}) == Decimal("0.30")
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.content = b"audio"
+        mock_response.headers = {"content-type": "audio/mpeg"}
+        with patch("x402gate.providers.elevenlabs.httpx.AsyncClient") as mock_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = mock_response
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            await provider.submit(voice_id, {"text": "Hello"})
+
+        url = mock_client.post.call_args.args[0]
+        assert url == f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
 
 
 # ---------------------------------------------------------------------------

@@ -18,6 +18,7 @@ body. The gateway returns one JSON completion after the stream finishes.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
@@ -25,19 +26,29 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, NoReturn
 
 import httpx
 
 from x402gate.core.config import ProviderConfig
-from x402gate.core.proxy import TaskTimeoutError
-from x402gate.providers.base import BaseProvider, ProviderError
+from x402gate.core.proxy import (
+    _GATEWAY_TIMEOUT_STATUSES,
+    _NOT_FOUND_GRACE_POLLS,
+    _NOT_FOUND_GRACE_S,
+    UPSTREAM_CREDENTIALS_DETAIL,
+    TaskTimeoutError,
+    UpstreamMayHaveRun,
+    rejected_credentials,
+)
+from x402gate.providers.base import BaseProvider, ProviderError, outcome_unknown
 
 logger = logging.getLogger(__name__)
 
 _JOBS_PATH = "jobs"
 _CHAT_PATH = "chat/completions"
-_PENDING_STATES = frozenset({"queued", "running"})
+# Only these mean SpicyAPI gave up on the task. A missing or unlisted state
+# may be a job still running (and billing), so it is polled like a pending one.
+_FAILED_STATES = frozenset({"failed", "canceled", "cancelled", "expired"})
 _QUOTE_SKEW_SECONDS = 20
 _IMAGE_WAIT_SECONDS = 45
 _IMAGE_REQUEST_TIMEOUT = 75.0
@@ -45,6 +56,13 @@ _DEFAULT_TIMEOUT = 30.0
 _MAX_RETRIES = 2
 _RETRY_DELAY = 2.0
 _COST_LOOKUP_TRIES = 3
+# Unpaid quote requests fill the quote and price caches, so both are bounded.
+# A price outlives the gateway's price cache (60s by default) and has the same
+# entry cap, so a price served from that cache still finds its record here.
+_PRICED_TTL_SECONDS = 3600
+_CACHE_MAX_ENTRIES = 10_000
+_POLL_BACKOFF_MIN = 1.0
+_POLL_BACKOFF_MAX = 30.0
 
 _INTERNAL_FIELDS = frozenset({"_caller", "_file_bytes", "_file_name"})
 _REQUEST_FIELDS = frozenset({"model", "input", "callBackUrl"})
@@ -91,14 +109,15 @@ class SpicyApiProvider(BaseProvider):
         self._default_max_tokens = default_max_tokens
         self._client: httpx.AsyncClient | None = None
         self._quotes: dict[str, _Quote] = {}
-        self._priced: dict[str, Decimal] = {}
+        # Price shown to the client per request key, with its monotonic time.
+        self._priced: dict[str, tuple[Decimal, float]] = {}
         self._actual_costs: dict[str, Decimal] = {}
 
     async def get_price(self, model_path: str, inputs: dict[str, Any]) -> Decimal:
         """Quote the exact job or chat. The quote is reused when the client pays."""
         payload = self._payload(model_path, inputs)
         quote = await self._quote(payload)
-        self._priced[self._cache_key(payload)] = quote.cost
+        self._remember_price(self._cache_key(payload), quote.cost)
         logger.info(
             "SpicyAPI quote for %s: $%s (%s)",
             payload["model"],
@@ -128,6 +147,10 @@ class SpicyApiProvider(BaseProvider):
         try:
             record = await self._create_task(payload, quote, wait=wait)
         except ProviderError as exc:
+            # A new quote means a new Idempotency-Key, so a create that may
+            # already have made the task is never sent again.
+            if outcome_unknown(exc):
+                raise
             if "40901" not in exc.detail and "no longer" not in exc.detail.lower():
                 raise
             logger.info("SpicyAPI quote rejected, quoting %s again", payload["model"])
@@ -137,10 +160,17 @@ class SpicyApiProvider(BaseProvider):
         return self._outcome(record)
 
     async def get_result(self, task_id: str) -> dict[str, Any]:
-        """Poll recordInfo until the task leaves queued/running."""
+        """Poll recordInfo until the task succeeds or SpicyAPI marks it failed.
+
+        The task was accepted at createTask, so only a task SpicyAPI marks
+        failed is a known failure. A task that stays missing, a rejected key
+        or a redirect is an unknown outcome: the job may still run, and bill.
+        """
         interval = self._config.poll_interval
         deadline = time.monotonic() + self._config.poll_timeout
-        not_found = 0
+        not_found = 0  # consecutive not-found answers
+        not_found_since = 0.0  # monotonic time of the first of them
+        transient = 0
 
         while time.monotonic() < deadline:
             try:
@@ -150,24 +180,77 @@ class SpicyApiProvider(BaseProvider):
                     params={"taskId": task_id},
                     request_timeout=_DEFAULT_TIMEOUT,
                     retry=False,
+                    check=False,
                 )
-            except ProviderError as exc:
-                if exc.status_code == 404 and not_found < 5:
-                    not_found += 1
-                    await self._sleep(interval)
-                    continue
-                if exc.status_code >= 500:
-                    await self._sleep(interval)
-                    continue
-                raise
+            except ProviderError:
+                # A timeout or dropped connection says nothing about the job.
+                transient += 1
+                await self._sleep(_poll_backoff(interval, transient, deadline))
+                continue
 
-            data = _envelope_data(response)
+            status = _poll_status(response)
+            if status != 404:
+                not_found = 0
+            if status == 429 or status >= 500:
+                # A rate limit or an upstream hiccup, as an HTTP status, an
+                # envelope code or a proxy's non-JSON page, says nothing about
+                # the job, which keeps running and billing. Back off and poll
+                # again; running out of time is an unknown outcome.
+                transient += 1
+                await self._sleep(_poll_backoff(interval, transient, deadline))
+                continue
+            if status == 404:
+                # A new task may not be readable yet, so a missing task counts
+                # as lost only after a grace period, as in proxy.poll_result.
+                now = time.monotonic()
+                if not not_found:
+                    not_found_since = now
+                not_found += 1
+                if not_found > _NOT_FOUND_GRACE_POLLS and now - not_found_since >= (
+                    _NOT_FOUND_GRACE_S
+                ):
+                    logger.error("SpicyAPI no longer finds task %s", task_id)
+                    raise ProviderError(
+                        provider=self.name,
+                        detail=f"SpicyAPI no longer finds task {task_id}",
+                        status_code=502,
+                    ) from UpstreamMayHaveRun(f"Task {task_id} not found")
+                await self._sleep(interval)
+                continue
+            if rejected_credentials(status):
+                logger.error("SpicyAPI rejected our key while polling task %s", task_id)
+                raise ProviderError(
+                    provider=self.name,
+                    detail=UPSTREAM_CREDENTIALS_DETAIL,
+                    status_code=502,
+                ) from UpstreamMayHaveRun(f"Poll of task {task_id} rejected our key")
+            if 300 <= status < 400:
+                # httpx does not follow redirects, so the task cannot be read.
+                raise ProviderError(
+                    provider=self.name,
+                    detail=f"SpicyAPI redirected the poll of task {task_id}",
+                    status_code=502,
+                ) from UpstreamMayHaveRun(f"Poll redirect {status}")
+            if status >= 400:
+                # Any other request error will not change on retry. It mirrors
+                # proxy.poll_result's rule for a 4xx while polling.
+                raise self._error_from_response(response)
+
+            try:
+                data = _envelope_data(response)
+            except ProviderError:
+                # A garbled 2xx says nothing about the task; ask again.
+                transient += 1
+                await self._sleep(_poll_backoff(interval, transient, deadline))
+                continue
+            transient = 0
+
             state = str(data.get("state") or "")
             if state == "succeeded":
                 self._remember_cost(task_id, data.get("cost"))
                 logger.info("SpicyAPI task %s succeeded", task_id)
                 return data
-            if state not in _PENDING_STATES:
+            if state in _FAILED_STATES:
                 self._log_terminal_failure(task_id, data)
                 raise ProviderError(
                     provider=self.name,
@@ -283,6 +366,9 @@ class SpicyApiProvider(BaseProvider):
         try:
             completion, task_id = await self._stream_chat(payload, quote)
         except ProviderError as exc:
+            # A stream cut off after output may have run, so it is never re-sent.
+            if outcome_unknown(exc):
+                raise
             if "40901" not in exc.detail and "no longer" not in exc.detail.lower():
                 raise
             logger.info("SpicyAPI chat quote rejected, quoting %s again", payload["model"])
@@ -367,7 +453,13 @@ class SpicyApiProvider(BaseProvider):
                 )
             except ProviderError:
                 return None
-            data = _envelope_data(response)
+            try:
+                data = _envelope_data(response)
+            except ProviderError:
+                # The chat already ran and billed; an unreadable record (a task
+                # not readable yet, a 5xx code, a non-JSON page) only means the
+                # quoted cost may be used instead, never a failed request.
+                data = {}
             cost = _parse_cost(data.get("cost"))
             if data.get("settled") is True and cost is not None:
                 return cost
@@ -437,14 +529,25 @@ class SpicyApiProvider(BaseProvider):
         """Reuse the price shown to the client, or quote again if it is stale.
 
         A fresh quote that costs more than the price already offered is
-        rejected, so a paid retry cannot be accepted above that amount.
+        rejected, so a paid retry cannot be accepted above that amount. A
+        request with no price on record is refused before anything runs: the
+        amount the client paid is unknown, so no quote can be checked against it.
         """
         key = self._cache_key(payload)
+        priced = self._price_for(key)
+        if priced is None:
+            raise ProviderError(
+                provider=self.name,
+                detail=(
+                    f"SpicyAPI price for {payload['model']} is no longer on record. "
+                    "Retry the request."
+                ),
+                status_code=409,
+            )
         quote = self._quotes.get(key)
         if quote is None or quote.expires_at <= time.time() + _QUOTE_SKEW_SECONDS:
             quote = await self._quote(payload)
-        priced = self._priced.get(key)
-        if priced is not None and quote.cost > priced:
+        if quote.cost > priced:
             raise ProviderError(
                 provider=self.name,
                 detail=(
@@ -483,8 +586,31 @@ class SpicyApiProvider(BaseProvider):
         )
         key = self._cache_key(payload)
         self._drop_expired(self._quotes)
+        self._quotes.pop(key, None)
+        while len(self._quotes) >= _CACHE_MAX_ENTRIES:
+            del self._quotes[next(iter(self._quotes))]
         self._quotes[key] = quote
         return quote
+
+    def _remember_price(self, key: str, cost: Decimal) -> None:
+        """Record the price shown for a request. Old and excess entries go first."""
+        now = time.monotonic()
+        # Re-inserting moves the key to the end, so dict order stays oldest first.
+        self._priced.pop(key, None)
+        while self._priced:
+            oldest = next(iter(self._priced))
+            stored_at = self._priced[oldest][1]
+            if now - stored_at <= _PRICED_TTL_SECONDS and len(self._priced) < _CACHE_MAX_ENTRIES:
+                break
+            del self._priced[oldest]
+        self._priced[key] = (cost, now)
+
+    def _price_for(self, key: str) -> Decimal | None:
+        """Return the price shown for a request, or None if it is gone or stale."""
+        entry = self._priced.get(key)
+        if entry is None or time.monotonic() - entry[1] > _PRICED_TTL_SECONDS:
+            return None
+        return entry[0]
 
     async def _create_task(
         self,
@@ -502,45 +628,73 @@ class SpicyApiProvider(BaseProvider):
         params = {"wait": wait} if wait else None
         timeout = _IMAGE_REQUEST_TIMEOUT if wait else _DEFAULT_TIMEOUT
         idempotency_key = str(uuid.uuid4())
-        response = await self._send(
+        response, may_have_run = await self._send_tracked(
             "POST",
             "/api/v1/jobs/createTask",
             json_body=request_body,
             params=params,
             request_timeout=timeout,
             extra_headers={"Idempotency-Key": idempotency_key},
+            billable=True,
         )
-        data = _envelope_data(response)
-        task_id = data.get("taskId")
+        data = self._created_record(response, may_have_run)
         logger.info(
             "SpicyAPI task %s for %s (%s)",
-            task_id or "unknown",
+            data["taskId"],
             payload["model"],
             data.get("state") or "unknown",
         )
         return data
 
-    def _outcome(self, data: dict[str, Any]) -> dict[str, Any]:
-        """Map a createTask record onto the gateway's sync or async shape."""
+    def _created_record(self, response: httpx.Response, may_have_run: str) -> dict[str, Any]:
+        """Return the task record from a 2xx createTask answer.
+
+        SpicyAPI accepted the call, so an answer without a readable task is an
+        unknown outcome: the task may exist and bill. The exception is a
+        4xx-class envelope code (40001 invalid input, 40201/40202 balance,
+        40901 stale quote): SpicyAPI uses those to refuse a job before it
+        creates one, as it does with the same codes on an HTTP 4xx, and 40901
+        must stay a known failure so submit can quote again.
+        """
+        try:
+            data = _envelope_data(response)
+        except ProviderError as exc:
+            status = _envelope_status(response)
+            if status is not None and 400 <= status < 500 and status != 429:
+                error = self._error_from_response(response)
+                if may_have_run:
+                    raise error from UpstreamMayHaveRun(may_have_run)
+                raise error from None
+            raise ProviderError(
+                provider=self.name,
+                detail=f"SpicyAPI accepted the job but its answer was unreadable: {exc.detail}",
+                status_code=502,
+            ) from UpstreamMayHaveRun(may_have_run or "Unreadable createTask answer")
         task_id = data.get("taskId")
         if not isinstance(task_id, str) or not task_id:
             raise ProviderError(
                 provider=self.name,
                 detail="SpicyAPI response missing taskId",
                 status_code=502,
-            )
+            ) from UpstreamMayHaveRun(may_have_run or "No task id in the createTask answer")
+        return data
+
+    def _outcome(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Map a createTask record onto the gateway's sync or async shape."""
+        task_id = str(data["taskId"])
         state = str(data.get("state") or "")
         if state == "succeeded":
             self._remember_cost(task_id, data.get("cost"))
             return {"data": data}
-        if state in _PENDING_STATES or not state:
-            return {"data": {"id": task_id, "status": "processing", "state": state or "queued"}}
-        self._log_terminal_failure(task_id, data)
-        raise ProviderError(
-            provider=self.name,
-            detail=_failure_detail(data),
-            status_code=502,
-        )
+        if state in _FAILED_STATES:
+            self._log_terminal_failure(task_id, data)
+            raise ProviderError(
+                provider=self.name,
+                detail=_failure_detail(data),
+                status_code=502,
+            )
+        # Pending, missing or unlisted: get_result polls until a terminal state.
+        return {"data": {"id": task_id, "status": "processing", "state": state or "queued"}}
 
     def _remember_cost(self, task_id: str, cost: Any) -> None:
         """Keep a task's settled cost until the gateway asks for it."""
@@ -570,8 +724,45 @@ class SpicyApiProvider(BaseProvider):
         request_timeout: float = _DEFAULT_TIMEOUT,
         extra_headers: dict[str, str] | None = None,
         retry: bool = True,
+        check: bool = True,
     ) -> httpx.Response:
-        """Call SpicyAPI. 5xx and timeouts retry with the same headers."""
+        """Call SpicyAPI. 5xx and timeouts retry with the same headers.
+
+        With ``check=False`` an HTTP error answer is returned, not raised.
+        """
+        response, _ = await self._send_tracked(
+            method,
+            path,
+            json_body=json_body,
+            params=params,
+            request_timeout=request_timeout,
+            extra_headers=extra_headers,
+            retry=retry,
+            check=check,
+        )
+        return response
+
+    async def _send_tracked(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
+        request_timeout: float = _DEFAULT_TIMEOUT,
+        extra_headers: dict[str, str] | None = None,
+        retry: bool = True,
+        check: bool = True,
+        billable: bool = False,
+    ) -> tuple[httpx.Response, str]:
+        """Call SpicyAPI and say why a billable call may already have run.
+
+        A billable call (createTask) retries with one Idempotency-Key. When
+        any attempt timed out or dropped after it was sent, or hit a gateway
+        timeout, the task may exist whatever the last attempt says, so a final
+        failure is chained to ``UpstreamMayHaveRun`` and the reason is
+        returned with a 2xx answer.
+        """
         url = f"{self._config.base_url.rstrip('/')}{path}"
         headers = {
             "Authorization": f"Bearer {self._config.api_key}",
@@ -583,10 +774,11 @@ class SpicyApiProvider(BaseProvider):
             headers.update(extra_headers)
 
         attempts = 1 + _MAX_RETRIES if retry else 1
-        last_error: ProviderError | None = None
+        may_have_run = ""
         client = await self._get_client()
 
         for attempt in range(attempts):
+            cause: BaseException | None = None
             try:
                 response = await client.request(
                     method,
@@ -597,42 +789,53 @@ class SpicyApiProvider(BaseProvider):
                     timeout=request_timeout,
                 )
             except httpx.TimeoutException as exc:
-                last_error = ProviderError(
+                cause = exc
+                error = ProviderError(
                     provider=self.name,
                     detail=f"SpicyAPI request timed out after {request_timeout}s",
                     status_code=504,
                 )
-                if attempt + 1 < attempts:
-                    await self._sleep(_RETRY_DELAY * (2**attempt))
-                    continue
-                raise last_error from exc
             except httpx.HTTPError as exc:
-                last_error = ProviderError(
+                cause = exc
+                error = ProviderError(
                     provider=self.name,
                     detail=f"Failed to connect to SpicyAPI: {exc}",
                     status_code=503,
                 )
-                if attempt + 1 < attempts:
-                    await self._sleep(_RETRY_DELAY * (2**attempt))
-                    continue
-                raise last_error from exc
-
-            if response.status_code < 400:
-                return response
-            if response.status_code >= 500 and attempt + 1 < attempts:
+            else:
+                status = response.status_code
+                if 200 <= status < 300 or not check:
+                    return response, may_have_run
+                if billable and status in _GATEWAY_TIMEOUT_STATUSES and not may_have_run:
+                    may_have_run = f"{path} attempt {attempt + 1}: gateway timeout {status}"
+                if status < 500:
+                    # A 3xx or 4xx will not change on retry.
+                    error = self._error_from_response(response)
+                    if may_have_run:
+                        raise error from UpstreamMayHaveRun(may_have_run)
+                    raise error
                 logger.warning(
                     "SpicyAPI %s %s returned %s (attempt %s/%s)",
                     method,
                     path,
-                    response.status_code,
+                    status,
                     attempt + 1,
                     attempts,
                 )
+                error = self._error_from_response(response)
+
+            if billable and cause is not None and outcome_unknown(cause) and not may_have_run:
+                may_have_run = f"{path} attempt {attempt + 1}: {type(cause).__name__}"
+            if attempt + 1 < attempts:
                 await self._sleep(_RETRY_DELAY * (2**attempt))
                 continue
-            raise self._error_from_response(response)
+            if may_have_run:
+                raise error from UpstreamMayHaveRun(may_have_run)
+            if cause is not None:
+                raise error from cause
+            raise error
 
-        raise last_error or ProviderError(
+        raise ProviderError(
             provider=self.name,
             detail="SpicyAPI request failed",
             status_code=502,
@@ -652,16 +855,22 @@ class SpicyApiProvider(BaseProvider):
             message = body.get("msg") or body.get("message")
             if message:
                 detail = str(message)
+        if not 400 <= status < 600:
+            # An error envelope in a 2xx or 3xx answer: use its code's status.
+            envelope = _status_class(code)
+            status = envelope if envelope is not None and 400 <= envelope < 600 else 502
         if code in (40201, 40202, "40201", "40202") or status == 402:
             return ProviderError(
                 provider=self.name,
                 detail=f"SpicyAPI account cannot accept this charge: {detail}",
                 status_code=503,
             )
-        if status == 401:
+        if rejected_credentials(status):
+            # A client reads 401/403 as its own credentials being bad, so a
+            # rejected gateway key is a 502, as in proxy.py.
             return ProviderError(
                 provider=self.name,
-                detail="SpicyAPI authentication failed",
+                detail=UPSTREAM_CREDENTIALS_DETAIL,
                 status_code=502,
             )
         if code == 40901 or code == "40901":
@@ -669,7 +878,7 @@ class SpicyApiProvider(BaseProvider):
         return ProviderError(
             provider=self.name,
             detail=detail,
-            status_code=status if 400 <= status < 600 else 502,
+            status_code=status,
         )
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -679,7 +888,9 @@ class SpicyApiProvider(BaseProvider):
 
     @staticmethod
     def _cache_key(payload: dict[str, Any]) -> str:
-        return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        # Hashed, so a large chat body is not kept in memory as a cache key.
+        text = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        return hashlib.sha256(text.encode()).hexdigest()
 
     @staticmethod
     def _drop_expired(quotes: dict[str, _Quote]) -> None:
@@ -728,6 +939,59 @@ def _envelope_data(response: httpx.Response) -> dict[str, Any]:
     return data
 
 
+def _status_class(code: Any) -> int | None:
+    """Return the HTTP-style status of a SpicyAPI envelope code, or None.
+
+    Codes are HTTP statuses (429, 500) or five digits that start with one
+    (40201 is a 402, 40901 a 409, 50001 a 500).
+    """
+    try:
+        value = int(code)
+    except (TypeError, ValueError):
+        return None
+    return value // 100 if 10_000 <= value < 100_000 else value
+
+
+def _envelope_status(response: httpx.Response) -> int | None:
+    """Return the HTTP-style status of an error envelope, or None.
+
+    None for success, no code, or a body that is not a JSON object.
+    """
+    try:
+        body = response.json()
+    except Exception:
+        return None
+    if not isinstance(body, dict) or body.get("code") in (None, 200, "200"):
+        return None
+    return _status_class(body.get("code"))
+
+
+def _envelope_transient(response: httpx.Response) -> bool:
+    """True when a 2xx body is unreadable or its envelope code is 429 or 5xx class."""
+    try:
+        body = response.json()
+    except Exception:
+        return True
+    if not isinstance(body, dict):
+        return True
+    status = _status_class(body.get("code") or 200)
+    return status is not None and (status == 429 or 500 <= status < 600)
+
+
+def _poll_status(response: httpx.Response) -> int:
+    """Return the HTTP-style status of a poll answer.
+
+    A 2xx can carry an error in its envelope code. An unreadable 2xx counts
+    as a 503, a transient hiccup that says nothing about the task.
+    """
+    status = response.status_code
+    if not 200 <= status < 300:
+        return status
+    if _envelope_transient(response):
+        return 503
+    return _envelope_status(response) or status
+
+
 def _parse_cost(value: Any) -> Decimal | None:
     if value is None or value == "":
         return None
@@ -746,6 +1010,12 @@ def _expires_at(value: Any) -> float:
         except ValueError:
             pass
     return time.time() + 240
+
+
+def _poll_backoff(interval: float, failures: int, deadline: float) -> float:
+    """Delay before the next poll after transient failures, within the deadline."""
+    delay = min(max(interval, _POLL_BACKOFF_MIN) * 2 ** (failures - 1), _POLL_BACKOFF_MAX)
+    return min(delay, max(0.0, deadline - time.monotonic()))
 
 
 def _failure_detail(data: dict[str, Any]) -> str:
@@ -777,9 +1047,14 @@ def _chat_max_tokens(body: dict[str, Any], default_max_tokens: int) -> int:
 
 
 async def _read_sse_chunks(response: httpx.Response) -> list[dict[str, Any]]:
-    """Read a jobs/stream body into JSON chunks, ignoring keepalive comments."""
+    """Read a jobs/stream body into JSON chunks, ignoring keepalive comments.
+
+    A failure before any output is a known failure. Once output has streamed,
+    SpicyAPI has billed it, so a failure from then on is an unknown outcome.
+    """
     chunks: list[dict[str, Any]] = []
     event_name = ""
+    produced = False
     async for line in response.aiter_lines():
         if line.startswith(":"):
             continue
@@ -794,33 +1069,69 @@ async def _read_sse_chunks(response: httpx.Response) -> list[dict[str, Any]]:
         try:
             payload = json.loads(data)
         except json.JSONDecodeError as exc:
+            if produced:
+                _raise_cut_off("SpicyAPI chat stream returned a non-JSON event after output")
             raise ProviderError(
                 provider="spicyapi",
                 detail="SpicyAPI chat stream returned a non-JSON event",
                 status_code=502,
             ) from exc
         if not isinstance(payload, dict):
+            if produced:
+                _raise_cut_off("SpicyAPI chat stream returned an unexpected event after output")
             raise ProviderError(
                 provider="spicyapi",
                 detail="SpicyAPI chat stream returned an unexpected event",
                 status_code=502,
             )
         if event_name == "error" or "error" in payload:
+            if produced:
+                message = _stream_error_message(payload)
+                _raise_cut_off(f"SpicyAPI chat failed after output: {message}")
             _raise_stream_error(payload)
         chunks.append(payload)
+        produced = produced or _has_output(payload)
         event_name = ""
     return chunks
 
 
-def _raise_stream_error(payload: dict[str, Any]) -> None:
-    """Turn a stream error event into ProviderError. Nothing was charged."""
+def _has_output(chunk: dict[str, Any]) -> bool:
+    """Return True when a stream chunk carries generated, billable output."""
+    for choice in chunk.get("choices") or []:
+        if not isinstance(choice, dict) or not isinstance(choice.get("delta"), dict):
+            continue
+        delta = choice["delta"]
+        if delta.get("content") or delta.get("reasoning_content") or delta.get("tool_calls"):
+            return True
+    return False
+
+
+def _raise_cut_off(detail: str) -> NoReturn:
+    """Raise for a stream that failed after output, as an unknown outcome.
+
+    The output was generated and billed, so the payment is kept. Chaining to
+    a transport error is how ``outcome_unknown()`` recognises that case.
+    """
+    raise ProviderError(provider="spicyapi", detail=detail, status_code=502) from (
+        httpx.RemoteProtocolError("SpicyAPI chat stream ended after output")
+    )
+
+
+def _stream_error_message(payload: dict[str, Any]) -> str:
+    """Return the message of a stream error event."""
     error = payload.get("error")
     if isinstance(error, dict):
         code = str(error.get("code") or "")
-        message = str(error.get("message") or code or "chat failed")
-    else:
-        code = str(payload.get("code") or "")
-        message = str(payload.get("message") or payload.get("msg") or code or "chat failed")
+        return str(error.get("message") or code or "chat failed")
+    code = str(payload.get("code") or "")
+    return str(payload.get("message") or payload.get("msg") or code or "chat failed")
+
+
+def _raise_stream_error(payload: dict[str, Any]) -> None:
+    """Turn a stream error event before any output into ProviderError."""
+    error = payload.get("error")
+    code = str((error.get("code") if isinstance(error, dict) else payload.get("code")) or "")
+    message = _stream_error_message(payload)
     client_error = code in {"content_rejected", "invalid_request", "unsupported_parameter"}
     status = 400 if client_error else 502
     raise ProviderError(provider="spicyapi", detail=message, status_code=status)
@@ -866,6 +1177,8 @@ def _completion_from_chunks(chunks: list[dict[str, Any]], model: str) -> dict[st
                 if isinstance(tool_call, dict):
                     _merge_tool_call(slot, tool_call)
     if not choices or any(slot["finish_reason"] is None for slot in choices.values()):
+        if any(_has_output(chunk) for chunk in chunks):
+            _raise_cut_off("SpicyAPI chat stream ended before the answer finished")
         raise ProviderError(
             provider="spicyapi",
             detail="SpicyAPI chat stream ended before the answer finished",

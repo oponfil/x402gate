@@ -191,6 +191,65 @@ class TestSubmit:
 
 
 # ---------------------------------------------------------------------------
+# calculate_actual_cost
+# ---------------------------------------------------------------------------
+
+
+def _mock_client(mock_cls, payload: dict) -> None:
+    """Make the patched httpx.AsyncClient return a 200 with ``payload``."""
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = payload
+    mock_client = AsyncMock()
+    mock_client.post.return_value = mock_response
+    mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+
+class TestActualCost:
+    """Actual cost follows MiniMax's own usage_characters."""
+
+    @pytest.mark.asyncio
+    async def test_uses_usage_characters(self):
+        """The billed count from extra_info prices the call, at the path model's rate."""
+        provider = _make_provider()
+        body = {"text": "Hello world"}
+        with patch("x402gate.providers.minimax.httpx.AsyncClient") as mock_cls:
+            _mock_client(
+                mock_cls,
+                {
+                    "base_resp": {"status_code": 0},
+                    "data": {"audio": b"\xff\xfb".hex()},
+                    "extra_info": {"usage_characters": 500},
+                },
+            )
+            result = await provider.submit("speech-02-turbo", body)
+
+        assert result["usage_characters"] == 500
+        cost = await provider.calculate_actual_cost(body, result)
+        assert cost == Decimal("500") / Decimal("1000") * Decimal("0.06")
+
+    @pytest.mark.asyncio
+    async def test_missing_usage_falls_back_to_estimate(self):
+        """Without usage_characters the estimate is used (None)."""
+        provider = _make_provider()
+        body = {"text": "Hello", "model": "speech-02-hd"}
+        with patch("x402gate.providers.minimax.httpx.AsyncClient") as mock_cls:
+            _mock_client(
+                mock_cls,
+                {
+                    "base_resp": {"status_code": 0},
+                    "data": {"audio": b"\xff\xfb".hex()},
+                    "extra_info": {"usage_characters": "lots"},
+                },
+            )
+            result = await provider.submit("speech-02-hd", body)
+
+        assert "usage_characters" not in result
+        assert await provider.calculate_actual_cost(body, result) is None
+
+
+# ---------------------------------------------------------------------------
 # get_result
 # ---------------------------------------------------------------------------
 

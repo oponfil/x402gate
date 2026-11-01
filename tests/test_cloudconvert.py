@@ -8,6 +8,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from x402gate.core.config import ProviderConfig
+from x402gate.core.proxy import UPSTREAM_CREDENTIALS_DETAIL
+from x402gate.providers.base import ProviderError, outcome_unknown
 from x402gate.providers.cloudconvert import CloudConvertProvider
 
 
@@ -30,6 +32,9 @@ def _make_provider(**overrides) -> CloudConvertProvider:
     return CloudConvertProvider(config=config)
 
 
+_VALID_BODY = {"output_format": "pdf", "_file_bytes": b"data", "_file_name": "a.docx"}
+
+
 class TestGetPrice:
     """Tests for CloudConvertProvider.get_price()."""
 
@@ -37,22 +42,66 @@ class TestGetPrice:
     async def test_returns_fixed_price(self):
         """Returns the configured fixed price."""
         provider = _make_provider(fixed_price_usd=0.03)
-        price = await provider.get_price("convert", {})
+        price = await provider.get_price("convert", dict(_VALID_BODY))
         assert price == Decimal("0.03")
 
     @pytest.mark.asyncio
     async def test_returns_custom_price(self):
         """Returns a custom fixed price."""
         provider = _make_provider(fixed_price_usd=0.05)
-        price = await provider.get_price("convert", {"output_format": "pdf"})
+        price = await provider.get_price("convert", dict(_VALID_BODY))
         assert price == Decimal("0.05")
 
     @pytest.mark.asyncio
     async def test_fallback_on_zero_price(self):
         """Falls back to $0.03 if fixed_price_usd is 0."""
         provider = _make_provider(fixed_price_usd=0.0)
-        price = await provider.get_price("convert", {})
+        price = await provider.get_price("convert", dict(_VALID_BODY))
         assert price == Decimal("0.03")
+
+    @pytest.mark.asyncio
+    async def test_optimize_needs_no_output_format(self):
+        """Optimize is priced without output_format, as submit() accepts it."""
+        provider = _make_provider()
+        body = {"operation": "optimize", "_file_bytes": b"%PDF-1.7"}
+        assert await provider.get_price("optimize", body) == Decimal("0.03")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("body", "match"),
+        [
+            ({"output_format": "pdf"}, "No file provided"),
+            ({"_file_bytes": b"data"}, "output_format"),
+            ({"operation": "merge", **_VALID_BODY}, "Unsupported operation"),
+            ({"output_format": "pdf", "_file_bytes": 1}, "No file provided"),
+            ({"output_format": "pdf", "_file_bytes": {"a": 1}}, "No file provided"),
+            ({"output_format": "pdf", "_file_bytes": ["x"]}, "No file provided"),
+            ({"output_format": "pdf", "_file_bytes": "text"}, "No file provided"),
+            ({**_VALID_BODY, "output_format": 1}, "output_format"),
+            ({**_VALID_BODY, "output_format": ["pdf"]}, "output_format"),
+            ({**_VALID_BODY, "input_format": 1}, "input_format"),
+        ],
+    )
+    async def test_rejects_invalid_body_before_payment(self, body, match):
+        """A body submit() would refuse is refused by get_price(), before payment."""
+        provider = _make_provider()
+        with pytest.raises(ProviderError, match=match) as exc_info:
+            await provider.get_price("convert", body)
+        assert exc_info.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_bytearray_and_empty_input_format_accepted(self):
+        """Valid requests keep working: bytearray uploads and a null input_format."""
+        provider = _make_provider()
+        body = {"output_format": "pdf", "_file_bytes": bytearray(b"data"), "input_format": None}
+        assert await provider.get_price("convert", body) == Decimal("0.03")
+
+    @pytest.mark.asyncio
+    async def test_non_string_file_name_does_not_crash(self):
+        """A non-string _file_name falls back to the default name."""
+        provider = _make_provider()
+        body = {**_VALID_BODY, "_file_name": 123}
+        assert await provider.get_price("convert", body) == Decimal("0.03")
 
 
 class TestSubmit:
@@ -255,6 +304,105 @@ class TestGetResult:
 
             with pytest.raises(Exception, match="did not complete"):
                 await provider.get_result("job_slow")
+
+
+def _response(status_code: int, payload=None, text: str = "") -> MagicMock:
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.text = text
+    if isinstance(payload, Exception):
+        resp.json.side_effect = payload
+    else:
+        resp.json.return_value = payload
+    return resp
+
+
+def _mock_client(method: str, responses: list) -> MagicMock:
+    mock_client = AsyncMock()
+    getattr(mock_client, method).side_effect = responses
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    return mock_client
+
+
+_FINISHED = {
+    "data": {
+        "id": "job_1",
+        "status": "finished",
+        "tasks": [
+            {
+                "name": "export-file",
+                "status": "finished",
+                "result": {"files": [{"url": "https://out.pdf", "filename": "out.pdf"}]},
+            }
+        ],
+    }
+}
+
+
+class TestUpstreamStatuses:
+    """Upstream statuses the client must not see as they are."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [401, 402, 403])
+    async def test_job_creation_rejected_key_is_502(self, status):
+        """An upstream 402 must not reach x402 clients as a payment request."""
+        provider = _make_provider()
+        client = _mock_client("post", [_response(status, text="Invalid API key")])
+        with (
+            patch("httpx.AsyncClient", return_value=client),
+            pytest.raises(ProviderError) as caught,
+        ):
+            await provider.submit("convert", {"output_format": "pdf", "_file_bytes": b"data"})
+        assert caught.value.status_code == 502
+        assert caught.value.detail == UPSTREAM_CREDENTIALS_DETAIL
+        assert outcome_unknown(caught.value) is False
+
+    @pytest.mark.asyncio
+    async def test_poll_rejected_key_is_502(self):
+        """The job was created with this key and may still run: keep the payment."""
+        provider = _make_provider(poll_interval=1, poll_timeout=10)
+        client = _mock_client("get", [_response(403, text="Forbidden")])
+        with (
+            patch("httpx.AsyncClient", return_value=client),
+            patch("x402gate.providers.cloudconvert.asyncio.sleep", new_callable=AsyncMock),
+            pytest.raises(ProviderError) as caught,
+        ):
+            await provider.get_result("job_1")
+        assert caught.value.status_code == 502
+        assert caught.value.detail == UPSTREAM_CREDENTIALS_DETAIL
+        assert outcome_unknown(caught.value) is True
+
+    @pytest.mark.asyncio
+    async def test_poll_rate_limit_keeps_polling(self):
+        """A 429 while polling is transient; the job keeps running."""
+        provider = _make_provider(poll_interval=1, poll_timeout=10)
+        client = _mock_client("get", [_response(429, text="Too Many"), _response(200, _FINISHED)])
+        with (
+            patch("httpx.AsyncClient", return_value=client),
+            patch("x402gate.providers.cloudconvert.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            result = await provider.get_result("job_1")
+        assert result["url"] == "https://out.pdf"
+
+    @pytest.mark.asyncio
+    async def test_poll_unreadable_body_keeps_polling(self):
+        """A garbled body must not escape get_result() as a raw exception."""
+        provider = _make_provider(poll_interval=1, poll_timeout=10)
+        client = _mock_client(
+            "get",
+            [
+                _response(200, ValueError("bad json"), text="<html>"),
+                _response(200, ["not", "a", "job"]),
+                _response(200, _FINISHED),
+            ],
+        )
+        with (
+            patch("httpx.AsyncClient", return_value=client),
+            patch("x402gate.providers.cloudconvert.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            result = await provider.get_result("job_1")
+        assert result["url"] == "https://out.pdf"
 
 
 class TestExtractResult:

@@ -77,6 +77,7 @@ x402gate estimates cost **before** payment from audio duration and the model's p
 - Audio duration is parsed from the uploaded file and rounded **up to whole seconds** (conservative estimate).
 - Minimum billing unit is **1 second** — even a 0.01 s clip is estimated as 1 s.
 - Maximum file size: **25 MB** (OpenRouter Whisper limit).
+- The header's stated length is not trusted on its own. The gateway also counts what the file actually holds (MP3 frames, FLAC frames, Ogg Opus/Vorbis/Speex packets, WAV and AIFF PCM bytes, MP4 audio-track samples) and prices the larger of the two, so a file whose header claims a shorter length than it plays is still priced in full. WAV and AIFF audio must be uncompressed PCM, whatever `input_audio.format` says: a compressed WAV or AIFF-C file (mu-law, GSM, IMA ADPCM) gets HTTP 400 before payment, as does any file that cannot be parsed.
 - Microsoft MAI models publish an hourly rate in `pricing.prompt` (`0.10`, `0.36`). Those rates are divided by 3600. Every other duration model is already priced per second.
 
 **After the request:** prepaid mode deducts `usage.cost` from OpenRouter when available; x402 mode settles the signed estimate (see [prepaid.md](prepaid.md)).
@@ -144,5 +145,5 @@ print(resp.json()["data"]["text"])
 
 - STT is part of the **OpenRouter** managed provider — same x402 and prepaid flows as chat/embeddings.
 - `max_tokens` injection (used for chat completions) does **not** apply to `audio/transcriptions` or `embeddings`.
-- WAV duration is parsed in-process; other formats use the `mutagen` library.
+- WAV duration is parsed in-process. Other formats are identified and timed with the `mutagen` library, and the gateway then counts MP3, FLAC, Ogg, AIFF and MP4 content in-process for the floor described under Pricing.
 - For real transcription quality, use meaningful audio — the config example is a minimal silent WAV for documentation only.

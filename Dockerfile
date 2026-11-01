@@ -16,6 +16,10 @@ COPY config.yaml .
 COPY .agents/skills/ .agents/skills/
 COPY x402gate/ x402gate/
 
+# Run without root rights; the app only reads its files and listens on 4021.
+RUN useradd --create-home --uid 10001 app
+USER app
+
 EXPOSE 4021
 
 CMD ["python", "-m", "x402gate.main"]

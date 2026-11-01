@@ -40,6 +40,7 @@ class YourProvider(BaseProvider):
             path="pricing",  # your pricing endpoint
             body={"model": model_path, "params": inputs},
             api_key=self._config.api_key,
+            idempotent=True,  # a price quote starts no job, so a 5xx can be retried
         )
         return Decimal(str(result["price"]))
 
@@ -107,6 +108,10 @@ Create `tests/test_your_provider.py` with mocked API responses.
 - **Synchronous providers**: If your provider returns results immediately (no polling), return the result from `submit()` and have `get_result()` raise `NotImplementedError`
 - **Custom pricing**: If your provider doesn't have a pricing API, you can hardcode prices in `get_price()` or read them from config
 - **Error mapping**: Map provider-specific error codes to `ProviderError` with appropriate HTTP status codes
+- **Validate before payment**: check the request body in `get_price()` and raise `ProviderError(..., status_code=400)`, so a request that can never succeed is refused before the client pays
+- **Retries**: `proxy_request` resends a request only when the connection never opened. Pass `idempotent=True` only for calls that start nothing (such as pricing) to also retry them on 5xx
+- **Rejected API key**: turn an upstream 401/402/403 into a 502 with `UPSTREAM_CREDENTIALS_DETAIL` (check with `rejected_credentials()`), so a 402 is not read as an x402 payment request
+- **Unknown outcome**: when a failure comes after the provider may have accepted the job (a gateway timeout, a lost task, a billed 2xx with an error), `raise ProviderError(...) from UpstreamMayHaveRun(reason)` so the payment is kept, not refunded
 
 ## Multipart/File Upload Providers
 

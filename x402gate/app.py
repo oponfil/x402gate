@@ -24,7 +24,13 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 from x402gate.core import stats
 from x402gate.core.balances import fetch_balances
 from x402gate.core.config import AppConfig, load_config
-from x402gate.core.payment import PaymentHandler
+from x402gate.core.payment import (
+    InFlightAmounts,
+    PaymentClaims,
+    PaymentHandler,
+    payment_key,
+    settlement_state,
+)
 from x402gate.core.prepaid import (
     build_signing_message,
     deposit,
@@ -59,6 +65,19 @@ logger = logging.getLogger(__name__)
 # whitespace, so clients still parse the object that follows.
 _HEARTBEAT_INTERVAL_S = 20.0
 _HEARTBEAT_PAD = b"\n" * 8192
+# A payment stays claimed this long after it settles. An RPC node that has
+# not seen the transaction yet could otherwise pass a replay through verify.
+# A Solana blockhash lives about a minute, so its claim outlives the signature.
+_BASE_CLAIM_HOLD_S = 60.0
+_SOLANA_CLAIM_HOLD_S = 180.0
+# Multipart framing (boundaries, small text fields) on top of the file limit.
+_MULTIPART_OVERHEAD_BYTES = 1024 * 1024
+_TOPUP_BODY_LIMIT_BYTES = 64 * 1024
+# Parsed JSON takes about 80 bytes per empty object, so a body made of tiny
+# containers grows 20x in memory. Real requests (base64 media, chat) have few.
+_MAX_JSON_CONTAINERS = 200_000
+# Keys the gateway adds to the body itself; a client must not supply them.
+_INTERNAL_BODY_KEYS = frozenset({"_caller", "_file_bytes", "_file_name"})
 
 
 def _error_response(
@@ -118,14 +137,15 @@ def _record_onchain_settlement(
 
 
 async def _refund_settled_payment(payer: str, amount: Decimal) -> dict[str, str]:
-    """Credit a settled Solana payment back to the payer's prepaid balance.
+    """Credit a settled x402 payment back to the payer's prepaid balance.
 
-    Used when the provider fails after an upfront Solana settlement. The
-    balance is in-memory and is lost on restart.
+    Used when the provider fails after the payment settled: Solana settles
+    before the provider call, Base settles while it runs. The balance is
+    in-memory and is lost on restart.
     """
     new_balance = await deposit(payer, amount)
     logger.warning(
-        "Solana refund: $%s credited to prepaid %s (balance: $%s)",
+        "Refund: $%s credited to prepaid %s (balance: $%s)",
         amount,
         (payer[:12] + "…") if payer else "",
         new_balance,
@@ -185,6 +205,28 @@ payment_handler: PaymentHandler
 price_cache: PriceCache
 _pending_settlements: set[asyncio.Task] = set()
 _pending_jobs: set[asyncio.Task] = set()
+payment_claims = PaymentClaims()
+base_in_flight = InFlightAmounts()
+
+
+async def _read_body_capped(request: Request, limit: int) -> bytes | None:
+    """Read the request body, or return None once it passes ``limit`` bytes.
+
+    The body is read before pricing and payment, so an unpaid client could
+    otherwise fill the memory. An out-of-memory restart wipes every prepaid
+    balance.
+    """
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > limit:
+        return None
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > limit:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _track_job(task: asyncio.Task) -> None:
@@ -443,8 +485,12 @@ async def service_info(request: Request) -> Response:
             "Transparent pay-per-request proxy for AI services via the x402 protocol. "
             "Send a POST request to any provider endpoint — if no payment header is "
             "included, a 402 response is returned with USDC payment options. "
-            "The request body format is defined by the upstream provider — "
-            "x402gate forwards it as-is. See provider_docs for API references."
+            "The request body format is defined by the upstream provider. "
+            "x402gate forwards it unchanged, except that chat requests may get caps "
+            "that keep the cost within the quote (max_tokens, provider.max_price, "
+            "web plugin limits), and options it cannot price before payment, such as "
+            "stream: true, are refused with HTTP 400 before any payment. "
+            "See provider_docs for API references."
         ),
         "payment_protocol": "x402",
         "payment_asset": "USDC",
@@ -490,8 +536,10 @@ async def ai_plugin_manifest() -> dict[str, Any]:
         "description_for_human": "Pay-per-request proxy for AI services via x402/USDC",
         "description_for_model": (
             "x402gate is a transparent payment proxy for AI services using the x402 protocol. "
-            "The request body format is defined by the upstream provider — "
-            "x402gate forwards it as-is. See the provider docs for body schema. "
+            "The request body format is defined by the upstream provider; "
+            "x402gate forwards it unchanged, except for chat cost caps (max_tokens, "
+            "provider.max_price) and HTTP 400 before payment for options it cannot "
+            "price, such as stream: true. See the provider docs for body schema. "
             f"{providers_text}. "
             "If no payment is attached, the server returns HTTP 402 with accepted payment "
             "options (scheme, network, asset, amount, pay_to address). "
@@ -590,8 +638,11 @@ async def topup(request: Request) -> Response:
     min_topup = Decimal(str(config.gateway.min_prepaid_topup))
     max_topup = Decimal(str(config.gateway.max_prepaid_topup))
 
+    raw_body = await _read_body_capped(request, _TOPUP_BODY_LIMIT_BYTES)
+    if raw_body is None:
+        return _error_response(413, "Request body too large")
     try:
-        body = await request.json()
+        body = json.loads(raw_body) if raw_body else {}
     except Exception:
         body = {}
 
@@ -801,10 +852,10 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
         in about a minute, before a long job finishes. A failed settle does
         not call the provider. If the provider fails afterwards, the amount
         is credited to the payer's prepaid balance.
-    6. Forward request to provider as-is
+    6. Forward request to provider as-is. Base: settle at the same time.
     7. If async (task_id present) → poll for result; else use response directly
-    8. Base: settle in the background after success. Solana: record revenue
-        only, because settlement already happened.
+    8. Base: return the result only if the settlement succeeded. If the
+        provider failed, a settled amount is credited to prepaid.
     9. Return result to client
     """
     provider = providers.get(provider_name)
@@ -820,12 +871,26 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
     max_upload_bytes = config.gateway.max_upload_mb * 1024 * 1024
     content_type = request.headers.get("content-type", "")
     if "multipart/form-data" in content_type:
+        declared = request.headers.get("content-length", "")
+        if declared.isdigit() and int(declared) > max_upload_bytes + _MULTIPART_OVERHEAD_BYTES:
+            return _error_response(
+                413,
+                f"Request too large. Maximum file size: {config.gateway.max_upload_mb} MB",
+            )
         try:
             form = await request.form()
             body: dict[str, Any] = {}
             for key in form:
                 value = form[key]
                 if hasattr(value, "read"):  # UploadFile
+                    # Starlette spools uploads to disk; check the size before
+                    # pulling the file into memory.
+                    if (getattr(value, "size", None) or 0) > max_upload_bytes:
+                        return _error_response(
+                            413,
+                            f"File too large ({value.size / 1024 / 1024:.1f} MB). "
+                            f"Maximum: {config.gateway.max_upload_mb} MB",
+                        )
                     file_bytes = await value.read()
                     if len(file_bytes) > max_upload_bytes:
                         return _error_response(
@@ -835,26 +900,37 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
                         )
                     body["_file_bytes"] = file_bytes
                     body["_file_name"] = getattr(value, "filename", "input_file")
-                else:
+                elif key not in _INTERNAL_BODY_KEYS:
                     body[key] = value
         except Exception:
             return _error_response(400, "Invalid multipart form data")
     else:
+        raw_body = await _read_body_capped(request, config.gateway.max_json_mb * 1024 * 1024)
+        if raw_body is None:
+            return _error_response(
+                413, f"Request body too large. Maximum: {config.gateway.max_json_mb} MB"
+            )
+        if raw_body.count(b"{") + raw_body.count(b"[") > _MAX_JSON_CONTAINERS:
+            return _error_response(413, "Request body has too many JSON objects and arrays")
         try:
-            body = await request.json()
+            body = json.loads(raw_body)
         except Exception:
             return _error_response(400, "Invalid JSON body")
         if not isinstance(body, dict):
             return _error_response(400, "JSON body must be an object")
+        for key in _INTERNAL_BODY_KEYS:
+            body.pop(key, None)
 
     # 2. Fetch price (with cache)
     try:
-        cached_price = price_cache.get(path, body)
+        # Providers share paths such as chat/completions at different prices.
+        price_key = f"{provider_name}/{path}"
+        cached_price = price_cache.get(price_key, body)
         if cached_price is not None:
             base_price = cached_price
         else:
             base_price = await provider.get_price(path, body)
-            price_cache.set(path, body, base_price)
+            price_cache.set(price_key, body, base_price)
     except ProviderError as e:
         stats.record_request(provider_name, 0, False, error_msg=e.detail)
         return _error_response(e.status_code, e.detail, provider=e.provider)
@@ -872,6 +948,8 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
     payment_network = ""
     payer = ""
     upfront_settlement: dict[str, Any] | None = None
+    base_settle: asyncio.Task[dict[str, Any] | None] | None = None
+    payment_id = ""
     prepaid_reserved: Decimal | None = None
 
     if payment_sig:
@@ -888,14 +966,32 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
                 else "Payment verification failed"
             )
             return _error_response(402, msg)
-        # EVM verify() only checks signature, not balance — check on-chain
+        # One payment buys one generation. Parallel requests with the same
+        # payment all pass verify, since nothing has landed on-chain yet.
+        payment_id = payment_key(payment_sig)
+        if not payment_claims.claim(payment_id):
+            return _error_response(
+                409,
+                "This payment is already used by another request. Sign a new payment.",
+            )
+        # The balance must also cover this payer's other Base requests that
+        # have not settled yet, each signed with its own nonce. The check runs
+        # on-chain because the provider is paid before the settlement lands.
         if payment_network.startswith("eip155:"):
-            has_funds = await payment_handler.check_evm_balance(payment_network, payer, final_price)
-            if has_funds is None:
-                verify_s = time.monotonic() - t_verify_start
-                return _error_response(503, "Payment network unavailable, retry")
+            in_flight = base_in_flight.add(payer, final_price)
+            has_funds = await payment_handler.check_evm_balance(payment_network, payer, in_flight)
             if not has_funds:
+                base_in_flight.remove(payer, final_price)
+                payment_claims.release(payment_id)
                 verify_s = time.monotonic() - t_verify_start
+                if has_funds is None:
+                    return _error_response(503, "Payment network unavailable, retry")
+                if in_flight > final_price:
+                    return _error_response(
+                        402,
+                        "Insufficient USDC balance: other payments from this wallet "
+                        "are still settling",
+                    )
                 return _error_response(402, "Insufficient USDC balance")
         verify_s = time.monotonic() - t_verify_start
     elif prepaid_pubkey:
@@ -936,79 +1032,88 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
     # Settle before the provider call so a long job cannot outlive the signature.
     if payment_sig and payment_network.startswith("solana:"):
         t_settle_start = time.monotonic()
-        upfront_settlement = await payment_handler.settle(
-            payment_sig,
-            final_price,
-            payment_network,
-            extra_context={
-                "provider_name": provider_name,
-                "estimated_cost": float(base_price),
-                "provider_cost": float(base_price),
-                "generation_s": 0.0,
-                "t_client": time.monotonic() - t_start,
-                "commission_rate": config.gateway.commission,
-                "gas_surcharge": config.gateway.gas_surcharge,
-            },
-        )
-        if not upfront_settlement or not upfront_settlement.get("success"):
-            reason = (upfront_settlement or {}).get("error_reason") or "unknown"
-            return _error_response(402, f"Payment settlement failed: {reason}")
-        _record_onchain_settlement(
-            provider_name,
-            payment_network,
-            upfront_settlement,
-            time.monotonic() - t_settle_start,
-        )
-
-    def _settle_in_background(provider_cost: Decimal, generation_s: float, t_client: float) -> None:
-        """Settle the Base authorization and log the financial summary."""
-
-        async def background_settle() -> None:
-            """Settle payment and log financial summary in background."""
-            try:
-                ctx = {
+        state = "unknown"
+        try:
+            upfront_settlement = await payment_handler.settle(
+                payment_sig,
+                final_price,
+                payment_network,
+                extra_context={
                     "provider_name": provider_name,
                     "estimated_cost": float(base_price),
-                    "provider_cost": float(provider_cost),
-                    "generation_s": generation_s,
-                    "t_client": t_client,
+                    "provider_cost": float(base_price),
+                    "generation_s": 0.0,
+                    "t_client": time.monotonic() - t_start,
                     "commission_rate": config.gateway.commission,
                     "gas_surcharge": config.gateway.gas_surcharge,
-                }
-                t_settle_start = time.monotonic()
-                settlement = await payment_handler.settle(
-                    payment_sig,
-                    final_price,
-                    payment_network,
-                    extra_context=ctx,
-                )
-                settle_latency = time.monotonic() - t_settle_start
+                },
+            )
+            state = settlement_state(upfront_settlement)
+        finally:
+            # Only a clear failure frees the payment at once. A crash or a
+            # cancel may still have broadcast the transaction.
+            payment_claims.release(payment_id, 0.0 if state == "failed" else _SOLANA_CLAIM_HOLD_S)
+        if state == "failed" or upfront_settlement is None:
+            # None means settle crashed, maybe before sending anything. The
+            # claim stays held in case the transaction went out.
+            reason = (upfront_settlement or {}).get("error_reason") or "unknown"
+            return _error_response(402, f"Payment settlement failed: {reason}")
+        if state == "unknown":
+            # Sent, but its confirmation wait failed: it most likely lands. The
+            # client gets the job. A provider failure is not credited, since
+            # the payment may never land.
+            logger.error(
+                "Solana settlement status unknown for %s; running the job anyway", provider_name
+            )
+        else:
+            _record_onchain_settlement(
+                provider_name,
+                payment_network,
+                upfront_settlement,
+                time.monotonic() - t_settle_start,
+            )
 
-                if not settlement:
-                    logger.error(
-                        "Settlement returned None for %s — check logs above", payment_network
-                    )
-                elif not settlement.get("success"):
-                    logger.error(
-                        "Settlement FAILED for %s: %s",
-                        payment_network,
-                        settlement.get("error_reason", "unknown"),
-                    )
-                else:
-                    _record_onchain_settlement(
-                        provider_name, payment_network, settlement, settle_latency
-                    )
-                    stats.record_revenue(
-                        provider_name,
-                        Decimal(str(settlement.get("amount_usdc", 0))),
-                        provider_cost,
-                    )
-            except Exception:
-                logger.exception("Background settlement crashed for %s", payment_network)
+    async def _settle_base() -> dict[str, Any] | None:
+        """Settle the Base authorization while the provider runs.
 
-        task = asyncio.create_task(background_settle())
-        _pending_settlements.add(task)
-        task.add_done_callback(_pending_settlements.discard)
+        The result goes out only after this succeeds. A payer who reuses
+        the authorization, moves the USDC or cancels it during the job
+        gets an error instead of a free result.
+        """
+        settlement: dict[str, Any] | None = None
+        t_settle_start = time.monotonic()
+        try:
+            settlement = await payment_handler.settle(
+                payment_sig,
+                final_price,
+                payment_network,
+                extra_context={
+                    "provider_name": provider_name,
+                    "estimated_cost": float(base_price),
+                    "provider_cost": float(base_price),
+                    "generation_s": 0.0,
+                    "t_client": time.monotonic() - t_start,
+                    "commission_rate": config.gateway.commission,
+                    "gas_surcharge": config.gateway.gas_surcharge,
+                },
+            )
+        finally:
+            base_in_flight.remove(payer, final_price)
+            failed = settlement_state(settlement) == "failed"
+            payment_claims.release(payment_id, 0.0 if failed else _BASE_CLAIM_HOLD_S)
+        if settlement_state(settlement) == "ok":
+            _record_onchain_settlement(
+                provider_name,
+                payment_network,
+                settlement,
+                time.monotonic() - t_settle_start,
+            )
+        return settlement
+
+    async def _base_settlement() -> dict[str, Any] | None:
+        """Wait for the Base settlement. A client that leaves does not cancel it."""
+        assert base_settle is not None
+        return await asyncio.shield(base_settle)
 
     async def _provider_error(
         status_code: int,
@@ -1022,8 +1127,9 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
 
         Funds go back only when the provider reported the failure. With
         ``keep_payment`` the outcome is unknown: the job may have run and
-        billed us, so the prepaid hold is charged, a Solana payment stays
-        settled and a Base authorization is settled.
+        billed us, so the prepaid hold is charged and a settled x402
+        payment is kept. Otherwise a settled payment goes to the payer's
+        prepaid balance. A Base settlement that failed took nothing.
         """
         if keep_payment:
             extra["outcome_unknown"] = True
@@ -1038,19 +1144,24 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
                 stats.record_prepaid_usage(provider_name, charged)
             report = _prepaid_report(remaining, charged)
             extra["prepaid"] = report
-        elif upfront_settlement is not None:
-            if keep_payment:
-                stats.record_revenue(
+        else:
+            settlement = upfront_settlement
+            if base_settle is not None:
+                settlement = await _base_settlement()
+            if settlement_state(settlement) == "unknown" and (upfront_settlement or base_settle):
+                logger.error(
+                    "%s failed and the payment status is unknown; nothing credited",
                     provider_name,
-                    Decimal(str(upfront_settlement.get("amount_usdc", 0))),
-                    base_price,
                 )
-            else:
-                extra.update(await _refund_settled_payment(payer, final_price))
-        elif keep_payment:
-            _settle_in_background(
-                base_price, time.monotonic() - t_gen_start, time.monotonic() - t_start
-            )
+            if settlement_state(settlement) == "ok":
+                if keep_payment:
+                    stats.record_revenue(
+                        provider_name,
+                        Decimal(str(settlement.get("amount_usdc", 0))),
+                        base_price,
+                    )
+                else:
+                    extra.update(await _refund_settled_payment(payer, final_price))
         response = _error_response(status_code, detail, provider=provider_label, **extra)
         if report is not None:
             response.headers.update(_prepaid_headers(report))
@@ -1076,25 +1187,51 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
             keep_payment=outcome_unknown(exc),
         )
 
-    # 6. Forward request to provider
+    async def _job_crashed(exc: Exception) -> JSONResponse:
+        """Handle an error that is not a ProviderError.
+
+        It is a gateway bug, and the provider may have run and billed the
+        job, so the outcome is unknown and the payment is kept.
+        """
+        logger.error("%s call crashed after payment", provider_name, exc_info=exc)
+        stats.record_request(
+            provider_name,
+            time.monotonic() - t_gen_start,
+            False,
+            error_msg=f"Gateway error: {type(exc).__name__}",
+        )
+        return await _provider_error(
+            502,
+            "Gateway error while handling the provider response",
+            provider_label=provider.name,
+            keep_payment=True,
+        )
+
+    # 6. Forward request to provider. Base settles at the same time.
     body["_caller"] = (prepaid_pubkey or payer or "x402")[:12]
     t_gen_start = time.monotonic()
+    if payment_sig and payment_network.startswith("eip155:"):
+        base_settle = asyncio.create_task(_settle_base())
+        _pending_settlements.add(base_settle)
+        base_settle.add_done_callback(_pending_settlements.discard)
     try:
         result = await provider.submit(path, body, prepaid=prepaid_mode)
+
+        # 7. Determine if response is async (needs polling) or sync (ready)
+        #    - Sync providers (OpenRouter, TTS, etc.) return results directly,
+        #      often in OpenAI format with "choices" or "data" (list) key
+        #    - Async providers (WaveSpeed) return {"data": {"id": ..., "status": ...}}
+        task_data = result.get("data", result)
+        is_async = (
+            isinstance(task_data, dict)
+            and "id" in task_data
+            and "status" in task_data
+            and "choices" not in result
+        )
     except ProviderError as e:
         return await _job_failed(e)
-
-    # 7. Determine if response is async (needs polling) or sync (ready)
-    #    - Sync providers (OpenRouter, TTS, etc.) return results directly,
-    #      often in OpenAI format with "choices" or "data" (list) key
-    #    - Async providers (WaveSpeed) return {"data": {"id": ..., "status": ...}}
-    task_data = result.get("data", result)
-    is_async = (
-        isinstance(task_data, dict)
-        and "id" in task_data
-        and "status" in task_data
-        and "choices" not in result
-    )
+    except Exception as e:
+        return await _job_crashed(e)
 
     async def _respond(output: Any) -> JSONResponse:
         """Settle a finished provider call and build the client response."""
@@ -1102,11 +1239,15 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
 
         # 8. Calculate actual cost (if provider supports it)
         #    x402 exact scheme requires settling the signed amount (final_price).
-        #    Actual cost is used only for Transaction Summary reporting.
+        #    Actual cost is used for dashboard revenue stats and prepaid deduction.
         #    Pass the full `result` (not `output`) so the provider can access
         #    top-level fields like "usage" -- for embeddings, output is a list
         #    and would not have .get().
-        actual_base_price = await provider.calculate_actual_cost(body, result)
+        try:
+            actual_base_price = await provider.calculate_actual_cost(body, result)
+        except Exception:
+            logger.exception("%s actual cost failed; using the estimate", provider_name)
+            actual_base_price = None
         if actual_base_price is None:
             actual_base_price = base_price  # fallback to estimate
 
@@ -1148,9 +1289,8 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
             content["prepaid"] = report
             return JSONResponse(content=content, headers=_prepaid_headers(report))
 
-        # 9. Settle. Solana already settled before the provider call.
-        t_client = time.monotonic() - t_start
-
+        # 9. Solana settled before the provider call. Base settled while it
+        #    ran: the result is withheld unless that settlement succeeded.
         if upfront_settlement is not None:
             stats.record_revenue(
                 provider_name,
@@ -1164,7 +1304,34 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
                 generation_s,
             )
         else:
-            _settle_in_background(actual_base_price, generation_s, t_client)
+            settlement = await _base_settlement()
+            state = settlement_state(settlement)
+            if state == "unknown" and settlement is not None:
+                # Sent, but its confirmation wait failed: it most likely lands,
+                # and a payer cannot cause that on purpose. The result goes out.
+                logger.error(
+                    "Base settlement status unknown for %s; returning the result", provider_name
+                )
+            elif state != "ok":
+                # A failure, or a settle that crashed (None), maybe before sending.
+                reason = (settlement or {}).get("error_reason") or "unknown"
+                logger.warning(
+                    "Withholding %s result: Base settlement failed: %s", provider_name, reason
+                )
+                stats.record_request(
+                    provider_name,
+                    generation_s,
+                    False,
+                    error_msg=f"Base settlement failed: {reason}",
+                )
+                return _error_response(402, f"Payment settlement failed: {reason}")
+            else:
+                stats.record_revenue(
+                    provider_name,
+                    Decimal(str(settlement.get("amount_usdc", 0))),
+                    actual_base_price,
+                )
+        t_client = time.monotonic() - t_start
 
         # 10. Return result to client
         stats.record_request(provider_name, generation_s, True)
@@ -1195,6 +1362,8 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
             output = await provider.get_result(task_id)
         except (TaskTimeoutError, ProviderError) as e:
             return await _job_failed(e)
+        except Exception as e:
+            return await _job_crashed(e)
         return await _respond(output)
 
     # The job runs in its own task, so a client that disconnects does not

@@ -19,6 +19,11 @@ from typing import Any
 import httpx
 
 from x402gate.core.config import ProviderConfig
+from x402gate.core.proxy import (
+    UPSTREAM_CREDENTIALS_DETAIL,
+    UpstreamMayHaveRun,
+    rejected_credentials,
+)
 from x402gate.providers.base import BaseProvider, ProviderError
 
 logger = logging.getLogger(__name__)
@@ -39,6 +44,24 @@ def _error_message(item: dict[str, Any]) -> str:
         if isinstance(value, str) and value.strip():
             return value
     return json.dumps(item, ensure_ascii=False, default=str)[:300]
+
+
+def _require_url(body: dict[str, Any], provider_name: str) -> str:
+    """Return the media URL from the request body, or raise ProviderError 400.
+
+    Shared by get_price() and submit(): get_price() runs before payment, so a
+    request without a URL is turned away before it is paid for. Any scheme is
+    allowed (schemeless links such as ``youtu.be/x`` work), but a non-string
+    or blank value can never resolve, so it is refused too.
+    """
+    url = body.get("url", "")
+    if not isinstance(url, str) or not url.strip():
+        raise ProviderError(
+            provider=provider_name,
+            detail="Request body must contain 'url' field",
+            status_code=400,
+        )
+    return url
 
 
 def _select_best_media(api_response: list[dict]) -> dict[str, Any] | None:
@@ -116,13 +139,15 @@ class SocialDownloadProvider(BaseProvider):
         """Return the configured fixed price per download.
 
         Raises:
-            ProviderError: If fixed_price_usd is not configured.
+            ProviderError: If fixed_price_usd is not configured, or 400 if
+                the body has no ``url``.
         """
         if not self._config.fixed_price_usd:
             raise ProviderError(
                 provider=self.name,
                 detail="fixed_price_usd is not configured for socialdownload",
             )
+        _require_url(inputs, self.name)
         return Decimal(str(self._config.fixed_price_usd))
 
     async def submit(
@@ -149,13 +174,7 @@ class SocialDownloadProvider(BaseProvider):
         Raises:
             ProviderError: On validation failure or API error.
         """
-        url = body.get("url", "")
-        if not url:
-            raise ProviderError(
-                provider=self.name,
-                detail="Request body must contain 'url' field",
-                status_code=400,
-            )
+        url = _require_url(body, self.name)
 
         # Call RapidAPI
         api_url = f"{self._config.base_url.rstrip('/')}/v1/social/autolink"
@@ -184,18 +203,44 @@ class SocialDownloadProvider(BaseProvider):
                 detail=f"Failed to call RapidAPI: {e}",
             ) from e
 
-        if resp.status_code >= 400:
+        if rejected_credentials(resp.status_code):
+            logger.error("RapidAPI rejected our key (%d): %s", resp.status_code, resp.text[:300])
+            raise ProviderError(provider=self.name, detail=UPSTREAM_CREDENTIALS_DETAIL)
+
+        # Only 2xx ran the call. httpx does not follow redirects, so a 3xx
+        # never reached the API and is refunded like a 4xx/5xx.
+        if not 200 <= resp.status_code < 300:
             raise ProviderError(
                 provider=self.name,
                 detail=f"RapidAPI error ({resp.status_code}): {resp.text[:300]}",
-                status_code=resp.status_code,
+                status_code=resp.status_code if resp.status_code >= 400 else 502,
             )
 
-        api_response = resp.json()
+        # From here on RapidAPI answered 2xx: the call ran and RapidAPI billed
+        # it. Every failure below is chained to UpstreamMayHaveRun so the
+        # client's payment is kept rather than refunded for a call we paid for.
+        try:
+            return self._build_result(resp.json())
+        except ProviderError as e:
+            raise e from UpstreamMayHaveRun("RapidAPI billed the call")
+        except Exception as e:
+            logger.error("Unreadable RapidAPI response: %s: %s", type(e).__name__, e)
+            raise ProviderError(
+                provider=self.name,
+                detail=f"RapidAPI returned an unreadable response: {resp.text[:300]}",
+            ) from UpstreamMayHaveRun("RapidAPI billed the call")
 
+    def _build_result(self, api_response: Any) -> dict[str, Any]:
+        """Turn a 2xx RapidAPI body into the gateway's response.
+
+        Raises:
+            ProviderError: If RapidAPI reported an error item.
+        """
         # RapidAPI returns a list; normalise if needed
         if isinstance(api_response, dict):
             api_response = [api_response]
+        if not isinstance(api_response, list):
+            raise TypeError(f"expected a list, got {type(api_response).__name__}")
 
         # Extract metadata from first item
         first = api_response[0] if api_response else {}
@@ -223,7 +268,7 @@ class SocialDownloadProvider(BaseProvider):
         logger.info(
             "SocialDownload: %s — %s (%s)",
             result.get("source", "?"),
-            result.get("title", "?")[:50],
+            str(result.get("title") or "?")[:50],
             f"{best['width']}x{best['height']}" if best and best.get("width") else "no video",
         )
 

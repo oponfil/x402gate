@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import time
@@ -32,8 +33,11 @@ from x402gate.core.svm_signer import SolanaSigner
 logger = logging.getLogger(__name__)
 
 # Cached token prices for gas cost estimation
-_price_cache: dict[str, float] = {"ethereum": 0.0, "solana": 0.0, "ts": 0.0}
+_price_cache: dict[str, float] = {"ethereum": 0.0, "solana": 0.0, "ts": 0.0, "failed_at": 0.0}
 _PRICE_TTL = 300  # 5 minutes
+# Base settles before its result goes out, so a CoinGecko outage must not
+# add its 5 s timeout to every response. A failed fetch waits this long.
+_PRICE_RETRY_AFTER_FAILURE = 60
 
 
 def _fetch_prices_sync() -> dict:
@@ -54,8 +58,14 @@ async def _refresh_prices() -> None:
         _price_cache["ethereum"] > 0 or _price_cache["solana"] > 0
     ):
         return
+    if now - _price_cache["failed_at"] < _PRICE_RETRY_AFTER_FAILURE:
+        return
     try:
         data = await asyncio.to_thread(_fetch_prices_sync)
+        if not isinstance(data, dict) or not (
+            data.get("ethereum", {}).get("usd") or data.get("solana", {}).get("usd")
+        ):
+            raise ValueError(f"no prices in response: {str(data)[:200]}")
         _price_cache["ethereum"] = data.get("ethereum", {}).get("usd", _price_cache["ethereum"])
         _price_cache["solana"] = data.get("solana", {}).get("usd", _price_cache["solana"])
         _price_cache["ts"] = now
@@ -63,6 +73,7 @@ async def _refresh_prices() -> None:
             "Prices updated: ETH=$%.2f, SOL=$%.2f", _price_cache["ethereum"], _price_cache["solana"]
         )
     except Exception as e:
+        _price_cache["failed_at"] = now
         logger.warning("Failed to fetch prices from CoinGecko: %s", e)
 
 
@@ -89,6 +100,125 @@ def _settlement_failure_reason(result: Any) -> str:
     if detail:
         return f"{error_reason}: {detail}"
     return str(error_reason)
+
+
+def _canonical_nonce(nonce: str) -> str:
+    """Return the nonce as plain lowercase hex.
+
+    The SDK reads it with ``bytes.fromhex``, which accepts an optional 0x,
+    either case and spaces, so all of those spellings are one nonce.
+    """
+    try:
+        return bytes.fromhex(nonce.strip().removeprefix("0x").removeprefix("0X")).hex()
+    except ValueError:
+        return nonce.lower()
+
+
+def payment_key(payment_signature: str) -> str:
+    """Return a stable id for one payment.
+
+    A Base authorization is identified by its payer and nonce, so re-encoding
+    the same signed authorization does not produce a new id. A Solana
+    transaction is identified by a hash of its bytes, anything else by a hash
+    of its inner payload, and an unreadable header by a hash of the header.
+    """
+    try:
+        payload_dict = json.loads(base64.b64decode(payment_signature))
+        network = str(payload_dict.get("accepted", {}).get("network", ""))
+        inner = payload_dict.get("payload", {})
+        authorization = inner.get("authorization") if isinstance(inner, dict) else None
+        if isinstance(authorization, dict) and authorization.get("nonce"):
+            payer = str(authorization.get("from", "")).lower()
+            return f"{network}:{payer}:{_canonical_nonce(str(authorization['nonce']))}"
+        transaction = inner.get("transaction") if isinstance(inner, dict) else None
+        if isinstance(transaction, str):
+            digest = hashlib.sha256(base64.b64decode(transaction)).hexdigest()
+        else:
+            digest = hashlib.sha256(json.dumps(inner, sort_keys=True).encode()).hexdigest()
+        return f"{network}:{digest}"
+    except Exception:
+        return "raw:" + hashlib.sha256(payment_signature.encode()).hexdigest()
+
+
+class PaymentClaims:
+    """Payments that a request is using right now, or used a moment ago.
+
+    One signed payment must buy one generation. Without this, the same
+    payment sent in parallel requests passes verify in all of them, because
+    nothing has landed on-chain yet. A claim lasts until the request's
+    settlement finishes. After a successful settle the claim is kept for
+    ``hold_s`` more, so an RPC node that has not seen the transaction yet
+    cannot let a replay through.
+    """
+
+    def __init__(self) -> None:
+        self._claims: dict[str, float] = {}
+
+    def claim(self, key: str) -> bool:
+        """Take the payment for this request. False if another request has it."""
+        now = time.monotonic()
+        expired = [k for k, until in self._claims.items() if until <= now]
+        for k in expired:
+            del self._claims[k]
+        if key in self._claims:
+            return False
+        self._claims[key] = float("inf")
+        return True
+
+    def release(self, key: str, hold_s: float = 0.0) -> None:
+        """Free the payment, keeping it blocked for ``hold_s`` seconds."""
+        if hold_s > 0:
+            self._claims[key] = time.monotonic() + hold_s
+        else:
+            self._claims.pop(key, None)
+
+    def clear(self) -> None:
+        """Forget every claim."""
+        self._claims.clear()
+
+
+class InFlightAmounts:
+    """USDC that each Base payer has promised to requests still settling.
+
+    Each authorization has its own nonce, so the payment claim cannot see
+    two of them drawing on one balance. Without this, a wallet holding the
+    price of one job could start many paid provider calls at once; only
+    one settlement would land.
+    """
+
+    def __init__(self) -> None:
+        self._amounts: dict[str, Decimal] = {}
+
+    def add(self, payer: str, amount: Decimal) -> Decimal:
+        """Promise ``amount`` and return the payer's total in flight."""
+        key = payer.lower()
+        total = self._amounts.get(key, Decimal("0")) + amount
+        self._amounts[key] = total
+        return total
+
+    def remove(self, payer: str, amount: Decimal) -> None:
+        """Drop a promise once its settlement has finished."""
+        key = payer.lower()
+        left = self._amounts.get(key, Decimal("0")) - amount
+        if left > 0:
+            self._amounts[key] = left
+        else:
+            self._amounts.pop(key, None)
+
+    def clear(self) -> None:
+        """Forget every promise."""
+        self._amounts.clear()
+
+
+def settlement_state(settlement: dict[str, Any] | None) -> str:
+    """Classify a settle result as "ok", "failed" or "unknown".
+
+    Unknown means the transaction may still land: settle crashed (None), or
+    it was broadcast and its confirmation wait failed (settlement_pending).
+    """
+    if settlement is None or settlement.get("pending"):
+        return "unknown"
+    return "ok" if settlement.get("success") else "failed"
 
 
 class _NetworkScheme:
@@ -394,6 +524,12 @@ class PaymentHandler:
             requirements = PaymentRequirements.model_validate(requirements_dict)
 
             result = await asyncio.to_thread(ns.scheme.settle, payload, requirements)
+            if not result.success and getattr(result, "error_reason", "") == "settlement_pending":
+                # Broadcast, but the confirmation wait failed. The SDK keeps the
+                # transaction, and settling the same payload again waits for it
+                # instead of sending a new one.
+                logger.warning("Settlement pending on %s; waiting for it once more", network)
+                result = await asyncio.to_thread(ns.scheme.settle, payload, requirements)
             amount_usdc = int(requirements.amount) / 1_000_000
             settle_data = result.__dict__.copy()
 
@@ -483,6 +619,7 @@ class PaymentHandler:
                     reason,
                 )
                 settle_data["error_reason"] = reason
+                settle_data["pending"] = getattr(result, "error_reason", "") == "settlement_pending"
             return settle_data
 
         except Exception:

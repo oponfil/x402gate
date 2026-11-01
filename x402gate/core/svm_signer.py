@@ -26,6 +26,7 @@ from solana.rpc.async_api import AsyncClient
 from solana.rpc.types import TxOpts
 from solders.commitment_config import CommitmentLevel
 from solders.keypair import Keypair
+from solders.pubkey import Pubkey
 from solders.rpc.config import RpcContextConfig
 from solders.rpc.requests import IsBlockhashValid
 from solders.rpc.responses import IsBlockhashValidResp
@@ -45,6 +46,25 @@ _BLOCKHASH_CONFIG = RpcContextConfig(commitment=CommitmentLevel.Confirmed)
 _EXPIRED_MESSAGE = (
     "Transaction expired (blockhash no longer valid); payment was not taken, sign a new payment"
 )
+
+# The client builds the transaction and the gateway pays its fee. The x402 SDK
+# verifier caps the compute-unit price at 5,000,000 microlamports but never the
+# limit, and priority fee = limit x price. These caps bound what one payment
+# can cost the fee payer.
+_COMPUTE_BUDGET_PROGRAM = Pubkey.from_string("ComputeBudget111111111111111111111111111111")
+_SET_COMPUTE_UNIT_LIMIT = 2
+_SET_COMPUTE_UNIT_PRICE = 3
+# A USDC TransferChecked plus memo uses well under 20k CU; the SDK client asks
+# for exactly 20,000.
+_MAX_COMPUTE_UNIT_LIMIT = 40_000
+# Worst case 40,000 CU x 100,000 microlamports = 4,000 lamports, below the
+# 10,000-lamport base fee the two signatures already cost. The SDK client
+# bids 1 microlamport, so legitimate clients have a wide margin.
+_MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS = 100_000
+# Fee payer + the token authority. Each extra signature adds 5,000 lamports
+# to the fee, and the SDK verifier does not count them.
+_MAX_REQUIRED_SIGNATURES = 2
+_FEE_PAYER_INDEX = 0
 
 
 class SolanaSigner:
@@ -146,6 +166,8 @@ class SolanaSigner:
         tx = VersionedTransaction.from_bytes(tx_bytes)
 
         message = tx.message
+        # Every verify and settle signs here first, so the fee bound lives here.
+        self._check_fee_budget(message)
         is_versioned = self._is_versioned_transaction(tx_bytes)
 
         msg_to_sign = bytes([0x80]) + bytes(message) if is_versioned else bytes(message)
@@ -157,6 +179,67 @@ class SolanaSigner:
 
         signed_tx = VersionedTransaction.populate(message, new_sigs)
         return base64.b64encode(bytes(signed_tx)).decode()
+
+    @staticmethod
+    def _check_fee_budget(message: Any) -> None:
+        """Refuse to sign a transaction whose fee the client inflated.
+
+        A missing SetComputeUnitLimit is refused too: the runtime default is
+        200k CU per instruction, which would multiply the price cap by up to
+        35. The SDK verifier already requires it as instruction 0.
+
+        The fee payer must not appear in any instruction's accounts. It is a
+        writable signer, so an instruction could spend its SOL (a Lighthouse
+        instruction paying rent for a new account, say), and the SDK verifier
+        never checks the accounts of the optional instructions.
+
+        Raises:
+            ValueError: The signature count, compute-unit limit or price is
+                above the gateway's caps, the limit instruction is missing, or
+                an instruction uses the fee payer.
+        """
+        signatures = message.header.num_required_signatures
+        if signatures > _MAX_REQUIRED_SIGNATURES:
+            raise ValueError(
+                f"Transaction requires {signatures} signatures, "
+                f"at most {_MAX_REQUIRED_SIGNATURES} allowed"
+            )
+
+        # The fee payer is always static key 0. The runtime rejects a key
+        # loaded twice, so a lookup table cannot bring it in under another index.
+        if any(_FEE_PAYER_INDEX in bytes(ix.accounts) for ix in message.instructions):
+            raise ValueError("Fee payer must not appear in instruction accounts")
+
+        keys = message.account_keys
+        limit: int | None = None
+        price = 0
+        for ix in message.instructions:
+            if ix.program_id_index >= len(keys):
+                continue
+            if keys[ix.program_id_index] != _COMPUTE_BUDGET_PROGRAM:
+                continue
+            data = bytes(ix.data)
+            if data[:1] == bytes([_SET_COMPUTE_UNIT_LIMIT]):
+                if len(data) < 5:
+                    raise ValueError("Malformed SetComputeUnitLimit instruction")
+                # max() so a duplicate instruction cannot hide the larger value.
+                limit = max(limit or 0, int.from_bytes(data[1:5], "little"))
+            elif data[:1] == bytes([_SET_COMPUTE_UNIT_PRICE]):
+                if len(data) < 9:
+                    raise ValueError("Malformed SetComputeUnitPrice instruction")
+                price = max(price, int.from_bytes(data[1:9], "little"))
+
+        if limit is None:
+            raise ValueError("Transaction has no SetComputeUnitLimit instruction")
+        if limit > _MAX_COMPUTE_UNIT_LIMIT:
+            raise ValueError(
+                f"Compute unit limit {limit} is above the gateway cap of {_MAX_COMPUTE_UNIT_LIMIT}"
+            )
+        if price > _MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS:
+            raise ValueError(
+                f"Compute unit price {price} microlamports is above the gateway cap of "
+                f"{_MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS}"
+            )
 
     @staticmethod
     def _is_versioned_transaction(tx_bytes: bytes) -> bool:
@@ -254,7 +337,8 @@ class SolanaSigner:
         client-visible hang. The same signed bytes are sent again while the
         status is empty. Once the blockhash is no longer valid the transaction
         cannot land, and the wait ends. A plain timeout keeps the bytes so a
-        later confirm of the same signature can still rebroadcast them.
+        later confirm of the same signature can still rebroadcast them. A
+        failed status read is logged and retried, and never counts as expiry.
         """
         sig = Signature.from_string(signature)
         start = time.monotonic()
@@ -262,7 +346,12 @@ class SolanaSigner:
 
         while time.monotonic() - start < _CONFIRM_TIMEOUT_S:
             iteration += 1
-            status = await self._read_status(sig)
+            read, status = await self._try_read_status(sig)
+            if not read:
+                # The transaction is already broadcast and usually lands, so a
+                # failed status read is retried instead of failing the settle.
+                await asyncio.sleep(_POLL_INTERVAL_S)
+                continue
             if self._apply_status(status, signature, start):
                 return
 
@@ -271,10 +360,12 @@ class SolanaSigner:
             if status is None and tx_bytes is not None and iteration % _BLOCKHASH_CHECK_EVERY == 0:
                 still_valid = await self._blockhash_still_valid(tx_bytes)
                 if still_valid is False:
-                    last = await self._read_status(sig)
-                    if self._apply_status(last, signature, start):
+                    read, last = await self._try_read_status(sig)
+                    if read and self._apply_status(last, signature, start):
                         return
-                    if last is None:
+                    # An unread status is not proof the transaction missed:
+                    # keep polling until the next check or the timeout.
+                    if read and last is None:
                         self._inflight.pop(signature, None)
                         logger.warning(
                             "Transaction %s expired before landing",
@@ -288,6 +379,14 @@ class SolanaSigner:
             await asyncio.sleep(_POLL_INTERVAL_S)
 
         raise RuntimeError(f"Transaction {signature} not confirmed within {_CONFIRM_TIMEOUT_S}s")
+
+    async def _try_read_status(self, sig: Signature) -> tuple[bool, Any]:
+        """Read the status. ``(False, None)`` means the RPC call itself failed."""
+        try:
+            return True, await self._read_status(sig)
+        except Exception as exc:
+            logger.warning("Signature status read failed, retrying: %s", exc)
+            return False, None
 
     async def _read_status(self, sig: Signature) -> Any:
         resp = await self._client.get_signature_statuses(

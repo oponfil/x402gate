@@ -1,13 +1,16 @@
-"""Solana signer rebroadcast and blockhash expiry."""
+"""Solana signer fee guard, rebroadcast and blockhash expiry."""
 
 import base64
 from types import SimpleNamespace
 
 import pytest
 from solders.commitment_config import CommitmentLevel
+from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
 from solders.hash import Hash
+from solders.instruction import AccountMeta, Instruction
 from solders.keypair import Keypair
 from solders.message import MessageV0
+from solders.pubkey import Pubkey
 from solders.rpc.config import RpcContextConfig
 from solders.rpc.requests import IsBlockhashValid
 from solders.rpc.responses import IsBlockhashValidResp
@@ -17,6 +20,8 @@ from solders.transaction import VersionedTransaction
 from x402gate.core.svm_signer import (
     _CONFIRM_RUN_TIMEOUT_S,
     _CONFIRM_TIMEOUT_S,
+    _MAX_COMPUTE_UNIT_LIMIT,
+    _MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS,
     SolanaSigner,
 )
 
@@ -37,6 +42,148 @@ def _signed_transfer() -> tuple[bytes, str, str]:
     raw = bytes(transaction)
     encoded = base64.b64encode(raw).decode()
     return raw, encoded, str(transaction.signatures[0])
+
+
+_SDK_CU_LIMIT = 20_000
+_SDK_CU_PRICE = 1
+
+
+def _client_payment(
+    fee_payer: Keypair,
+    *,
+    cu_limit: int | None = _SDK_CU_LIMIT,
+    cu_price: int = _SDK_CU_PRICE,
+    extra_signer: Keypair | None = None,
+    extra_instruction: Instruction | None = None,
+) -> str:
+    """A client-built payment with the SDK client's compute-budget layout.
+
+    The fee payer is account 0 and the client signs the transfer, so the
+    gateway's signature fills slot 0 just as in a real settle.
+    """
+    client = Keypair()
+    instructions = []
+    if cu_limit is not None:
+        instructions.append(set_compute_unit_limit(cu_limit))
+    instructions.append(set_compute_unit_price(cu_price))
+    instructions.append(
+        transfer(TransferParams(from_pubkey=client.pubkey(), to_pubkey=client.pubkey(), lamports=1))
+    )
+    signers = [fee_payer, client]
+    if extra_signer is not None:
+        # A memo that demands one more signature, which the fee payer pays for.
+        instructions.append(
+            Instruction(
+                Pubkey.from_string("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"),
+                b"x",
+                [AccountMeta(extra_signer.pubkey(), is_signer=True, is_writable=False)],
+            )
+        )
+        signers.append(extra_signer)
+    if extra_instruction is not None:
+        instructions.append(extra_instruction)
+    message = MessageV0.try_compile(
+        payer=fee_payer.pubkey(),
+        instructions=instructions,
+        address_lookup_table_accounts=[],
+        recent_blockhash=Hash.default(),
+    )
+    return base64.b64encode(bytes(VersionedTransaction(message, signers))).decode()
+
+
+def _fee_signer(fee_payer: Keypair) -> SolanaSigner:
+    signer = SolanaSigner.__new__(SolanaSigner)
+    signer._keypair = fee_payer
+    return signer
+
+
+class TestFeeGuard:
+    """The gateway pays the fee, so it refuses transactions that inflate it."""
+
+    def _sign(self, fee_payer: Keypair, encoded: str) -> str:
+        return _fee_signer(fee_payer).sign_transaction(
+            encoded, str(fee_payer.pubkey()), "solana:mainnet"
+        )
+
+    def test_sdk_client_transaction_is_signed(self) -> None:
+        fee_payer = Keypair()
+        signed = self._sign(fee_payer, _client_payment(fee_payer))
+
+        tx = VersionedTransaction.from_bytes(base64.b64decode(signed))
+        assert tx.signatures[0] == fee_payer.sign_message(bytes([0x80]) + bytes(tx.message))
+
+    def test_caps_are_accepted(self) -> None:
+        fee_payer = Keypair()
+        encoded = _client_payment(
+            fee_payer,
+            cu_limit=_MAX_COMPUTE_UNIT_LIMIT,
+            cu_price=_MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS,
+        )
+
+        self._sign(fee_payer, encoded)
+
+    def test_worst_case_priority_fee_stays_below_the_base_fee(self) -> None:
+        priority_lamports = _MAX_COMPUTE_UNIT_LIMIT * _MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS
+        assert priority_lamports // 1_000_000 < 10_000
+        assert _MAX_COMPUTE_UNIT_LIMIT >= 2 * _SDK_CU_LIMIT
+
+    def test_huge_compute_unit_limit_is_refused(self) -> None:
+        fee_payer = Keypair()
+        encoded = _client_payment(fee_payer, cu_limit=1_400_000)
+
+        with pytest.raises(ValueError, match="Compute unit limit 1400000"):
+            self._sign(fee_payer, encoded)
+
+    def test_huge_compute_unit_price_is_refused(self) -> None:
+        fee_payer = Keypair()
+        # The SDK verifier's own cap; still far above the gateway's.
+        encoded = _client_payment(fee_payer, cu_price=5_000_000)
+
+        with pytest.raises(ValueError, match="Compute unit price 5000000"):
+            self._sign(fee_payer, encoded)
+
+    def test_missing_compute_unit_limit_is_refused(self) -> None:
+        fee_payer = Keypair()
+        encoded = _client_payment(fee_payer, cu_limit=None)
+
+        with pytest.raises(ValueError, match="no SetComputeUnitLimit"):
+            self._sign(fee_payer, encoded)
+
+    def test_extra_signature_is_refused(self) -> None:
+        fee_payer = Keypair()
+        encoded = _client_payment(fee_payer, extra_signer=Keypair())
+
+        with pytest.raises(ValueError, match="requires 3 signatures"):
+            self._sign(fee_payer, encoded)
+
+    def test_fee_payer_in_optional_instruction_is_refused(self) -> None:
+        fee_payer = Keypair()
+        # The SDK verifier allows Lighthouse here without checking accounts;
+        # with the fee payer as a writable signer it could pay rent from it.
+        lighthouse = Instruction(
+            Pubkey.from_string("L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95"),
+            b"\x00",
+            [
+                AccountMeta(fee_payer.pubkey(), is_signer=True, is_writable=True),
+                AccountMeta(Keypair().pubkey(), is_signer=False, is_writable=True),
+            ],
+        )
+        encoded = _client_payment(fee_payer, extra_instruction=lighthouse)
+
+        with pytest.raises(ValueError, match="Fee payer must not appear"):
+            self._sign(fee_payer, encoded)
+
+    def test_fee_payer_as_readonly_memo_account_is_refused(self) -> None:
+        fee_payer = Keypair()
+        memo = Instruction(
+            Pubkey.from_string("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"),
+            b"x",
+            [AccountMeta(fee_payer.pubkey(), is_signer=False, is_writable=False)],
+        )
+        encoded = _client_payment(fee_payer, extra_instruction=memo)
+
+        with pytest.raises(ValueError, match="Fee payer must not appear"):
+            self._sign(fee_payer, encoded)
 
 
 def _status(confirmation_status=None, err=None):  # noqa: ANN001
@@ -61,6 +208,9 @@ class _Rpc:
         _ = signatures, search_transaction_history
         item = self._statuses.pop(0) if self._statuses else None
         self.events.append("status")
+        # An exception in the script stands for one failed RPC call.
+        if isinstance(item, Exception):
+            raise item
         return SimpleNamespace(value=[item])
 
     async def send_raw_transaction(self, txn, opts=None):  # noqa: ANN001
@@ -266,6 +416,90 @@ class TestSolanaConfirm:
         await signer._confirm_async(signature)
 
         assert _sends(rpc) == []
+        assert signer._inflight == {}
+        assert clock["t"] < 60
+
+
+class TestTransientStatusErrors:
+    """A failed status read is retried, since the broadcast usually lands."""
+
+    async def test_status_rpc_error_is_retried(self, clock: dict[str, float]) -> None:
+        _raw, encoded, signature = _signed_transfer()
+        rpc = _Rpc(
+            [
+                ConnectionError("rpc down"),
+                ConnectionError("rpc down"),
+                _status(confirmation_status="confirmed"),
+            ]
+        )
+        signer = _signer(rpc)
+        await signer._send_async(encoded)
+
+        await signer._confirm_async(signature)
+
+        assert rpc.events.count("status") == 3
+        assert signer._inflight == {}
+        assert clock["t"] < 60
+
+    async def test_status_rpc_error_on_expiry_recheck_is_not_expiry(
+        self, clock: dict[str, float]
+    ) -> None:
+        raw, encoded, signature = _signed_transfer()
+        # Iteration 3 finds the blockhash dead, but the re-read fails. The next
+        # poll then sees the transaction confirmed.
+        rpc = _Rpc(
+            [
+                None,
+                None,
+                None,
+                ConnectionError("rpc down"),
+                _status(confirmation_status="confirmed"),
+            ],
+            blockhash_result=False,
+        )
+        signer = _signer(rpc)
+        await signer._send_async(encoded)
+
+        await signer._confirm_async(signature)
+
+        check_at = next(
+            index
+            for index, event in enumerate(rpc.events)
+            if isinstance(event, tuple) and event[0] == "check"
+        )
+        assert not any(
+            isinstance(event, tuple) and event[0] == "send" for event in rpc.events[check_at + 1 :]
+        )
+        assert all(payload == raw for _, payload, _ in _sends(rpc))
+        assert signer._inflight == {}
+        assert clock["t"] < 60
+
+    async def test_status_rpc_down_until_timeout_is_not_expiry(
+        self, clock: dict[str, float]
+    ) -> None:
+        raw, encoded, signature = _signed_transfer()
+        rpc = _Rpc([ConnectionError("rpc down")] * 100, blockhash_result=False)
+        signer = _signer(rpc)
+        await signer._send_async(encoded)
+
+        with pytest.raises(RuntimeError, match="not confirmed within 120s") as raised:
+            await signer._confirm_async(signature)
+
+        assert "expired" not in str(raised.value)
+        assert signer._inflight[signature][0] == raw
+        assert clock["t"] >= _CONFIRM_TIMEOUT_S
+
+    async def test_failed_transaction_still_fails_after_a_read_error(
+        self, clock: dict[str, float]
+    ) -> None:
+        _raw, encoded, signature = _signed_transfer()
+        rpc = _Rpc([ConnectionError("rpc down"), _status(err="InstructionError")])
+        signer = _signer(rpc)
+        await signer._send_async(encoded)
+
+        with pytest.raises(RuntimeError, match="Transaction failed: InstructionError"):
+            await signer._confirm_async(signature)
+
         assert signer._inflight == {}
         assert clock["t"] < 60
 

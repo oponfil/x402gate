@@ -59,9 +59,10 @@ If you need deep technical details on specific features:
 - **x402 Protocol Specification:** [x402.org](https://x402.org)
 
 ## 5. Key Agent Rules
-- **Pay on success**: If the provider reports a failure, you are not charged: a Base payment is never settled, and a Solana payment is credited to your prepaid balance. If the outcome is unknown (a timeout, or a dropped connection to the provider), the payment is kept and the error says `"outcome_unknown": true`.
+- **Pay on success**: If the provider reports a failure, your settled payment (Base or Solana) is credited to your prepaid balance. On Base the result is returned only after your payment lands. Use a fresh payment for every request: reusing one that another request is still using returns HTTP 409. On Base, parallel requests from one wallet must be covered together: if the wallet's USDC balance is below the sum of its unsettled payments, the extra requests get HTTP 402 "Insufficient USDC balance: other payments from this wallet are still settling". Wait for earlier requests to finish, or use prepaid mode. If the outcome is unknown (a timeout, a dropped connection to the provider, a gateway timeout 504/520/524 on submit, or a job the provider accepted and then lost), the payment is kept and the error says `"outcome_unknown": true`. SocialDownload is charged even when RapidAPI cannot download the URL (unsupported or private), because RapidAPI bills every call it answers, so check the URL before you send it.
 - **Do not invent endpoints**: Always refer to the discovery manifest (`GET /`).
 - **File Uploads**: For `cloudconvert`, use standard `multipart/form-data`. For OpenRouter STT, send JSON with base64-encoded audio in `input_audio.data`.
+- **Chat (OpenRouter, NanoGPT)**: Do not stream; `stream: true` returns HTTP 400. Always set `model`. Options the gateway cannot price before payment (non-text output, file or video parts, plugins other than `web`, native web search, NanoGPT memory or priority tiers) also return HTTP 400 before any payment, so read the error and resend without them.
 
 ## Tips
 

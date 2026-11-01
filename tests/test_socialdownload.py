@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from x402gate.core.config import ProviderConfig
-from x402gate.providers.base import ProviderError
+from x402gate.core.proxy import UPSTREAM_CREDENTIALS_DETAIL
+from x402gate.providers.base import ProviderError, outcome_unknown
 from x402gate.providers.socialdownload import (
     SocialDownloadProvider,
     _select_best_media,
@@ -138,15 +140,32 @@ class TestGetPrice:
     async def test_returns_fixed_price(self):
         """Returns the configured fixed price."""
         provider = _make_provider(fixed_price_usd=0.005)
-        price = await provider.get_price("download", {})
+        price = await provider.get_price("download", {"url": "https://youtu.be/x"})
         assert price == Decimal("0.005")
+
+    @pytest.mark.asyncio
+    async def test_accepts_schemeless_url(self):
+        """A link without a scheme is still priced; RapidAPI resolves it."""
+        provider = _make_provider(fixed_price_usd=0.005)
+        assert await provider.get_price("download", {"url": "youtu.be/x"}) == Decimal("0.005")
 
     @pytest.mark.asyncio
     async def test_raises_if_price_not_configured(self):
         """Raises ProviderError if fixed_price_usd is 0."""
         provider = _make_provider(fixed_price_usd=0.0)
         with pytest.raises(Exception, match="fixed_price_usd is not configured"):
-            await provider.get_price("download", {})
+            await provider.get_price("download", {"url": "https://youtu.be/x"})
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "body", [{}, {"url": ""}, {"url": "   "}, {"url": 123}, {"url": ["x"]}, {"url": {"a": 1}}]
+    )
+    async def test_rejects_missing_url_before_payment(self, body):
+        """A body without a url is refused by get_price(), before payment."""
+        provider = _make_provider()
+        with pytest.raises(ProviderError, match="'url' field") as exc_info:
+            await provider.get_price("download", body)
+        assert exc_info.value.status_code == 400
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +271,8 @@ class TestSubmit:
                 await provider.submit("download", {"url": "https://www.youtube.com/watch?v=test"})
 
         assert exc_info.value.detail == expected
+        # RapidAPI answered 200, so it ran and billed the call: keep the payment.
+        assert outcome_unknown(exc_info.value) is True
 
     @pytest.mark.asyncio
     async def test_submit_no_suitable_media(self):
@@ -278,6 +299,80 @@ class TestSubmit:
             )
 
         assert "best_media" not in result
+
+
+@contextmanager
+def _rapidapi_answers(response: MagicMock):
+    """Patch RapidAPI to answer with ``response``."""
+    with patch("x402gate.providers.socialdownload.httpx.AsyncClient") as mock_cls:
+        mock_client = AsyncMock()
+        mock_client.post.return_value = response
+        mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+        yield
+
+
+class TestBilling:
+    """Which failures refund the client and which keep the payment."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [401, 402, 403])
+    async def test_rejected_key_is_502_and_refunded(self, status):
+        """An upstream 402 must not reach x402 clients as a payment request."""
+        response = MagicMock(status_code=status, text="Invalid API key")
+        with _rapidapi_answers(response), pytest.raises(ProviderError) as caught:
+            await _make_provider().submit("download", {"url": "https://x.com/a/status/1"})
+        assert caught.value.status_code == 502
+        assert caught.value.detail == UPSTREAM_CREDENTIALS_DETAIL
+        assert outcome_unknown(caught.value) is False
+
+    @pytest.mark.asyncio
+    async def test_error_status_is_refunded(self):
+        response = MagicMock(status_code=429, text="Too Many Requests")
+        with _rapidapi_answers(response), pytest.raises(ProviderError) as caught:
+            await _make_provider().submit("download", {"url": "https://x.com/a/status/1"})
+        assert caught.value.status_code == 429
+        assert outcome_unknown(caught.value) is False
+
+    @pytest.mark.asyncio
+    async def test_redirect_is_refunded(self):
+        """httpx does not follow redirects, so a 3xx never ran the call."""
+        response = MagicMock(status_code=307, text="")
+        with _rapidapi_answers(response), pytest.raises(ProviderError) as caught:
+            await _make_provider().submit("download", {"url": "https://x.com/a/status/1"})
+        assert caught.value.status_code == 502
+        assert outcome_unknown(caught.value) is False
+        response.json.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "body",
+        [
+            ValueError("Expecting value"),
+            "just a string",
+            [None],
+            [{"medias": {"not": "a list"}}],
+        ],
+    )
+    async def test_unreadable_success_body_keeps_the_payment(self, body):
+        """A 200 we cannot parse still ran, and was billed, at RapidAPI."""
+        response = MagicMock(status_code=200, text="garbled")
+        if isinstance(body, Exception):
+            response.json.side_effect = body
+        else:
+            response.json.return_value = body
+        with _rapidapi_answers(response), pytest.raises(ProviderError) as caught:
+            await _make_provider().submit("download", {"url": "https://x.com/a/status/1"})
+        assert "unreadable response" in caught.value.detail
+        assert outcome_unknown(caught.value) is True
+
+    @pytest.mark.asyncio
+    async def test_null_title_does_not_fail(self):
+        response = MagicMock(status_code=200)
+        response.json.return_value = [{"title": None, "source": "x", "medias": []}]
+        with _rapidapi_answers(response):
+            result = await _make_provider().submit("download", {"url": "https://x.com/a/status/1"})
+        assert result["title"] is None
 
 
 # ---------------------------------------------------------------------------

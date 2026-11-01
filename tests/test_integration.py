@@ -22,6 +22,7 @@ import x402gate.app as gateway
 from tests.helpers import make_wav_b64
 from x402gate.app import _pending_settlements, app, providers
 from x402gate.core.config import load_config as real_load
+from x402gate.core.payment import payment_key
 from x402gate.core.prepaid import deposit, get_balance, reset
 from x402gate.core.pricing import apply_commission
 from x402gate.core.proxy import TaskTimeoutError
@@ -103,6 +104,9 @@ def client(config_file):
         patch("x402gate.app.fetch_balances", new=AsyncMock(return_value={})),
     ):
         mock_load.return_value = real_load(config_file)
+        # Tests reuse the same fake payment header across requests.
+        gateway.payment_claims.clear()
+        gateway.base_in_flight.clear()
 
         with TestClient(app) as c:
             yield c
@@ -917,43 +921,55 @@ class TestSolanaUpfrontSettlement:
         assert response.content.startswith(b"\n")
         assert response.json()["data"]["outputs"][0].endswith("clip.mp4")
 
+
+class TestBaseParallelSettlement:
+    """Base settles while the provider runs, and the result waits for it."""
+
     @respx.mock
-    def test_evm_provider_runs_before_settle(self, client):
-        """Base still calls the provider before any settlement."""
+    def test_settles_once_and_returns_result(self, client):
+        """Settle starts with the provider call; a settled job returns 200."""
         reset()
         _price_ok()
-        seen: dict[str, int] = {}
-
-        def on_submit(request):
-            seen["settle_at_submit"] = mock_ph.settle.await_count
-            return httpx.Response(200, json={"outputs": ["ok"]})
-
-        respx.post(WAVESPEED_SUBMIT).mock(side_effect=on_submit)
-        before = set(_pending_settlements)
+        respx.post(WAVESPEED_SUBMIT).mock(
+            return_value=httpx.Response(200, json={"outputs": ["ok"]})
+        )
 
         with patch("x402gate.app.payment_handler") as mock_ph:
             _paid_handler(mock_ph, EVM_NETWORK, "0xPayer")
             mock_ph.settle = AsyncMock(return_value=_settled_ok("ETH"))
             response = _post_wavespeed(client)
 
-            async def _drain() -> None:
-                pending = [task for task in list(_pending_settlements) if not task.done()]
-                if pending:
-                    await asyncio.wait(pending, timeout=2)
-
-            portal = getattr(client, "portal", None)
-            if portal is not None:
-                portal.call(_drain)
-            new_tasks = _pending_settlements - before
-
         assert response.status_code == 200
-        assert seen["settle_at_submit"] == 0
-        assert "refunded_to_prepaid" not in response.json()
-        assert mock_ph.settle.await_count == 1 or new_tasks
+        assert response.json()["data"] == {"outputs": ["ok"]}
+        assert mock_ph.settle.await_count == 1
+        expected = apply_commission(Decimal("0.003"), 0.04, 0.001)
+        assert mock_ph.settle.await_args.args[1] == expected
+        assert mock_ph.settle.await_args.args[2] == EVM_NETWORK
 
     @respx.mock
-    def test_evm_provider_error_does_not_settle_or_refund(self, client):
-        """A Base provider error leaves the authorization unsettled."""
+    def test_failed_settle_withholds_result(self, client):
+        """A payer who moved the USDC during the job gets a 402, not the result."""
+        reset()
+        _price_ok()
+        respx.post(WAVESPEED_SUBMIT).mock(
+            return_value=httpx.Response(200, json={"outputs": ["secret"]})
+        )
+
+        with patch("x402gate.app.payment_handler") as mock_ph:
+            _paid_handler(mock_ph, EVM_NETWORK, "0xPayer")
+            mock_ph.settle = AsyncMock(
+                return_value={"success": False, "error_reason": "insufficient_funds"}
+            )
+            response = _post_wavespeed(client)
+
+        assert response.status_code == 402
+        assert "insufficient_funds" in response.json()["error"]
+        assert "secret" not in response.text
+        assert "data" not in response.json()
+
+    @respx.mock
+    def test_provider_error_after_settle_refunds_prepaid(self, client):
+        """A known provider failure credits the settled Base payment to prepaid."""
         reset()
         _price_ok()
         respx.post(WAVESPEED_SUBMIT).mock(return_value=httpx.Response(400, text="bad prompt"))
@@ -963,10 +979,294 @@ class TestSolanaUpfrontSettlement:
             mock_ph.settle = AsyncMock(return_value=_settled_ok("ETH"))
             response = _post_wavespeed(client)
 
+        expected = apply_commission(Decimal("0.003"), 0.04, 0.001)
+        assert response.status_code == 502
+        assert response.json()["refunded_to_prepaid"] == str(expected)
+        assert get_balance("0xpayer") == expected
+
+    @respx.mock
+    def test_provider_error_with_failed_settle_refunds_nothing(self, client):
+        """No settlement, no refund: the payer kept the USDC."""
+        reset()
+        _price_ok()
+        respx.post(WAVESPEED_SUBMIT).mock(return_value=httpx.Response(400, text="bad prompt"))
+
+        with patch("x402gate.app.payment_handler") as mock_ph:
+            _paid_handler(mock_ph, EVM_NETWORK, "0xPayer")
+            mock_ph.settle = AsyncMock(
+                return_value={"success": False, "error_reason": "invalid_signature"}
+            )
+            response = _post_wavespeed(client)
+
         assert response.status_code == 502
         assert "refunded_to_prepaid" not in response.json()
-        assert mock_ph.settle.await_count == 0
         assert get_balance("0xPayer") == 0
+
+    @respx.mock
+    def test_payment_in_use_is_rejected(self, client):
+        """A payment another request is using gets a 409 and no provider call."""
+        reset()
+        _price_ok()
+        submit = respx.post(WAVESPEED_SUBMIT).mock(
+            return_value=httpx.Response(200, json={"outputs": ["ok"]})
+        )
+        gateway.payment_claims.claim(payment_key("fake-sig"))
+
+        with patch("x402gate.app.payment_handler") as mock_ph:
+            _paid_handler(mock_ph, EVM_NETWORK, "0xPayer")
+            mock_ph.settle = AsyncMock(return_value=_settled_ok("ETH"))
+            response = _post_wavespeed(client)
+
+        assert response.status_code == 409
+        assert not submit.called
+        assert mock_ph.settle.await_count == 0
+
+    @respx.mock
+    def test_settled_payment_cannot_be_replayed_at_once(self, client):
+        """Right after a settle the same payment is still claimed."""
+        reset()
+        _price_ok()
+        submit = respx.post(WAVESPEED_SUBMIT).mock(
+            return_value=httpx.Response(200, json={"outputs": ["ok"]})
+        )
+
+        with patch("x402gate.app.payment_handler") as mock_ph:
+            _paid_handler(mock_ph, EVM_NETWORK, "0xPayer")
+            mock_ph.settle = AsyncMock(return_value=_settled_ok("ETH"))
+            first = _post_wavespeed(client)
+            second = _post_wavespeed(client)
+
+        assert first.status_code == 200
+        assert second.status_code == 409
+        assert submit.call_count == 1
+
+    @respx.mock
+    def test_failed_settle_frees_the_payment(self, client):
+        """A payment whose settle clearly failed can be sent again."""
+        reset()
+        _price_ok()
+        respx.post(WAVESPEED_SUBMIT).mock(
+            return_value=httpx.Response(200, json={"outputs": ["ok"]})
+        )
+
+        with patch("x402gate.app.payment_handler") as mock_ph:
+            _paid_handler(mock_ph, EVM_NETWORK, "0xPayer")
+            mock_ph.settle = AsyncMock(
+                side_effect=[
+                    {"success": False, "error_reason": "insufficient_funds"},
+                    _settled_ok("ETH"),
+                ]
+            )
+            first = _post_wavespeed(client)
+            second = _post_wavespeed(client)
+
+        assert first.status_code == 402
+        assert second.status_code == 200
+
+    @respx.mock
+    def test_unexpected_error_keeps_the_payment(self, client):
+        """A gateway bug after payment is an unknown outcome: no refund."""
+        reset()
+        _price_ok()
+
+        with (
+            patch("x402gate.app.payment_handler") as mock_ph,
+            patch.object(providers["wavespeed"], "submit", AsyncMock(side_effect=KeyError("boom"))),
+        ):
+            _paid_handler(mock_ph, EVM_NETWORK, "0xPayer")
+            mock_ph.settle = AsyncMock(return_value=_settled_ok("ETH"))
+            response = _post_wavespeed(client)
+
+        assert response.status_code == 502
+        assert response.json()["outcome_unknown"] is True
+        assert "refunded_to_prepaid" not in response.json()
+        assert mock_ph.settle.await_count == 1
+
+
+class TestBaseSettlementEdgeCases:
+    """Pending settlements and many payments drawing on one balance."""
+
+    @respx.mock
+    def test_pending_settlement_still_returns_result(self, client):
+        """A broadcast whose confirmation wait failed most likely lands."""
+        reset()
+        _price_ok()
+        respx.post(WAVESPEED_SUBMIT).mock(
+            return_value=httpx.Response(200, json={"outputs": ["ok"]})
+        )
+
+        with patch("x402gate.app.payment_handler") as mock_ph:
+            _paid_handler(mock_ph, EVM_NETWORK, "0xPayer")
+            mock_ph.settle = AsyncMock(
+                return_value={
+                    "success": False,
+                    "pending": True,
+                    "error_reason": "settlement_pending",
+                }
+            )
+            response = _post_wavespeed(client)
+            replay = _post_wavespeed(client)
+
+        assert response.status_code == 200
+        assert replay.status_code == 409
+
+    @respx.mock
+    def test_crashed_settle_withholds_result_and_keeps_claim(self, client):
+        """A settle that crashed (None) withholds the result but holds the payment."""
+        reset()
+        _price_ok()
+        respx.post(WAVESPEED_SUBMIT).mock(
+            return_value=httpx.Response(200, json={"outputs": ["secret"]})
+        )
+
+        with patch("x402gate.app.payment_handler") as mock_ph:
+            _paid_handler(mock_ph, EVM_NETWORK, "0xPayer")
+            mock_ph.settle = AsyncMock(return_value=None)
+            response = _post_wavespeed(client)
+            replay = _post_wavespeed(client)
+
+        assert response.status_code == 402
+        assert "secret" not in response.text
+        assert replay.status_code == 409
+
+    @respx.mock
+    def test_pending_settlement_on_provider_failure_credits_nothing(self, client):
+        """An unconfirmed payment is not credited when the provider fails."""
+        reset()
+        _price_ok()
+        respx.post(WAVESPEED_SUBMIT).mock(return_value=httpx.Response(400, text="bad prompt"))
+
+        with patch("x402gate.app.payment_handler") as mock_ph:
+            _paid_handler(mock_ph, EVM_NETWORK, "0xPayer")
+            mock_ph.settle = AsyncMock(
+                return_value={"success": False, "pending": True, "error_reason": "x"}
+            )
+            response = _post_wavespeed(client)
+
+        assert response.status_code == 502
+        assert "refunded_to_prepaid" not in response.json()
+        assert get_balance("0xPayer") == 0
+
+    @respx.mock
+    def test_balance_must_cover_payments_still_settling(self, client):
+        """A second nonce from the same wallet counts what the first has promised."""
+        reset()
+        _price_ok()
+        submit = respx.post(WAVESPEED_SUBMIT).mock(
+            return_value=httpx.Response(200, json={"outputs": ["ok"]})
+        )
+        price = apply_commission(Decimal("0.003"), 0.04, 0.001)
+        gateway.base_in_flight.add("0xPAYER", price)
+
+        with patch("x402gate.app.payment_handler") as mock_ph:
+            _paid_handler(mock_ph, EVM_NETWORK, "0xPayer")
+
+            async def balance(network, payer, amount):
+                return amount <= price
+
+            mock_ph.check_evm_balance = AsyncMock(side_effect=balance)
+            mock_ph.settle = AsyncMock(return_value=_settled_ok("ETH"))
+            response = _post_wavespeed(client)
+
+        assert response.status_code == 402
+        assert "still settling" in response.json()["error"]
+        assert mock_ph.check_evm_balance.await_args.args[2] == price * 2
+        assert not submit.called
+        # The rejected request takes back its own promise only.
+        gateway.base_in_flight.remove("0xpayer", price)
+        assert gateway.base_in_flight.add("0xpayer", Decimal("0")) == 0
+
+    @respx.mock
+    def test_in_flight_amount_is_released_after_settle(self, client):
+        """Once a settle finishes, the wallet's promise is gone."""
+        reset()
+        _price_ok()
+        respx.post(WAVESPEED_SUBMIT).mock(
+            return_value=httpx.Response(200, json={"outputs": ["ok"]})
+        )
+
+        with patch("x402gate.app.payment_handler") as mock_ph:
+            _paid_handler(mock_ph, EVM_NETWORK, "0xPayer")
+            mock_ph.settle = AsyncMock(return_value=_settled_ok("ETH"))
+            response = _post_wavespeed(client)
+
+        assert response.status_code == 200
+        assert gateway.base_in_flight.add("0xpayer", Decimal("0")) == 0
+
+    @respx.mock
+    def test_solana_pending_settlement_runs_the_job(self, client):
+        """A Solana transaction that was sent but not confirmed still runs."""
+        reset()
+        _price_ok()
+        submit = respx.post(WAVESPEED_SUBMIT).mock(
+            return_value=httpx.Response(200, json={"outputs": ["ok"]})
+        )
+
+        with patch("x402gate.app.payment_handler") as mock_ph:
+            _paid_handler(mock_ph, SOLANA_NETWORK, SOL_PAYER)
+            mock_ph.settle = AsyncMock(
+                return_value={"success": False, "pending": True, "error_reason": "x"}
+            )
+            response = _post_wavespeed(client)
+
+        assert response.status_code == 200
+        assert submit.called
+
+
+class TestRequestLimits:
+    """Bodies are bounded and prices are cached per provider."""
+
+    def test_json_body_over_limit_is_rejected(self, client):
+        """A JSON body above max_json_mb is a 413 before pricing."""
+        limit = gateway.config.gateway.max_json_mb
+        gateway.config.gateway.max_json_mb = 1
+        try:
+            response = client.post(
+                "/v1/wavespeed/wavespeed-ai/flux-dev",
+                content=b'{"prompt": "' + b"a" * (1024 * 1024 + 10) + b'"}',
+                headers={"content-type": "application/json"},
+            )
+        finally:
+            gateway.config.gateway.max_json_mb = limit
+        assert response.status_code == 413
+
+    def test_json_body_of_tiny_containers_is_rejected(self, client):
+        """A small body that would parse into millions of objects is a 413."""
+        body = b'{"a": [' + b"{}," * 200_001 + b"{}]}"
+        response = client.post(
+            "/v1/wavespeed/wavespeed-ai/flux-dev",
+            content=body,
+            headers={"content-type": "application/json"},
+        )
+        assert response.status_code == 413
+
+    def test_client_cannot_supply_internal_keys(self, client):
+        """_file_bytes sent in JSON or as a form text field is dropped, not priced."""
+        response = client.post(
+            "/v1/cloudconvert/convert",
+            json={"output_format": "pdf", "_file_bytes": "fake", "_file_name": "a.txt"},
+        )
+        assert response.status_code == 400
+        assert "No file provided" in response.json()["error"]
+
+        response = client.post(
+            "/v1/cloudconvert/convert",
+            data={"output_format": "pdf", "_file_bytes": "fake"},
+            files={"other": ("x.txt", b"", "text/plain")},
+        )
+        assert response.status_code == 400
+
+    @respx.mock
+    def test_price_cache_is_per_provider(self, client):
+        """A cached price under the bare path is not used for this provider."""
+        _price_ok()
+        gateway.price_cache.set("wavespeed-ai/flux-dev", {"prompt": "a cat"}, Decimal("0"))
+        gateway.price_cache.set("other/wavespeed-ai/flux-dev", {"prompt": "a cat"}, Decimal("0"))
+
+        response = client.post("/v1/wavespeed/wavespeed-ai/flux-dev", json={"prompt": "a cat"})
+
+        assert response.status_code == 402
+        assert response.json()["accepts"][0]["price"] == "$0.004120"
 
 
 class TestTopupSettlesBeforeCredit:

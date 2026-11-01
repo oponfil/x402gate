@@ -18,9 +18,70 @@ from typing import Any
 import httpx
 
 from x402gate.core.config import ProviderConfig
+from x402gate.core.proxy import (
+    UPSTREAM_CREDENTIALS_DETAIL,
+    TaskTimeoutError,
+    UpstreamMayHaveRun,
+    rejected_credentials,
+)
 from x402gate.providers.base import BaseProvider, ProviderError
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_body(body: dict[str, Any], provider_name: str) -> tuple[str, Any, Any, str]:
+    """Check the request fields and return (operation, output_format, file_bytes, file_name).
+
+    Shared by get_price() and submit(): get_price() runs before payment, so a
+    request that could never be converted is turned away before it is paid for.
+
+    Raises:
+        ProviderError: 400 on an unsupported operation, a convert without a
+            string ``output_format``, a non-string ``input_format``, or no
+            uploaded file.
+    """
+    operation = body.get("operation", "convert")
+    if operation not in ("convert", "optimize"):
+        raise ProviderError(
+            provider=provider_name,
+            detail=f"Unsupported operation '{operation}'. Use 'convert' or 'optimize'.",
+            status_code=400,
+        )
+
+    output_format = body.get("output_format")
+    if operation == "convert" and (not output_format or not isinstance(output_format, str)):
+        raise ProviderError(
+            provider=provider_name,
+            detail="'output_format' is required for convert (e.g. 'pdf', 'png', 'mp4')",
+            status_code=400,
+        )
+
+    # submit() forwards input_format only when it is set; a non-string one
+    # (JSON bodies only, multipart fields are always strings) cannot succeed.
+    input_format = body.get("input_format")
+    if input_format and not isinstance(input_format, str):
+        raise ProviderError(
+            provider=provider_name,
+            detail="'input_format' must be a string (e.g. 'docx', 'jpg')",
+            status_code=400,
+        )
+
+    # Only a multipart upload yields bytes. A JSON body can set _file_bytes to
+    # anything, which would crash or fail in submit() after payment.
+    file_bytes = body.get("_file_bytes")
+    if not isinstance(file_bytes, (bytes, bytearray)) or not file_bytes:
+        raise ProviderError(
+            provider=provider_name,
+            detail="No file provided. Send file as multipart/form-data.",
+            status_code=400,
+        )
+
+    # A non-string name (only possible from a hand-written JSON body) would
+    # crash the extension logging in submit() after payment.
+    file_name = body.get("_file_name", "input_file")
+    if not isinstance(file_name, str):
+        file_name = "input_file"
+    return operation, output_format, file_bytes, file_name
 
 
 class CloudConvertProvider(BaseProvider):
@@ -40,7 +101,12 @@ class CloudConvertProvider(BaseProvider):
 
         CloudConvert uses credit-based pricing with no per-request pricing API,
         so we charge a flat rate configured via fixed_price_usd.
+
+        Raises:
+            ProviderError: 400 if the request could not be converted (see
+                ``_validate_body``).
         """
+        _validate_body(inputs, self.name)
         price = Decimal(str(self._config.fixed_price_usd))
         if price <= 0:
             price = Decimal("0.03")
@@ -65,30 +131,7 @@ class CloudConvertProvider(BaseProvider):
         Returns:
             Dict with "id" and "status" keys for polling.
         """
-        operation = body.get("operation", "convert")
-        if operation not in ("convert", "optimize"):
-            raise ProviderError(
-                provider=self.name,
-                detail=f"Unsupported operation '{operation}'. Use 'convert' or 'optimize'.",
-                status_code=400,
-            )
-
-        output_format = body.get("output_format")
-        if operation == "convert" and not output_format:
-            raise ProviderError(
-                provider=self.name,
-                detail="'output_format' is required for convert (e.g. 'pdf', 'png', 'mp4')",
-                status_code=400,
-            )
-
-        file_bytes = body.get("_file_bytes")
-        file_name = body.get("_file_name", "input_file")
-        if not file_bytes:
-            raise ProviderError(
-                provider=self.name,
-                detail="No file provided. Send file as multipart/form-data.",
-                status_code=400,
-            )
+        operation, output_format, file_bytes, file_name = _validate_body(body, self.name)
 
         # Log file details for debugging OPEN_FAILED issues
         ext = file_name.rsplit(".", 1)[-1] if "." in file_name else "(none)"
@@ -147,6 +190,12 @@ class CloudConvertProvider(BaseProvider):
                         "Content-Type": "application/json",
                     },
                 )
+
+            if rejected_credentials(resp.status_code):
+                logger.error(
+                    "CloudConvert rejected our key (%d): %s", resp.status_code, resp.text[:200]
+                )
+                raise ProviderError(provider=self.name, detail=UPSTREAM_CREDENTIALS_DETAIL)
 
             if resp.status_code >= 400:
                 raise ProviderError(
@@ -253,7 +302,8 @@ class CloudConvertProvider(BaseProvider):
                         headers={"Authorization": f"Bearer {self._config.api_key}"},
                     )
 
-                    if resp.status_code >= 500:
+                    if resp.status_code >= 500 or resp.status_code == 429:
+                        # Transient: the job keeps running, so keep polling.
                         logger.warning(
                             "CloudConvert job %s poll #%d: HTTP %d after %ds",
                             task_id,
@@ -261,6 +311,18 @@ class CloudConvertProvider(BaseProvider):
                             resp.status_code,
                             elapsed,
                         )
+                    elif rejected_credentials(resp.status_code):
+                        logger.error(
+                            "CloudConvert job %s poll rejected our key (%d): %s",
+                            task_id,
+                            resp.status_code,
+                            resp.text[:200],
+                        )
+                        # The job was created and uploaded with this key and
+                        # may still run upstream, so the payment is kept.
+                        raise ProviderError(
+                            provider=self.name, detail=UPSTREAM_CREDENTIALS_DETAIL
+                        ) from UpstreamMayHaveRun(f"Poll of job {task_id} rejected our key")
                     elif resp.status_code >= 400:
                         raise ProviderError(
                             provider=self.name,
@@ -268,7 +330,7 @@ class CloudConvertProvider(BaseProvider):
                             status_code=resp.status_code,
                         )
                     else:
-                        job = resp.json().get("data", resp.json())
+                        job = self._parse_job(resp)
                         status = job.get("status", "")
 
                         if status == "finished":
@@ -322,9 +384,24 @@ class CloudConvertProvider(BaseProvider):
                 await asyncio.sleep(poll_interval)
                 elapsed += poll_interval
 
-        from x402gate.core.proxy import TaskTimeoutError
-
         raise TaskTimeoutError(task_id=task_id, timeout=poll_timeout)
+
+    @staticmethod
+    def _parse_job(resp: httpx.Response) -> dict[str, Any]:
+        """Return the job from a poll response, or {} when the body is unreadable.
+
+        A garbled answer says nothing about the job, so polling goes on
+        instead of an exception escaping get_result().
+        """
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = None
+        job = payload.get("data", payload) if isinstance(payload, dict) else None
+        if not isinstance(job, dict):
+            logger.warning("CloudConvert poll returned an unreadable body: %s", resp.text[:200])
+            return {}
+        return job
 
     @staticmethod
     def _extract_result(job: dict[str, Any]) -> dict[str, Any]:

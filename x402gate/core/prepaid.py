@@ -34,6 +34,17 @@ _timestamp_window: int = 300  # default, overridden from config
 USD_STEP = Decimal("0.00000001")
 
 
+def _key(pubkey: str) -> str:
+    """Return the balance key for a wallet.
+
+    EVM addresses are case-insensitive hex, and clients send them both
+    checksummed and lowercase. Solana base58 keys are case-sensitive.
+    """
+    if pubkey[:2].lower() == "0x":
+        return pubkey.lower()
+    return pubkey
+
+
 def format_usd(amount: Decimal) -> str:
     """Format a prepaid amount as plain decimal text, rounded down to USD_STEP.
 
@@ -56,6 +67,7 @@ async def deposit(pubkey: str, amount: Decimal) -> Decimal:
     Returns:
         New total balance.
     """
+    pubkey = _key(pubkey)
     async with _lock:
         current = _balances.get(pubkey, Decimal("0"))
         new_balance = current + amount
@@ -79,6 +91,7 @@ async def deduct(pubkey: str, amount: Decimal) -> bool:
     Returns:
         True if deduction succeeded, False if insufficient funds.
     """
+    pubkey = _key(pubkey)
     async with _lock:
         current = _balances.get(pubkey, Decimal("0"))
         if current < amount:
@@ -108,6 +121,7 @@ async def reserve(pubkey: str, amount: Decimal) -> bool:
     """
     if amount < 0:
         return False
+    pubkey = _key(pubkey)
     async with _lock:
         current = _balances.get(pubkey, Decimal("0"))
         if current < amount:
@@ -144,6 +158,7 @@ async def release(pubkey: str, reserved: Decimal, actual: Decimal) -> tuple[Deci
         actual = Decimal("0")
     charged = min(actual, reserved).quantize(USD_STEP, rounding=ROUND_DOWN)
     refund = reserved - charged
+    pubkey = _key(pubkey)
     async with _lock:
         current = _balances.get(pubkey, Decimal("0"))
         new_balance = current + refund
@@ -167,7 +182,7 @@ def get_balance(pubkey: str) -> Decimal:
     Returns:
         Current balance in USD (0 if unknown).
     """
-    return _balances.get(pubkey, Decimal("0"))
+    return _balances.get(_key(pubkey), Decimal("0"))
 
 
 def get_total_balance() -> Decimal:

@@ -128,7 +128,7 @@ If the client disconnects during a long job, the job still finishes and is charg
 
 **Long jobs:** a polled job that runs longer than 20 seconds is kept open with whitespace heartbeats. Its headers go out with the first heartbeat, before the cost is known, so that response has no `X-Prepaid-*` headers and the cost is **only in the body**. The HTTP status is already 200 by then. A failure shows up as the usual error JSON, with `status` and `prepaid`. Reading the body is the reliable way for every request.
 
-The `prepaid` object appears only on prepaid requests. Do not confuse it with `refunded_to_prepaid` and `prepaid_balance`: those appear on a failed **x402 Solana** payment, when the settled amount is credited to the payer's prepaid balance.
+The `prepaid` object appears only on prepaid requests. Do not confuse it with `refunded_to_prepaid` and `prepaid_balance`: those appear on a failed **x402** payment (Base or Solana), when the settled amount is credited to the payer's prepaid balance.
 
 ### Signing Message Format
 
@@ -217,5 +217,5 @@ print(response.json())
 - **In-memory storage only** — balances are lost on server restart
 - **Top-up limits** — min $0.10, max $10 (configurable in config.yaml)
 - **No cash-out** — prepaid balances cannot be withdrawn back to USDC
-- **Solana job refunds** — if a Solana payment was settled up front and the provider then reports a failure, the amount is credited to that wallet's prepaid balance. It is still in-memory and lost on restart. This is not an on-chain refund
+- **x402 job refunds** — if a Base or Solana payment settled and the provider then reports a failure, the amount is credited to that wallet's prepaid balance. It is still in-memory and lost on restart. This is not an on-chain refund
 - **No multi-server** — balances are local to a single server instance

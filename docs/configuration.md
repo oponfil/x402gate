@@ -17,10 +17,11 @@ x402gate is configured via `config.yaml` in the project root. Secrets are stored
 | `gas_surcharge` | float | `0.001` | Fixed gas surcharge ($0.001) added per request |
 | `default_max_tokens` | int | `2048` | Default `max_tokens` for OpenRouter and NanoGPT chat when the client omits it. Applied in both x402 and prepaid mode |
 | `web_search_tokens_per_result` | int | `2048` | Estimated extra input tokens per web search result |
-| `default_web_search_max_results` | int | `3` | Default `max_results` for web search plugins when client omits it |
+| `default_web_search_max_results` | int | `3` | Default `max_results` for the OpenRouter web plugin when the client omits it or sends a value that is not a positive integer. Client values above 10 are capped at 10, and the plugin is always sent with `engine: "exa"` |
 | `web_search_cost_per_result` | float | `0.004` | Fixed cost per web search result ($0.004, OpenRouter Exa: $4/1000) |
 | `price_cache_ttl` | int | `60` | Price cache TTL in seconds. `0` = disabled |
 | `max_upload_mb` | int | `300` | Maximum file upload size in MB (all in RAM, no disk on Railway) |
+| `max_json_mb` | int | `40` | Maximum JSON request body in MB (fits 25 MB of base64 STT audio). Bodies are read before payment, so larger ones, or ones with more than 200,000 JSON objects and arrays, get HTTP 413 |
 | `max_prepaid_topup` | float | `10.0` | Maximum single top-up amount in USD |
 | `min_prepaid_topup` | float | `0.10` | Minimum single top-up amount in USD |
 | `prepaid_timestamp_window` | int | `300` | Signature validity window in seconds (checked on arrival, covers large uploads) |

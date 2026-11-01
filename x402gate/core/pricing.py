@@ -16,12 +16,17 @@ from typing import Any
 class PriceCache:
     """Simple TTL cache for pricing lookups.
 
-    Keys are (model_id, inputs_hash) tuples. Expired entries are
-    lazily evicted on the next get/set call.
+    Keys are (model_id, inputs_hash) tuples. The caller puts the provider
+    name into ``model_id``: two providers can share a path such as
+    ``chat/completions`` with very different prices.
+
+    Unpaid requests fill the cache too, so it is bounded. Once it holds
+    ``max_entries`` keys, expired entries are dropped, then the oldest.
     """
 
-    def __init__(self, ttl: int = 60) -> None:
+    def __init__(self, ttl: int = 60, max_entries: int = 10_000) -> None:
         self._ttl = ttl
+        self._max_entries = max_entries
         self._store: dict[str, tuple[Decimal, float]] = {}
 
     @staticmethod
@@ -58,7 +63,20 @@ class PriceCache:
         if self._ttl <= 0:
             return
         key = self._make_key(model_id, inputs)
-        self._store[key] = (price, time.monotonic())
+        now = time.monotonic()
+        # Re-inserting moves the key to the end, so dict order stays oldest first.
+        self._store.pop(key, None)
+        if len(self._store) >= self._max_entries:
+            self._evict(now)
+        self._store[key] = (price, now)
+
+    def _evict(self, now: float) -> None:
+        """Drop expired entries, then the oldest ones, to make room."""
+        expired = [key for key, (_, stored) in self._store.items() if now - stored > self._ttl]
+        for key in expired:
+            del self._store[key]
+        while len(self._store) >= self._max_entries:
+            del self._store[next(iter(self._store))]
 
     def clear(self) -> None:
         """Remove all entries from the cache."""
