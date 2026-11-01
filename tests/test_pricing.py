@@ -1,6 +1,9 @@
 """Unit tests for pricing logic."""
 
+import hashlib
+import json
 from decimal import Decimal
+from unittest.mock import patch
 
 from x402gate.core.pricing import PriceCache, apply_commission, format_price_for_x402
 
@@ -135,3 +138,51 @@ class TestPriceCacheBound:
         cache.set("p/a", {"x": 3}, Decimal("3"))
         assert cache.get("p/a", {"x": 1}) == Decimal("1")
         assert cache.get("p/a", {"x": 2}) is None
+
+
+class TestPriceCacheKey:
+    """A request hashes its body once and reuses the key."""
+
+    def test_key_round_trip(self):
+        cache = PriceCache(ttl=60)
+        key = cache.key("p/a", {"prompt": "cat"})
+        cache.set_by_key(key, Decimal("0.5"))
+        assert cache.get_by_key(key) == Decimal("0.5")
+        # The dict wrappers use the same key.
+        assert cache.get("p/a", {"prompt": "cat"}) == Decimal("0.5")
+
+    def test_disabled_cache_does_not_hash(self):
+        """With TTL 0 no key is computed, so a large upload is never hashed."""
+        cache = PriceCache(ttl=0)
+        with patch("x402gate.core.pricing.hashlib.sha256") as sha:
+            key = cache.key("p/a", {"_file_bytes": b"x" * 10})
+        assert key is None
+        sha.assert_not_called()
+        cache.set_by_key(key, Decimal("1"))
+        assert cache.get_by_key(key) is None
+
+    def test_file_is_hashed_once_per_key(self):
+        cache = PriceCache(ttl=60)
+        upload = {"_file_bytes": b"audio" * 1000, "model": "m"}
+        with patch("x402gate.core.pricing.hashlib.sha256", wraps=hashlib.sha256) as sha:
+            key = cache.key("p/stt", upload)
+            cache.get_by_key(key)
+            cache.set_by_key(key, Decimal("1"))
+        # One for the file, one for the small JSON around it.
+        assert sha.call_count == 2
+
+    def test_raw_body_key(self):
+        """Equal raw bytes share a price; any byte difference does not."""
+        cache = PriceCache(ttl=60)
+        raw = json.dumps({"prompt": "cat"}).encode()
+        cache.set_by_key(cache.key("p/a", {"prompt": "cat"}, raw), Decimal("2"))
+        assert cache.get_by_key(cache.key("p/a", {"prompt": "cat"}, raw)) == Decimal("2")
+        assert cache.get_by_key(cache.key("p/a", {}, raw + b" ")) is None
+        assert cache.get_by_key(cache.key("p/b", {"prompt": "cat"}, raw)) is None
+        # Raw keys and parsed-body keys never share an entry.
+        assert cache.get("p/a", {"prompt": "cat"}) is None
+
+    def test_raw_key_is_short(self):
+        key = PriceCache._make_key("p/a", {}, b'{"image": "' + b"A" * 100_000 + b'"}')
+        assert "AAAA" not in key
+        assert len(key) < 80

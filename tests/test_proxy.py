@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
+from x402gate.core import http
 from x402gate.core.proxy import (
     UPSTREAM_CREDENTIALS_DETAIL,
     ProxyError,
@@ -31,7 +32,10 @@ async def _send(post: AsyncMock, *, idempotent: bool = False) -> dict:
 
 
 async def _poll(get: AsyncMock, *, poll_interval: int = 2, poll_timeout: int = 60):
-    """Run poll_result against mocked responses; return (result or error, sleeps)."""
+    """Run poll_result against mocked responses; return (result or error, sleeps).
+
+    The sleeps leave out the short pause before the first poll.
+    """
     sleep = AsyncMock()
     with (
         patch("httpx.AsyncClient.get", get),
@@ -43,8 +47,9 @@ async def _poll(get: AsyncMock, *, poll_interval: int = 2, poll_timeout: int = 6
             )
         except (ProxyError, TaskTimeoutError) as exc:
             outcome = exc
-    # The first sleep is the fixed pause before the first poll.
-    return outcome, [call.args[0] for call in sleep.await_args_list[1:]]
+    sleeps = [call.args[0] for call in sleep.await_args_list]
+    assert sleeps[0] == pytest.approx(0.3)
+    return outcome, sleeps[1:]
 
 
 def _status(status: str, **extra) -> httpx.Response:
@@ -169,8 +174,9 @@ class TestPollResult:
         outcome, sleeps = await _poll(get, poll_timeout=20)
         assert isinstance(outcome, TaskTimeoutError)
         assert outcome_unknown(outcome) is True
-        # The last wait is cut short at the deadline.
-        assert sum(sleeps) == 20
+        # The last wait is cut short at the deadline (0.3 s went before the first poll).
+        assert sum(sleeps) == pytest.approx(20 - 0.3)
+        assert get.call_count == 3
 
     async def test_not_found_right_after_creation_is_tolerated(self):
         get = AsyncMock(
@@ -197,9 +203,10 @@ class TestPollResult:
         outcome, sleeps = await _poll(get)
         assert isinstance(outcome, ProxyError)
         assert outcome.status_code == 502
-        # Given up only once 20s have passed since the first 404.
-        assert sum(sleeps) == 20
-        assert get.call_count == 11
+        # Given up at the first poll 20s after the first 404, not before.
+        assert sum(sleeps) >= 20
+        assert sum(sleeps[:-1]) < 20
+        assert get.call_count == len(sleeps) + 1
         assert outcome_unknown(outcome) is True
 
     async def test_failed_task_is_a_known_failure(self):
@@ -244,3 +251,71 @@ class TestPollResult:
         )
         result, _ = await _poll(get)
         assert result["status"] == "completed"
+
+
+class TestPollSpeed:
+    """Short jobs are seen finished soon after they finish."""
+
+    async def test_first_poll_is_soon_and_gaps_grow_to_poll_interval(self):
+        get = AsyncMock(side_effect=[_status("processing")] * 6 + [_status("completed")])
+        result, sleeps = await _poll(get, poll_interval=2)
+        assert result["status"] == "completed"
+        assert sleeps == pytest.approx([0.4, 0.6, 0.9, 1.35, 2, 2])
+
+    async def test_early_gaps_never_exceed_a_short_poll_interval(self):
+        get = AsyncMock(side_effect=[_status("processing")] * 4 + [_status("completed")])
+        _, sleeps = await _poll(get, poll_interval=1)
+        assert sleeps == pytest.approx([0.4, 0.6, 0.9, 1])
+
+    async def test_rate_limit_backs_off_from_the_full_interval(self):
+        """Early fast polls do not shorten the 429 backoff."""
+        get = AsyncMock(
+            side_effect=[_status("processing"), httpx.Response(429, text="slow down")]
+            + [_status("completed")]
+        )
+        _, sleeps = await _poll(get, poll_interval=2)
+        assert sleeps == pytest.approx([0.4, 4])
+
+    async def test_short_timeout_still_ends_on_time(self):
+        get = AsyncMock(return_value=_status("processing"))
+        outcome, sleeps = await _poll(get, poll_timeout=1)
+        assert isinstance(outcome, TaskTimeoutError)
+        assert 0.3 + sum(sleeps) == pytest.approx(1)
+
+
+class TestPooledClient:
+    """Calls reuse the shared pooled client instead of opening one each."""
+
+    async def test_no_client_is_opened_per_call(self):
+        http.shared_client()  # the pool exists before the calls
+        post = AsyncMock(return_value=httpx.Response(200, json=CREATED))
+        get = AsyncMock(return_value=_status("completed"))
+        with (
+            patch.object(httpx.AsyncClient, "__init__", side_effect=AssertionError("new client")),
+            patch("httpx.AsyncClient.post", post),
+            patch("httpx.AsyncClient.get", get),
+            patch("x402gate.core.proxy.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            await proxy_request(BASE_URL, "wavespeed-ai/flux-dev", {"prompt": "x"}, "key")
+            await proxy_request(BASE_URL, "wavespeed-ai/flux-dev", {"prompt": "y"}, "key")
+            await poll_result(BASE_URL, "t1", "key")
+        assert not http.shared_client().is_closed
+
+    async def test_request_timeout_keeps_the_short_connect_limit(self):
+        post = AsyncMock(return_value=httpx.Response(200, json=CREATED))
+        with patch("httpx.AsyncClient.post", post):
+            await proxy_request(
+                BASE_URL, "wavespeed-ai/flux-dev", {"prompt": "x"}, "key", request_timeout=120
+            )
+        timeout = post.await_args.kwargs["timeout"]
+        assert timeout.read == 120
+        assert timeout.connect == http.CONNECT_TIMEOUT_S
+
+    async def test_pool_timeout_is_resent(self):
+        """Waiting for a free pooled connection sends nothing."""
+        post = AsyncMock(
+            side_effect=[httpx.PoolTimeout("pool full"), httpx.Response(200, json=CREATED)]
+        )
+        result = await _send(post)
+        assert post.call_count == 2
+        assert result["data"]["id"] == "t1"

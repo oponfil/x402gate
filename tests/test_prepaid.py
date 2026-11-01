@@ -274,6 +274,48 @@ class TestEvmSignatureVerification:
         )
 
 
+class TestEvmBackend:
+    """EVM checks run on libsecp256k1 (coincurve) and give the same answers."""
+
+    def test_coincurve_backend_is_active(self):
+        """eth_keys picks coincurve up; without it a check takes 3 ms, not 0.1 ms."""
+        from eth_keys.backends import CoinCurveECCBackend, get_backend
+
+        assert isinstance(get_backend(), CoinCurveECCBackend)
+
+    def test_backends_recover_the_same_signer(self):
+        """The native and coincurve backends agree on valid and broken signatures."""
+        import random
+
+        from eth_account import Account
+        from eth_account.messages import _hash_eip191_message, encode_defunct
+        from eth_keys import KeyAPI
+        from eth_keys.backends import CoinCurveECCBackend, NativeECCBackend
+        from eth_keys.datatypes import Signature
+
+        rng = random.Random(7)
+        message = encode_defunct(b"x402gate:openrouter/chat/completions:1700000000")
+        msg_hash = _hash_eip191_message(message)
+
+        def recover(backend, raw: bytes) -> str:
+            try:
+                signature = Signature(raw[:64] + bytes([raw[64] - 27]))
+                return KeyAPI(backend).ecdsa_recover(msg_hash, signature).to_checksum_address()
+            except Exception as exc:
+                return type(exc).__name__
+
+        native, fast = NativeECCBackend(), CoinCurveECCBackend()
+        for i in range(40):
+            acct = Account.from_key(bytes([i + 1]) * 32)
+            raw = bytearray(acct.sign_message(message).signature)
+            if i % 2:
+                raw[rng.randrange(64)] ^= 1 << rng.randrange(8)
+            assert recover(native, bytes(raw)) == recover(fast, bytes(raw))
+            if i % 2 == 0:
+                assert recover(fast, bytes(raw)) == acct.address
+                assert verify_wallet_signature(acct.address, bytes(raw).hex(), message.body)
+
+
 class TestEvmAddressCase:
     """EVM balances do not depend on how the address is capitalized."""
 

@@ -10,15 +10,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-import time
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import httpx
 
+from x402gate.core import http
 from x402gate.core.config import ProviderConfig
 from x402gate.providers.base import BaseProvider, ProviderError
 from x402gate.providers.openrouter import (
+    Catalog,
+    CatalogCache,
+    check_content_parts,
     estimate_chat_input_tokens,
     has_nested_key,
     output_ceiling,
@@ -160,6 +163,21 @@ def _positive_int(value: Any, field: str) -> int:
     return value
 
 
+def _lookup(models: Catalog, model_id: str) -> dict[str, Any] | None:
+    """Catalog entry of a model id, or None."""
+    if model_id in models:
+        return models[model_id]
+    # Routing suffixes (:thinking, :abliteration, :cheap) are not always
+    # their own catalog rows. The price is the underlying model. Suffixes
+    # that add a separate charge (:online, :memory) are refused before this.
+    candidate = model_id
+    while ":" in candidate:
+        candidate = candidate.rsplit(":", 1)[0]
+        if candidate in models:
+            return models[candidate]
+    return None
+
+
 class NanoGptProvider(BaseProvider):
     """NanoGPT chat provider.
 
@@ -169,9 +187,10 @@ class NanoGptProvider(BaseProvider):
 
     def __init__(self, config: ProviderConfig, *, default_max_tokens: int = 1024) -> None:
         super().__init__(name="nanogpt", config=config)
-        self._models_cache: dict[str, dict[str, Any]] = {}
-        self._cache_updated_at: float = 0.0
-        self._cache_ttl: float = float(config.models_cache_ttl)
+        # One catalog, stored under the key "".
+        self._catalog = CatalogCache(
+            float(config.models_cache_ttl), self._fetch_models_list, self.name
+        )
         self._default_max_tokens = default_max_tokens
 
     def _require_chat(self, path: str) -> None:
@@ -232,12 +251,15 @@ class NanoGptProvider(BaseProvider):
                 ),
                 status_code=400,
             )
-        messages = body.get("messages")
-        if isinstance(messages, list):
-            # Rejects content parts (files, video) the estimate cannot price.
-            estimate_chat_input_tokens(body, self.name)
+        # Rejects content parts (files, video) the estimate cannot price,
+        # without weighing the text, which get_price does once.
+        check_content_parts(body, self.name)
 
-    async def _fetch_models_list(self) -> None:
+    async def warm_up(self) -> None:
+        """Load the catalog at startup, so the first request does not wait."""
+        await self._catalog.load("")
+
+    async def _fetch_models_list(self, _key: str = "") -> Catalog:
         """Load the detailed text catalog. Prices are USD per million tokens."""
         url = f"{self._config.base_url.rstrip('/')}/models?detailed=true"
         max_retries = 2
@@ -246,8 +268,7 @@ class NanoGptProvider(BaseProvider):
 
         for attempt in range(1 + max_retries):
             try:
-                async with httpx.AsyncClient(timeout=15.0) as client:
-                    resp = await client.get(url)
+                resp = await http.shared_client().get(url, timeout=http.timeout(15.0))
             except httpx.TimeoutException as exc:
                 last_error = exc
                 if attempt < max_retries:
@@ -277,15 +298,13 @@ class NanoGptProvider(BaseProvider):
                 )
 
             models = resp.json().get("data", [])
-            cached: dict[str, dict[str, Any]] = {}
+            cached: Catalog = {}
             for model in models:
                 model_id = model.get("id", "")
                 if model_id:
                     cached[model_id] = model
-            self._models_cache = cached
-            self._cache_updated_at = time.time()
             logger.info("Cached %d models from NanoGPT", len(cached))
-            return
+            return cached
 
         raise ProviderError(
             provider=self.name,
@@ -294,22 +313,15 @@ class NanoGptProvider(BaseProvider):
         ) from last_error
 
     async def _model_info(self, model_id: str) -> dict[str, Any]:
-        now = time.time()
-        if not self._models_cache or now - self._cache_updated_at > self._cache_ttl:
-            await self._fetch_models_list()
-
-        if model_id in self._models_cache:
-            return self._models_cache[model_id]
-
-        # Routing suffixes (:thinking, :abliteration, :cheap) are not always
-        # their own catalog rows. The price is the underlying model. Suffixes
-        # that add a separate charge (:online, :memory) are refused before this.
-        candidate = model_id
-        while ":" in candidate:
-            candidate = candidate.rsplit(":", 1)[0]
-            if candidate in self._models_cache:
-                return self._models_cache[candidate]
-
+        # An expired catalog is served while it refreshes in the background,
+        # except for a model it lacks (perhaps added since), which waits for
+        # the fresh catalog; in the retry delay after a failed refresh it is
+        # not found without a fetch, so unknown ids cannot start one each.
+        info = _lookup(await self._catalog.get(""), model_id)
+        if info is None and self._catalog.may_fetch(""):
+            info = _lookup(await self._catalog.load(""), model_id)
+        if info is not None:
+            return info
         raise ProviderError(
             provider=self.name,
             detail=f"Model '{model_id}' not found on NanoGPT",

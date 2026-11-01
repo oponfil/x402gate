@@ -30,12 +30,19 @@ class PriceCache:
         self._store: dict[str, tuple[Decimal, float]] = {}
 
     @staticmethod
-    def _make_key(model_id: str, inputs: dict[str, Any]) -> str:
+    def _make_key(model_id: str, inputs: dict[str, Any], raw: bytes | None = None) -> str:
         """Create a deterministic cache key from model_id and inputs.
 
         File bytes are hashed on their own. Putting the raw upload into
         ``json.dumps`` would copy the whole file into the key.
+
+        ``raw`` is the JSON body exactly as received. Hashing it skips
+        re-serializing the parsed body (about 10 ms for 10 MB of base64).
+        Equal bytes parse to equal inputs, so they share a price; bodies
+        that only differ in key order or spacing get separate entries.
         """
+        if raw is not None:
+            return f"{model_id}:raw:{hashlib.sha256(raw).hexdigest()[:16]}"
         safe: dict[str, Any] = {key: value for key, value in inputs.items() if key != "_file_bytes"}
         file_bytes = inputs.get("_file_bytes")
         if isinstance(file_bytes, (bytes, bytearray)):
@@ -44,11 +51,28 @@ class PriceCache:
         inputs_hash = hashlib.sha256(inputs_json.encode()).hexdigest()[:16]
         return f"{model_id}:{inputs_hash}"
 
-    def get(self, model_id: str, inputs: dict[str, Any]) -> Decimal | None:
-        """Return cached price if it exists and hasn't expired."""
+    def key(self, model_id: str, inputs: dict[str, Any], raw: bytes | None = None) -> str | None:
+        """Return the cache key for a request, or None when caching is off.
+
+        A request computes it once and passes it to :meth:`get_by_key` and
+        :meth:`set_by_key`: hashing a 24 MB upload takes tens of ms.
+        """
         if self._ttl <= 0:
             return None
-        key = self._make_key(model_id, inputs)
+        return self._make_key(model_id, inputs, raw)
+
+    def get(self, model_id: str, inputs: dict[str, Any]) -> Decimal | None:
+        """Return cached price if it exists and hasn't expired."""
+        return self.get_by_key(self.key(model_id, inputs))
+
+    def set(self, model_id: str, inputs: dict[str, Any], price: Decimal) -> None:
+        """Store a price in the cache with the current timestamp."""
+        self.set_by_key(self.key(model_id, inputs), price)
+
+    def get_by_key(self, key: str | None) -> Decimal | None:
+        """Return the price stored under a :meth:`key` if it hasn't expired."""
+        if key is None or self._ttl <= 0:
+            return None
         entry = self._store.get(key)
         if entry is None:
             return None
@@ -58,11 +82,10 @@ class PriceCache:
             return None
         return price
 
-    def set(self, model_id: str, inputs: dict[str, Any], price: Decimal) -> None:
-        """Store a price in the cache with the current timestamp."""
-        if self._ttl <= 0:
+    def set_by_key(self, key: str | None, price: Decimal) -> None:
+        """Store a price under a :meth:`key` with the current timestamp."""
+        if key is None or self._ttl <= 0:
             return
-        key = self._make_key(model_id, inputs)
         now = time.monotonic()
         # Re-inserting moves the key to the end, so dict order stays oldest first.
         self._store.pop(key, None)

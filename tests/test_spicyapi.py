@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
+from x402gate.core import http
 from x402gate.core.config import ProviderConfig
 from x402gate.core.proxy import UPSTREAM_CREDENTIALS_DETAIL, TaskTimeoutError
 from x402gate.providers import spicyapi
@@ -39,7 +40,9 @@ def _provider(**overrides) -> SpicyApiProvider:
     provider = SpicyApiProvider(config=_config(**overrides))
     client = AsyncMock()
     client.is_closed = False
+    # The provider calls through the shared pool; tests hand it this mock.
     provider._client = client
+    provider._get_client = lambda: client
     return provider
 
 
@@ -353,6 +356,18 @@ class TestGetResult:
         assert await provider.calculate_actual_cost({}, {"data": {"id": "job_1"}}) == Decimal(
             "0.008"
         )
+
+    @pytest.mark.asyncio
+    async def test_first_poll_is_sent_without_a_delay(self):
+        """A job that finished while queued is read at once, not after a poll interval."""
+        provider = _provider(poll_interval=2)
+        provider._sleep = AsyncMock()
+        provider._client.request.return_value = _task("succeeded", cost="0.008")
+
+        result = await provider.get_result("job_1")
+
+        assert result["state"] == "succeeded"
+        provider._sleep.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_failed_poll_raises(self):
@@ -1059,9 +1074,7 @@ class TestChat:
         provider._sleep = AsyncMock()
         provider._client.request.side_effect = [
             _quote(cost="0.0098895", quote_id="qchat", unit="per_1k_tokens"),
-            record,
-            record,
-            record,
+            *[record] * (1 + len(spicyapi._COST_LOOKUP_DELAYS)),
         ]
         _attach_stream(provider, [_StreamResponse(200, _chat_lines())])
 
@@ -1213,3 +1226,186 @@ class TestChat:
 
         assert result["task_id"] == "job_chat"
         assert provider._client.stream is not None
+
+
+class TestSettledCostLookup:
+    """The settled chat cost is read right after the stream, then with short pauses."""
+
+    @pytest.mark.asyncio
+    async def test_settled_cost_on_the_first_read_needs_no_pause(self):
+        provider = _provider(poll_interval=2)
+        provider._sleep = AsyncMock()
+        provider._client.request.side_effect = [
+            _quote(cost="0.0098895", quote_id="qchat", unit="per_1k_tokens"),
+            _task("succeeded", task_id="job_chat", cost="0.001", settled=True),
+        ]
+        _attach_stream(provider, [_StreamResponse(200, _chat_lines())])
+
+        await provider.get_price("chat/completions", _CHAT)
+        result = await provider.submit("chat/completions", _CHAT)
+
+        assert await provider.calculate_actual_cost(_CHAT, result) == Decimal("0.001")
+        assert all(call.args[0] == 0 for call in provider._sleep.await_args_list)
+
+    @pytest.mark.asyncio
+    async def test_unsettled_cost_is_read_again_after_short_pauses(self):
+        """Pauses grow from a quarter second instead of a fixed poll interval each."""
+        provider = _provider(poll_interval=2)
+        provider._sleep = AsyncMock()
+        pending = _response(200, {"code": 200, "data": {"taskId": "job_chat", "state": "running"}})
+        provider._client.request.side_effect = [
+            _quote(cost="0.0098895", quote_id="qchat", unit="per_1k_tokens"),
+            pending,
+            pending,
+            _task("succeeded", task_id="job_chat", cost="0.001", settled=True),
+        ]
+        _attach_stream(provider, [_StreamResponse(200, _chat_lines())])
+
+        await provider.get_price("chat/completions", _CHAT)
+        result = await provider.submit("chat/completions", _CHAT)
+
+        assert await provider.calculate_actual_cost(_CHAT, result) == Decimal("0.001")
+        delays = [call.args[0] for call in provider._sleep.await_args_list]
+        assert [delay for delay in delays if delay] == [0.25, 0.5]
+
+    @pytest.mark.asyncio
+    async def test_never_settled_falls_back_to_the_quote_within_the_old_budget(self):
+        """Giving up no sooner than before keeps the exact charge as likely as it was."""
+        provider = _provider(poll_interval=2)
+        provider._sleep = AsyncMock()
+        pending = _response(200, {"code": 200, "data": {"taskId": "job_chat", "state": "running"}})
+        reads = 1 + len(spicyapi._COST_LOOKUP_DELAYS)
+        provider._client.request.side_effect = [
+            _quote(cost="0.0098895", quote_id="qchat", unit="per_1k_tokens"),
+            *[pending] * reads,
+        ]
+        _attach_stream(provider, [_StreamResponse(200, _chat_lines())])
+
+        await provider.get_price("chat/completions", _CHAT)
+        result = await provider.submit("chat/completions", _CHAT)
+
+        assert await provider.calculate_actual_cost(_CHAT, result) == Decimal("0.0098895")
+        assert provider._client.request.await_count == 1 + reads
+        delays = [call.args[0] for call in provider._sleep.await_args_list]
+        # The old lookup waited two poll intervals (2 s each) in all.
+        assert 3.5 <= sum(delays) <= 4.0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            _response(429, {"code": 429, "msg": "rate limited"}),
+            _response(503, {"code": 503, "msg": "unavailable"}),
+            _response(404, {"code": 404, "msg": "task not found"}),
+            httpx.ConnectError("refused"),
+            httpx.RemoteProtocolError("dropped"),
+        ],
+        ids=["429", "503", "404", "connect-error", "dropped"],
+    )
+    async def test_failed_read_is_retried_and_the_exact_cost_still_used(self, failure):
+        """One failed read must not bill the quote while later reads can settle."""
+        provider = _provider()
+        provider._sleep = AsyncMock()
+        provider._client.request.side_effect = [
+            _quote(cost="0.0098895", quote_id="qchat", unit="per_1k_tokens"),
+            failure,
+            _task("succeeded", task_id="job_chat", cost="0.001", settled=True),
+        ]
+        _attach_stream(provider, [_StreamResponse(200, _chat_lines())])
+
+        await provider.get_price("chat/completions", _CHAT)
+        result = await provider.submit("chat/completions", _CHAT)
+
+        assert await provider.calculate_actual_cost(_CHAT, result) == Decimal("0.001")
+        assert provider._client.request.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_failing_reads_fall_back_to_the_quote_after_the_last_read(self):
+        provider = _provider()
+        provider._sleep = AsyncMock()
+        reads = 1 + len(spicyapi._COST_LOOKUP_DELAYS)
+        provider._client.request.side_effect = [
+            _quote(cost="0.0098895", quote_id="qchat", unit="per_1k_tokens"),
+            *[_response(503, {"code": 503, "msg": "unavailable"})] * reads,
+        ]
+        _attach_stream(provider, [_StreamResponse(200, _chat_lines())])
+
+        await provider.get_price("chat/completions", _CHAT)
+        result = await provider.submit("chat/completions", _CHAT)
+
+        assert result["choices"][0]["message"]["content"] == "Hello there."
+        assert await provider.calculate_actual_cost(_CHAT, result) == Decimal("0.0098895")
+        assert provider._client.request.await_count == 1 + reads
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            _response(401, {"code": 401, "msg": "bad key"}),
+            httpx.ReadTimeout("slow"),
+        ],
+        ids=["rejected-key", "read-timeout"],
+    )
+    async def test_lasting_or_slow_failure_stops_the_lookup(self, failure):
+        """A rejected key will not change; a timeout already made the client wait."""
+        provider = _provider()
+        provider._sleep = AsyncMock()
+        provider._client.request.side_effect = [
+            _quote(cost="0.0098895", quote_id="qchat", unit="per_1k_tokens"),
+            failure,
+        ]
+        _attach_stream(provider, [_StreamResponse(200, _chat_lines())])
+
+        await provider.get_price("chat/completions", _CHAT)
+        result = await provider.submit("chat/completions", _CHAT)
+
+        assert await provider.calculate_actual_cost(_CHAT, result) == Decimal("0.0098895")
+        assert provider._client.request.await_count == 2
+
+
+class TestSharedPool:
+    """SpicyAPI calls go through the gateway's pooled client."""
+
+    @pytest.mark.asyncio
+    async def test_uses_the_shared_pool_and_close_leaves_it_open(self):
+        provider = SpicyApiProvider(config=_config())
+        client = provider._get_client()
+
+        assert client is http.shared_client()
+        await provider.close()
+        assert not client.is_closed
+        await http.close_shared_client()
+
+    @pytest.mark.asyncio
+    async def test_requests_fail_fast_when_the_host_does_not_connect(self):
+        """Each call keeps its read timeout but gets the short connect limit."""
+        provider = _provider()
+        provider._client.request.return_value = _quote()
+
+        await provider.get_price("jobs", _BODY)
+
+        timeout = provider._client.request.await_args.kwargs["timeout"]
+        assert isinstance(timeout, httpx.Timeout)
+        assert timeout.read == spicyapi._DEFAULT_TIMEOUT
+        assert timeout.connect == http.CONNECT_TIMEOUT_S
+
+    @pytest.mark.asyncio
+    async def test_chat_stream_has_the_short_connect_limit(self):
+        provider = _provider(poll_timeout=900)
+        captured: dict = {}
+
+        def open_stream(*args: object, **kwargs: object) -> _StreamContext:
+            captured["timeout"] = kwargs.get("timeout")
+            return _StreamContext(_StreamResponse(200, _chat_lines()))
+
+        provider._client.stream = open_stream
+        provider._client.request.side_effect = [
+            _quote(cost="0.0098895", quote_id="qchat", unit="per_1k_tokens"),
+            _task("succeeded", task_id="job_chat", cost="0.001", settled=True),
+        ]
+
+        await provider.get_price("chat/completions", _CHAT)
+        await provider.submit("chat/completions", _CHAT)
+
+        assert captured["timeout"].connect == http.CONNECT_TIMEOUT_S
+        assert captured["timeout"].read == 900.0

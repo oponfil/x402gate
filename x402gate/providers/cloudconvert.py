@@ -5,7 +5,8 @@ Implements the BaseProvider interface for CloudConvert's REST API v2:
 - Supported operations: convert (format conversion), optimize (file compression)
 - Job creation via POST /v2/jobs
 - File upload via multipart POST to the upload URL
-- Result polling via GET /v2/jobs/{id}
+- Result via the sync API (GET sync.api.cloudconvert.com/v2/jobs/{id}),
+  falling back to polling GET /v2/jobs/{id}
 """
 
 from __future__ import annotations
@@ -14,10 +15,13 @@ import asyncio
 import logging
 from decimal import Decimal
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
+from x402gate.core import http
 from x402gate.core.config import ProviderConfig
+from x402gate.core.http import shared_client
 from x402gate.core.proxy import (
     UPSTREAM_CREDENTIALS_DETAIL,
     TaskTimeoutError,
@@ -27,6 +31,54 @@ from x402gate.core.proxy import (
 from x402gate.providers.base import BaseProvider, ProviderError
 
 logger = logging.getLogger(__name__)
+
+# The sync API holds a request open until the job ends. Each wait is capped,
+# since proxies may drop a request that receives nothing for long; a wait
+# that runs out is checked with a plain poll and then opened again.
+_SYNC_WAIT_S = 60.0
+_JOB_ENDED = ("finished", "error")
+# A sync wait that fails for a passing reason (a dropped pooled connection,
+# a 5xx or 429) is retried after a poll and a pause; this many in a row
+# means the sync host is down, and the rest of the job is polled.
+_SYNC_MAX_FAILURES = 3
+# Each sync wait holds one connection of the shared pool for up to
+# _SYNC_WAIT_S. Past this many at once a job polls instead, so a burst of
+# conversions cannot take the slots that other providers' requests need.
+_SYNC_WAIT_SLOTS = asyncio.Semaphore(20)
+# The old loop slept this long before its first poll without counting it
+# against poll_timeout. It stays in the budget, so a job that used to
+# finish in time is never cut off sooner.
+_FIRST_POLL_GRACE_S = 1.0
+
+
+class _SyncWaitError(Exception):
+    """The sync API did not answer with an ended job; poll instead.
+
+    ``transient`` is True when the failure may pass (a transport error, a
+    5xx or 429), so the sync API is tried again after a poll.
+    """
+
+    def __init__(self, reason: str, *, transient: bool) -> None:
+        super().__init__(reason)
+        self.transient = transient
+
+
+def _sync_wait_url(base_url: str, job_id: str) -> str | None:
+    """Return the sync API URL that waits for ``job_id``, or None if there is none.
+
+    https://api.cloudconvert.com/v2 maps to https://sync.api.cloudconvert.com/v2
+    (and the sandbox api.sandbox.cloudconvert.com the same way). Any other
+    base URL (a proxy, a test server) has no known sync host and is polled.
+    """
+    parts = urlsplit(base_url.rstrip("/"))
+    host = parts.hostname or ""
+    if (
+        parts.scheme != "https"
+        or not host.startswith("api.")
+        or not host.endswith(".cloudconvert.com")
+    ):
+        return None
+    return urlunsplit(parts._replace(netloc=f"sync.{parts.netloc}")) + f"/jobs/{job_id}"
 
 
 def _validate_body(body: dict[str, Any], provider_name: str) -> tuple[str, Any, Any, str]:
@@ -181,15 +233,15 @@ class CloudConvertProvider(BaseProvider):
         }
 
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.post(
-                    f"{self._config.base_url.rstrip('/')}/jobs",
-                    json=job_payload,
-                    headers={
-                        "Authorization": f"Bearer {self._config.api_key}",
-                        "Content-Type": "application/json",
-                    },
-                )
+            resp = await shared_client().post(
+                f"{self._config.base_url.rstrip('/')}/jobs",
+                json=job_payload,
+                headers={
+                    "Authorization": f"Bearer {self._config.api_key}",
+                    "Content-Type": "application/json",
+                },
+                timeout=http.timeout(30.0),
+            )
 
             if rejected_credentials(resp.status_code):
                 logger.error(
@@ -241,13 +293,12 @@ class CloudConvertProvider(BaseProvider):
 
         try:
             # Upload: multipart POST with form parameters + file
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                files = {"file": (file_name, file_bytes)}
-                resp = await client.post(
-                    upload_url,
-                    data=upload_params,
-                    files=files,
-                )
+            resp = await shared_client().post(
+                upload_url,
+                data=upload_params,
+                files={"file": (file_name, file_bytes)},
+                timeout=http.timeout(120.0),
+            )
 
             if resp.status_code >= 400:
                 raise ProviderError(
@@ -277,114 +328,219 @@ class CloudConvertProvider(BaseProvider):
         return {"id": job_id, "status": "processing"}
 
     async def get_result(self, task_id: str) -> dict[str, Any]:
-        """Poll CloudConvert for job completion.
+        """Wait for the CloudConvert job to finish, fail, or time out.
 
-        Polls GET /v2/jobs/{id} until the job finishes, fails, or times out.
+        Waits on the sync API (GET sync.api.cloudconvert.com/v2/jobs/{id}),
+        which answers the moment the job ends instead of at the next poll.
+        A wait that runs out is followed by one plain poll, so a sync API
+        that hangs cannot hide a finished job. Any other sync answer than a
+        readable finished or failed job is followed by a plain poll of
+        GET /v2/jobs/{id}, whose handling of each status decides whether the
+        client is charged; a sync API that does not work is then dropped
+        for the rest of the job.
+
+        poll_timeout is counted as the old polling loop counted it: the
+        pauses between polls, not the time the polls themselves take. Time
+        in a sync wait is charged at the rate the old loop charged wall-clock
+        time (poll_interval out of every poll_interval plus one poll), so no
+        job gets less time than polling alone would have given it.
 
         Returns:
             Dict with job result including export URLs.
         """
         url = f"{self._config.base_url.rstrip('/')}/jobs/{task_id}"
+        wait_url = _sync_wait_url(self._config.base_url, task_id)
         poll_interval = self._config.poll_interval
         poll_timeout = self._config.poll_timeout
-        elapsed = 0
+        budget = poll_timeout + _FIRST_POLL_GRACE_S if poll_timeout > 0 else 0.0
+        loop = asyncio.get_running_loop()
+        started = loop.time()
         poll_count = 0
+        slept = 0.0  # pauses between polls, counted in full
+        synced = 0.0  # wall-clock time inside sync waits
+        polled = 0.0  # wall-clock time inside plain polls, never counted
+        sync_failures = 0
 
-        # Brief delay before first poll
-        await asyncio.sleep(1)
+        while True:
+            if poll_count and poll_interval > 0:
+                rate = poll_interval / (poll_interval + polled / poll_count)
+            else:
+                rate = 1.0
+            waited = slept + synced * rate
+            if waited >= budget:
+                break
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            while elapsed < poll_timeout:
-                poll_count += 1
+            pause = wait_url is None
+            if wait_url is not None and _SYNC_WAIT_SLOTS.locked():
+                # Every sync slot is busy: this round polls, as before.
+                pause = True
+            elif wait_url is not None:
+                wait_started = loop.time()
                 try:
-                    resp = await client.get(
-                        url,
-                        headers={"Authorization": f"Bearer {self._config.api_key}"},
-                    )
-
-                    if resp.status_code >= 500 or resp.status_code == 429:
-                        # Transient: the job keeps running, so keep polling.
-                        logger.warning(
-                            "CloudConvert job %s poll #%d: HTTP %d after %ds",
-                            task_id,
-                            poll_count,
-                            resp.status_code,
-                            elapsed,
+                    async with _SYNC_WAIT_SLOTS:
+                        job = await self._wait_for_job(wait_url, task_id, (budget - waited) / rate)
+                except _SyncWaitError as e:
+                    pause = True
+                    sync_failures = sync_failures + 1 if e.transient else _SYNC_MAX_FAILURES
+                    if sync_failures >= _SYNC_MAX_FAILURES:
+                        logger.info(
+                            "CloudConvert job %s: polling instead of waiting (%s)", task_id, e
                         )
-                    elif rejected_credentials(resp.status_code):
-                        logger.error(
-                            "CloudConvert job %s poll rejected our key (%d): %s",
-                            task_id,
-                            resp.status_code,
-                            resp.text[:200],
-                        )
-                        # The job was created and uploaded with this key and
-                        # may still run upstream, so the payment is kept.
-                        raise ProviderError(
-                            provider=self.name, detail=UPSTREAM_CREDENTIALS_DETAIL
-                        ) from UpstreamMayHaveRun(f"Poll of job {task_id} rejected our key")
-                    elif resp.status_code >= 400:
-                        raise ProviderError(
-                            provider=self.name,
-                            detail=f"Job polling failed: {resp.text}",
-                            status_code=resp.status_code,
-                        )
+                        wait_url = None
                     else:
-                        job = self._parse_job(resp)
-                        status = job.get("status", "")
+                        logger.warning(
+                            "CloudConvert job %s: sync wait failed (%s), retrying after a poll",
+                            task_id,
+                            e,
+                        )
+                else:
+                    sync_failures = 0
+                    if job is not None:
+                        return self._job_outcome(task_id, job, loop.time() - started, poll_count)
+                finally:
+                    synced += loop.time() - wait_started
 
-                        if status == "finished":
-                            logger.info(
-                                "CloudConvert job %s finished after %ds (%d polls)",
-                                task_id,
-                                elapsed,
-                                poll_count,
-                            )
-                            # Extract result URLs from export task
-                            return self._extract_result(job)
+            elapsed = loop.time() - started
+            poll_count += 1
+            poll_started = loop.time()
+            try:
+                resp = await shared_client().get(
+                    url,
+                    headers={"Authorization": f"Bearer {self._config.api_key}"},
+                    timeout=http.timeout(30.0),
+                )
 
-                        if status == "error":
-                            error_msg = self._extract_error(job)
-                            fmt_info = self._extract_formats(job)
-                            logger.error(
-                                "CloudConvert job %s failed%s: %s",
-                                task_id,
-                                f" ({fmt_info})" if fmt_info else "",
-                                error_msg,
-                            )
-                            raise ProviderError(
-                                provider=self.name,
-                                detail=(
-                                    f"Conversion failed ({fmt_info}): {error_msg}"
-                                    if fmt_info
-                                    else f"Conversion failed: {error_msg}"
-                                ),
-                                status_code=502,
-                            )
-
-                        if poll_count <= 5 or poll_count % 10 == 0:
-                            logger.info(
-                                "CloudConvert job %s poll #%d: status=%s, elapsed=%ds/%ds",
-                                task_id,
-                                poll_count,
-                                status,
-                                elapsed,
-                                poll_timeout,
-                            )
-
-                except (httpx.RequestError, httpx.TimeoutException) as e:
+                if resp.status_code >= 500 or resp.status_code == 429:
+                    # Transient: the job keeps running, so keep polling.
                     logger.warning(
-                        "CloudConvert job %s poll #%d: %s: %s",
+                        "CloudConvert job %s poll #%d: HTTP %d after %ds",
                         task_id,
                         poll_count,
-                        type(e).__name__,
-                        e,
+                        resp.status_code,
+                        elapsed,
                     )
+                elif rejected_credentials(resp.status_code):
+                    logger.error(
+                        "CloudConvert job %s poll rejected our key (%d): %s",
+                        task_id,
+                        resp.status_code,
+                        resp.text[:200],
+                    )
+                    # The job was created and uploaded with this key and
+                    # may still run upstream, so the payment is kept.
+                    raise ProviderError(
+                        provider=self.name, detail=UPSTREAM_CREDENTIALS_DETAIL
+                    ) from UpstreamMayHaveRun(f"Poll of job {task_id} rejected our key")
+                elif resp.status_code >= 400:
+                    raise ProviderError(
+                        provider=self.name,
+                        detail=f"Job polling failed: {resp.text}",
+                        status_code=resp.status_code,
+                    )
+                else:
+                    job = self._parse_job(resp)
+                    status = job.get("status", "")
 
+                    if status in _JOB_ENDED:
+                        return self._job_outcome(task_id, job, elapsed, poll_count)
+
+                    if poll_count <= 5 or poll_count % 10 == 0:
+                        logger.info(
+                            "CloudConvert job %s poll #%d: status=%s, elapsed=%ds/%ds",
+                            task_id,
+                            poll_count,
+                            status,
+                            elapsed,
+                            poll_timeout,
+                        )
+
+            except (httpx.RequestError, httpx.TimeoutException) as e:
+                logger.warning(
+                    "CloudConvert job %s poll #%d: %s: %s",
+                    task_id,
+                    poll_count,
+                    type(e).__name__,
+                    e,
+                )
+            finally:
+                polled += loop.time() - poll_started
+
+            # Back to the sync API at once after a wait that ran out; a poll
+            # that stands alone repeats after a pause.
+            if pause:
                 await asyncio.sleep(poll_interval)
-                elapsed += poll_interval
+                slept += poll_interval
 
         raise TaskTimeoutError(task_id=task_id, timeout=poll_timeout)
+
+    async def _wait_for_job(
+        self, wait_url: str, task_id: str, remaining: float
+    ) -> dict[str, Any] | None:
+        """Wait on the sync API until the job ends, for at most _SYNC_WAIT_S.
+
+        Only a finished or failed job is returned. Failures are never
+        classified here: a plain poll then sees the same state and decides.
+
+        Returns:
+            The ended job, or None when the wait ran out first.
+
+        Raises:
+            _SyncWaitError: The sync API gave any other answer; transient
+                for a transport error, a 5xx or a 429.
+        """
+        try:
+            resp = await shared_client().get(
+                wait_url,
+                headers={"Authorization": f"Bearer {self._config.api_key}"},
+                timeout=http.timeout(min(_SYNC_WAIT_S, remaining)),
+            )
+        except httpx.ReadTimeout:
+            logger.info("CloudConvert job %s still running after a sync wait", task_id)
+            return None
+        except httpx.HTTPError as e:
+            raise _SyncWaitError(f"{type(e).__name__}: {e}", transient=True) from e
+        if resp.status_code != 200:
+            raise _SyncWaitError(
+                f"HTTP {resp.status_code}",
+                transient=resp.status_code >= 500 or resp.status_code == 429,
+            )
+        job = self._parse_job(resp)
+        if job.get("status") not in _JOB_ENDED:
+            # Answered before the job ended: this endpoint is not waiting.
+            raise _SyncWaitError(f"status={job.get('status')!r}", transient=False)
+        return job
+
+    def _job_outcome(
+        self, task_id: str, job: dict[str, Any], elapsed: float, poll_count: int
+    ) -> dict[str, Any]:
+        """Return the result of a finished job, or raise for a failed one."""
+        if job.get("status") == "finished":
+            logger.info(
+                "CloudConvert job %s finished after %ds (%d polls)",
+                task_id,
+                elapsed,
+                poll_count,
+            )
+            # Extract result URLs from export task
+            return self._extract_result(job)
+
+        error_msg = self._extract_error(job)
+        fmt_info = self._extract_formats(job)
+        logger.error(
+            "CloudConvert job %s failed%s: %s",
+            task_id,
+            f" ({fmt_info})" if fmt_info else "",
+            error_msg,
+        )
+        raise ProviderError(
+            provider=self.name,
+            detail=(
+                f"Conversion failed ({fmt_info}): {error_msg}"
+                if fmt_info
+                else f"Conversion failed: {error_msg}"
+            ),
+            status_code=502,
+        )
 
     @staticmethod
     def _parse_job(resp: httpx.Response) -> dict[str, Any]:

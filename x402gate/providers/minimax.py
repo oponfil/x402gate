@@ -15,7 +15,9 @@ from typing import Any
 
 import httpx
 
+from x402gate.core import http
 from x402gate.core.config import ProviderConfig
+from x402gate.core.http import shared_client
 from x402gate.providers.base import BaseProvider, ProviderError, require_text
 
 logger = logging.getLogger(__name__)
@@ -133,12 +135,12 @@ class MinimaxProvider(BaseProvider):
                 payload[key] = body[key]
 
         try:
-            async with httpx.AsyncClient(timeout=float(self._config.poll_timeout)) as client:
-                resp = await client.post(
-                    api_url,
-                    json=payload,
-                    headers=headers,
-                )
+            resp = await shared_client().post(
+                api_url,
+                json=payload,
+                headers=headers,
+                timeout=http.timeout(self._config.poll_timeout),
+            )
         except httpx.TimeoutException:
             raise ProviderError(
                 provider=self.name,

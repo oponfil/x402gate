@@ -17,11 +17,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import hashlib
 import logging
 import threading
 import time
 from typing import Any
 
+import httpx2
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.types import TxOpts
 from solders.commitment_config import CommitmentLevel
@@ -33,15 +35,46 @@ from solders.rpc.responses import IsBlockhashValidResp
 from solders.signature import Signature
 from solders.transaction import VersionedTransaction
 
+from x402gate.core.http import KEEPALIVE_EXPIRY_S
+
 logger = logging.getLogger(__name__)
 
 _CONFIRM_TIMEOUT_S = 120
 # The poll loop is the long call. This must stay above it, or _run_async
 # cancels the wait while the blockhash is still valid.
 _CONFIRM_RUN_TIMEOUT_S = 150
-_POLL_INTERVAL_S = 2
-_BLOCKHASH_CHECK_EVERY = 3
-_INFLIGHT_TTL_S = 120
+# A transaction usually reaches confirmed 0.5-1.5 s after it is sent, so a
+# 2 s poll added about a second to every Solana settlement. Status is read
+# every 0.5 s only for the first 3 s after the send, then every 2 s as before.
+# The signer's RPC key also serves every payment's simulation and send, so a
+# slow confirm must not keep reading at 2 per second.
+_POLL_INTERVAL_S = 0.5
+_FAST_POLL_WINDOW_S = 3.0
+_SLOW_POLL_INTERVAL_S = 2.0
+# A failed read (a 429 among them) waits the old interval before the next one.
+_STATUS_RETRY_DELAY_S = 2.0
+# Resends and blockhash checks keep their old pace: sendTransaction has the
+# tightest RPC rate limit, and the blockhash lives for about a minute.
+_REBROADCAST_INTERVAL_S = 2.0
+_BLOCKHASH_CHECK_INTERVAL_S = 6.0
+# Kept for the whole confirm run: with 2 s polls after the fast window the
+# loop can end a little past _CONFIRM_TIMEOUT_S, and the pending retry that
+# follows must still find the bytes to resend.
+_INFLIGHT_TTL_S = _CONFIRM_RUN_TIMEOUT_S
+# Settle re-verifies the payment, and the SDK's verify simulates again the
+# exact bytes the request's own verify simulated a moment before. A passed
+# simulation of the same bytes is reused once within this window. The send
+# preflight still simulates at broadcast, so a balance spent in between is
+# still refused before anything is sent.
+_SIMULATION_REUSE_S = 10.0
+# solana-py's default drops an idle RPC connection after 5 s, so most
+# payments paid a new TLS handshake. Same expiry as the shared HTTP pool.
+_RPC_LIMITS = httpx2.Limits(
+    max_connections=10, max_keepalive_connections=5, keepalive_expiry=KEEPALIVE_EXPIRY_S
+)
+_RPC_TIMEOUT_S = 10
+# Each signature costs this base fee (lamports_per_signature on mainnet).
+_LAMPORTS_PER_SIGNATURE = 5_000
 _BLOCKHASH_CONFIG = RpcContextConfig(commitment=CommitmentLevel.Confirmed)
 _EXPIRED_MESSAGE = (
     "Transaction expired (blockhash no longer valid); payment was not taken, sign a new payment"
@@ -91,10 +124,15 @@ class SolanaSigner:
         # Signed bytes kept so confirm can rebroadcast the same transaction.
         # Touched only from this signer's background loop.
         self._inflight: dict[str, tuple[bytes, float]] = {}
+        # Digest of signed bytes -> when their simulation passed. Same loop.
+        self._simulated: dict[bytes, float] = {}
 
         # Persistent background event loop + async client
         self._loop = asyncio.new_event_loop()
-        self._client = AsyncClient(rpc_url)
+        self._client = AsyncClient(rpc_url, timeout=_RPC_TIMEOUT_S)
+        self._client._provider.session = httpx2.AsyncClient(
+            timeout=_RPC_TIMEOUT_S, limits=_RPC_LIMITS
+        )
         self._thread = threading.Thread(
             target=self._loop.run_forever,
             daemon=True,
@@ -210,25 +248,7 @@ class SolanaSigner:
         if any(_FEE_PAYER_INDEX in bytes(ix.accounts) for ix in message.instructions):
             raise ValueError("Fee payer must not appear in instruction accounts")
 
-        keys = message.account_keys
-        limit: int | None = None
-        price = 0
-        for ix in message.instructions:
-            if ix.program_id_index >= len(keys):
-                continue
-            if keys[ix.program_id_index] != _COMPUTE_BUDGET_PROGRAM:
-                continue
-            data = bytes(ix.data)
-            if data[:1] == bytes([_SET_COMPUTE_UNIT_LIMIT]):
-                if len(data) < 5:
-                    raise ValueError("Malformed SetComputeUnitLimit instruction")
-                # max() so a duplicate instruction cannot hide the larger value.
-                limit = max(limit or 0, int.from_bytes(data[1:5], "little"))
-            elif data[:1] == bytes([_SET_COMPUTE_UNIT_PRICE]):
-                if len(data) < 9:
-                    raise ValueError("Malformed SetComputeUnitPrice instruction")
-                price = max(price, int.from_bytes(data[1:9], "little"))
-
+        limit, price = _compute_budget(message)
         if limit is None:
             raise ValueError("Transaction has no SetComputeUnitLimit instruction")
         if limit > _MAX_COMPUTE_UNIT_LIMIT:
@@ -240,6 +260,20 @@ class SolanaSigner:
                 f"Compute unit price {price} microlamports is above the gateway cap of "
                 f"{_MAX_COMPUTE_UNIT_PRICE_MICROLAMPORTS}"
             )
+
+    @staticmethod
+    def fee_lamports(tx_base64: str) -> int:
+        """Return the network fee the fee payer pays for this transaction.
+
+        The fee is set by the message alone: the base fee per signature plus
+        the requested compute-unit limit times its price, rounded up. No RPC
+        call is needed. The SDK verifier allows no precompile instructions,
+        whose signatures would also count.
+        """
+        message = VersionedTransaction.from_bytes(base64.b64decode(tx_base64)).message
+        limit, price = _compute_budget(message)
+        priority = -(-(limit or 0) * price // 1_000_000)
+        return message.header.num_required_signatures * _LAMPORTS_PER_SIGNATURE + priority
 
     @staticmethod
     def _is_versioned_transaction(tx_bytes: bytes) -> bool:
@@ -274,10 +308,20 @@ class SolanaSigner:
 
     async def _simulate_async(self, tx_base64: str) -> None:
         tx_bytes = base64.b64decode(tx_base64)
+        digest = hashlib.sha256(tx_bytes).digest()
+        now = time.monotonic()
+        self._simulated = {
+            key: at for key, at in self._simulated.items() if now - at < _SIMULATION_REUSE_S
+        }
+        if self._simulated.pop(digest, None) is not None:
+            # Settle's re-verify of bytes that just passed. The send preflight
+            # repeats the check right before the broadcast.
+            return
         tx = VersionedTransaction.from_bytes(tx_bytes)
         result = await self._client.simulate_transaction(tx)
         if result.value.err:
             raise RuntimeError(f"Simulation failed: {result.value.err}")
+        self._simulated[digest] = time.monotonic()
 
     # ------------------------------------------------------------------
     # Protocol: send_transaction
@@ -292,6 +336,10 @@ class SolanaSigner:
 
         tx_bytes = base64.b64decode(tx_base64)
         tx = VersionedTransaction.from_bytes(tx_bytes)
+        # Keep the preflight: it is the balance check at broadcast that lets
+        # settle reuse the verify simulation, and a refused preflight sends
+        # nothing, so the settle fails cleanly instead of landing a failed
+        # transaction whose fee the gateway pays.
         opts = TxOpts(skip_preflight=False, max_retries=3)
         result = await self._client.send_transaction(tx, opts=opts)
 
@@ -314,6 +362,10 @@ class SolanaSigner:
         if entry is None:
             return None
         return entry[0]
+
+    def _inflight_sent_at(self, signature: str, default: float) -> float:
+        entry = self._inflight.get(signature)
+        return default if entry is None else entry[1]
 
     def _prune_inflight(self) -> None:
         cutoff = time.monotonic() - _INFLIGHT_TTL_S
@@ -342,22 +394,31 @@ class SolanaSigner:
         """
         sig = Signature.from_string(signature)
         start = time.monotonic()
-        iteration = 0
+        # A first confirm resends 2 s after the send. A later confirm of the
+        # same signature (after a timeout) resends at once.
+        sent_at = self._inflight_sent_at(signature, start)
+        last_broadcast = sent_at
+        last_blockhash_check = start
 
         while time.monotonic() - start < _CONFIRM_TIMEOUT_S:
-            iteration += 1
             read, status = await self._try_read_status(sig)
             if not read:
                 # The transaction is already broadcast and usually lands, so a
                 # failed status read is retried instead of failing the settle.
-                await asyncio.sleep(_POLL_INTERVAL_S)
+                await asyncio.sleep(_STATUS_RETRY_DELAY_S)
                 continue
             if self._apply_status(status, signature, start):
                 return
 
             tx_bytes = self._inflight_bytes(signature)
+            now = time.monotonic()
             blockhash_dead = False
-            if status is None and tx_bytes is not None and iteration % _BLOCKHASH_CHECK_EVERY == 0:
+            if (
+                status is None
+                and tx_bytes is not None
+                and now - last_blockhash_check >= _BLOCKHASH_CHECK_INTERVAL_S
+            ):
+                last_blockhash_check = now
                 still_valid = await self._blockhash_still_valid(tx_bytes)
                 if still_valid is False:
                     read, last = await self._try_read_status(sig)
@@ -374,9 +435,16 @@ class SolanaSigner:
                         raise RuntimeError(_EXPIRED_MESSAGE)
                     blockhash_dead = True
 
-            if status is None and tx_bytes is not None and not blockhash_dead:
+            if (
+                status is None
+                and tx_bytes is not None
+                and not blockhash_dead
+                and now - last_broadcast >= _REBROADCAST_INTERVAL_S
+            ):
+                last_broadcast = now
                 await self._rebroadcast(tx_bytes)
-            await asyncio.sleep(_POLL_INTERVAL_S)
+            fast = time.monotonic() - sent_at < _FAST_POLL_WINDOW_S
+            await asyncio.sleep(_POLL_INTERVAL_S if fast else _SLOW_POLL_INTERVAL_S)
 
         raise RuntimeError(f"Transaction {signature} not confirmed within {_CONFIRM_TIMEOUT_S}s")
 
@@ -452,29 +520,6 @@ class SolanaSigner:
             return None
 
     # ------------------------------------------------------------------
-    # Extra: async get_transaction (used by payment.py for gas reporting)
-    # ------------------------------------------------------------------
-
-    async def get_transaction_async(
-        self,
-        tx_sig,  # noqa: ANN001
-        *,
-        commitment: str = "confirmed",
-        max_supported_transaction_version: int = 0,
-    ):
-        """Fetch a confirmed transaction (async, called from payment.py).
-
-        Creates a temporary AsyncClient because this method runs on the
-        main event loop (not the signer's background loop).
-        """
-        async with AsyncClient(self._rpc_url) as client:
-            return await client.get_transaction(
-                tx_sig,
-                commitment=commitment,
-                max_supported_transaction_version=max_supported_transaction_version,
-            )
-
-    # ------------------------------------------------------------------
     # Cleanup
     # ------------------------------------------------------------------
 
@@ -485,3 +530,31 @@ class SolanaSigner:
             asyncio.run_coroutine_threadsafe(self._client.close(), self._loop).result(timeout=5)
         self._loop.call_soon_threadsafe(self._loop.stop)
         self._thread.join(timeout=5)
+
+
+def _compute_budget(message: Any) -> tuple[int | None, int]:
+    """Return the requested compute-unit limit and price of a message.
+
+    ``max()`` so a duplicate instruction cannot hide the larger value.
+
+    Raises:
+        ValueError: A compute-budget instruction is malformed.
+    """
+    keys = message.account_keys
+    limit: int | None = None
+    price = 0
+    for ix in message.instructions:
+        if ix.program_id_index >= len(keys):
+            continue
+        if keys[ix.program_id_index] != _COMPUTE_BUDGET_PROGRAM:
+            continue
+        data = bytes(ix.data)
+        if data[:1] == bytes([_SET_COMPUTE_UNIT_LIMIT]):
+            if len(data) < 5:
+                raise ValueError("Malformed SetComputeUnitLimit instruction")
+            limit = max(limit or 0, int.from_bytes(data[1:5], "little"))
+        elif data[:1] == bytes([_SET_COMPUTE_UNIT_PRICE]):
+            if len(data) < 9:
+                raise ValueError("Malformed SetComputeUnitPrice instruction")
+            price = max(price, int.from_bytes(data[1:9], "little"))
+    return limit, price

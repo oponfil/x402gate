@@ -6,6 +6,9 @@ pyyaml>=6.0
 pydantic>=2.10.0
 pydantic-settings>=2.7.0
 mutagen>=1.47.0
+# eth_keys uses libsecp256k1 through coincurve when it is installed: prepaid
+# EVM signature checks take 0.1 ms instead of 3 ms. Wheels only, no compiler.
+coincurve>=21.0.0
 # Pinned: SolanaSigner calls AsyncClient._provider, a private solana-py attribute.
 solana==0.39.0
 solders==0.27.1

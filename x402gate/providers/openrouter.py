@@ -16,11 +16,13 @@ import json
 import logging
 import re
 import time
+from collections.abc import Awaitable, Callable
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import httpx
 
+from x402gate.core import http
 from x402gate.core.audio_duration import (
     billing_seconds,
     get_audio_duration_seconds,
@@ -39,6 +41,16 @@ logger = logging.getLogger(__name__)
 # A billed POST is sent again only when the connection never opened.
 _CONNECT_RETRIES = 2
 _CONNECT_RETRY_DELAY = 2.0
+
+# After a failed background refresh the stale catalog stays in use and the
+# next refresh starts no sooner than this, so an outage of the models API
+# does not start a fetch on every request.
+_CATALOG_RETRY_S = 60.0
+
+# A request may be priced from the catalog a refresh then replaced (a cached
+# price lives 60 s by default, and verify and settle run in between), so for
+# this long the endpoint cap in submit is never above the replaced rates.
+_CAP_GRACE_S = 180.0
 
 # A 5xx body that reports a timeout ("Gateway Time-out", "upstream timed
 # out") means the request was forwarded and may have run.
@@ -196,38 +208,70 @@ def _value_units(value: Any) -> int:
     return _text_units(json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str))
 
 
+def _part_type(part: dict[str, Any], provider_name: str) -> Any:
+    """A content part's type, refusing types the estimate cannot price."""
+    part_type = part.get("type", "text" if "text" in part else None)
+    if part_type in _TEXT_PARTS or part_type in _IMAGE_PARTS or part_type in _INLINE_PARTS:
+        return part_type
+    raise ProviderError(
+        provider=provider_name,
+        detail=(
+            f"Content part type '{part_type}' is not supported because x402gate "
+            "cannot price it before payment. Use text, image_url or input_audio."
+        ),
+        status_code=400,
+    )
+
+
+def _content_parts(content: Any) -> list[Any] | None:
+    """A message's content as a list of parts, or None for plain content."""
+    if isinstance(content, dict):
+        return [content]
+    if isinstance(content, list):
+        return content
+    return None
+
+
 def _content_size(content: Any, provider_name: str) -> tuple[int, int]:
     """Return (token units, images) for a message's content."""
-    if isinstance(content, dict):
-        content = [content]
-    if not isinstance(content, list):
+    parts = _content_parts(content)
+    if parts is None:
         return _value_units(content), 0
     units = 0
     images = 0
-    for part in content:
+    for part in parts:
         if not isinstance(part, dict):
             units += _value_units(part)
             continue
-        part_type = part.get("type", "text" if "text" in part else None)
+        part_type = _part_type(part, provider_name)
         if part_type in _TEXT_PARTS:
             units += _value_units(part.get("text"))
         elif part_type in _IMAGE_PARTS:
             images += 1
-        elif part_type in _INLINE_PARTS:
+        else:
             # Base64 audio is not text the tokenizer reads; its size stands in
             # for its length at the plain ASCII rate, as before.
             serialized = json.dumps(part, ensure_ascii=False, separators=(",", ":"), default=str)
             units += len(serialized) * _ASCII_UNITS
-        else:
-            raise ProviderError(
-                provider=provider_name,
-                detail=(
-                    f"Content part type '{part_type}' is not supported because x402gate "
-                    "cannot price it before payment. Use text, image_url or input_audio."
-                ),
-                status_code=400,
-            )
     return units, images
+
+
+def check_content_parts(body: dict[str, Any], provider_name: str) -> None:
+    """Refuse content parts the estimate cannot price, as chat_input_size does.
+
+    Checks the part types without weighing any text, which on a body of
+    megabytes takes tens of milliseconds of event loop time per pass. Shared
+    with NanoGPT.
+    """
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        for part in _content_parts(message.get("content")) or ():
+            if isinstance(part, dict):
+                _part_type(part, provider_name)
 
 
 def chat_input_size(body: dict[str, Any], provider_name: str) -> tuple[int, int]:
@@ -438,15 +482,23 @@ async def post_billed_request(
     """
     for attempt in range(1 + _CONNECT_RETRIES):
         try:
-            async with httpx.AsyncClient(timeout=request_timeout) as client:
-                resp = await client.post(
-                    url,
-                    json=payload,
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                    },
-                )
+            # The pooled client skips a TCP and TLS handshake per call.
+            resp = await http.shared_client().post(
+                url,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                # The pool is shared by every provider: when it is full, fail
+                # fast (never sent, so retried, then refunded) instead of
+                # waiting the whole read timeout for a free connection.
+                timeout=httpx.Timeout(
+                    request_timeout,
+                    connect=min(request_timeout, http.CONNECT_TIMEOUT_S),
+                    pool=min(request_timeout, http.CONNECT_TIMEOUT_S),
+                ),
+            )
         except (httpx.TimeoutException, httpx.ConnectError) as exc:
             never_sent = isinstance(exc, httpx.ConnectError) or safe_to_resend(exc)
             if never_sent and attempt < _CONNECT_RETRIES:
@@ -639,6 +691,117 @@ def _apply_cost_floor(cost: Decimal) -> Decimal:
     return cost
 
 
+Catalog = dict[str, dict[str, Any]]
+
+
+class CatalogCache:
+    """Model catalogs by key, served stale while one task refreshes them.
+
+    Only the first load of a key makes a request wait. After that an
+    expired catalog is still served, and a single background task fetches a
+    new one; a failed refresh keeps the old catalog and is tried again after
+    ``_CATALOG_RETRY_S``. Concurrent loads of one key share one fetch. An
+    empty catalog counts as a failed fetch, so it never replaces the prices.
+    Shared with NanoGPT.
+    """
+
+    def __init__(
+        self, ttl: float, fetch: Callable[[str], Awaitable[Catalog]], provider_name: str
+    ) -> None:
+        self._ttl = ttl
+        self._fetch = fetch
+        self._provider_name = provider_name
+        self._catalogs: dict[str, Catalog] = {}
+        self._loaded_at: dict[str, float] = {}
+        self._refresh_at: dict[str, float] = {}
+        # The catalog each refresh replaced, and when.
+        self._previous: dict[str, tuple[Catalog, float]] = {}
+        self._tasks: dict[str, asyncio.Task[Catalog]] = {}
+
+    def put(self, key: str, models: Catalog) -> None:
+        """Store a freshly fetched catalog."""
+        now = time.time()
+        old = self._catalogs.get(key)
+        if old is not None:
+            self._previous[key] = (old, now)
+        self._catalogs[key] = models
+        self._loaded_at[key] = now
+        self._refresh_at[key] = now + self._ttl
+
+    def expired(self, key: str) -> bool:
+        """True when the catalog is older than the TTL or was never loaded."""
+        loaded_at = self._loaded_at.get(key)
+        return loaded_at is None or time.time() - loaded_at > self._ttl
+
+    def may_fetch(self, key: str) -> bool:
+        """True when ``load`` may fetch now: the catalog is expired and not
+        inside the retry delay after a failed refresh (or was never loaded).
+        """
+        if key not in self._catalogs:
+            return True
+        return self.expired(key) and time.time() >= self._refresh_at[key]
+
+    def replaced(self, key: str, within: float) -> Catalog | None:
+        """The catalog a refresh replaced less than ``within`` seconds ago."""
+        previous = self._previous.get(key)
+        if previous is None or time.time() - previous[1] > within:
+            return None
+        return previous[0]
+
+    async def get(self, key: str) -> Catalog:
+        """The catalog, stale or not; waits only when it was never loaded."""
+        models = self._catalogs.get(key)
+        if models is None:
+            return await self.load(key)
+        if time.time() >= self._refresh_at[key]:
+            self._start(key)
+        return models
+
+    async def load(self, key: str) -> Catalog:
+        """Fetch the catalog now, joining a fetch already in flight."""
+        # A request that is cancelled (client gone) must not cancel the fetch
+        # other requests may be waiting on.
+        return await asyncio.shield(self._start(key))
+
+    def _start(self, key: str) -> asyncio.Task[Catalog]:
+        task = self._tasks.get(key)
+        # A task of another event loop (tests run each case in a new one)
+        # cannot be awaited here.
+        if task is None or task.done() or task.get_loop() is not asyncio.get_running_loop():
+            task = asyncio.create_task(self._fetch_and_store(key))
+            task.add_done_callback(lambda done: self._finished(key, done))
+            self._tasks[key] = task
+        return task
+
+    async def _fetch_and_store(self, key: str) -> Catalog:
+        try:
+            models = await self._fetch(key)
+            if not models:
+                raise ProviderError(
+                    provider=self._provider_name,
+                    detail="The models API returned an empty catalog",
+                    status_code=503,
+                )
+        except Exception:
+            if key in self._catalogs:
+                self._refresh_at[key] = time.time() + _CATALOG_RETRY_S
+            raise
+        self.put(key, models)
+        return models
+
+    def _finished(self, key: str, task: asyncio.Task[Catalog]) -> None:
+        if self._tasks.get(key) is task:
+            del self._tasks[key]
+        if task.cancelled():
+            return
+        # Read here so a refresh nobody awaits does not log "never retrieved".
+        exc = task.exception()
+        if exc is not None and key in self._catalogs:
+            logger.warning(
+                "%s catalog refresh failed, serving the old one: %s", self._provider_name, exc
+            )
+
+
 class OpenRouterProvider(BaseProvider):
     """OpenRouter provider implementation.
 
@@ -657,10 +820,11 @@ class OpenRouterProvider(BaseProvider):
         web_search_cost_per_result: float = 0.004,
     ) -> None:
         super().__init__(name="openrouter", config=config)
-        self._models_cache: dict[str, dict[str, Any]] = {}
-        self._fetched_catalogs: set[str] = set()
-        self._cache_updated_at: float = 0.0
-        self._cache_ttl: float = float(config.models_cache_ttl)
+        # Keyed by the output_modalities filter: "" (chat), "embeddings",
+        # "transcription".
+        self._catalogs = CatalogCache(
+            float(config.models_cache_ttl), self._fetch_models_list, self.name
+        )
         self._default_max_tokens = default_max_tokens
         self._web_search_tokens_per_result = web_search_tokens_per_result
         self._default_web_search_max_results = default_web_search_max_results
@@ -675,8 +839,11 @@ class OpenRouterProvider(BaseProvider):
     ) -> dict[str, Any]:
         """Fetch model info (including pricing) from OpenRouter Models API.
 
-        Fetches only the catalog needed by the request type, then adds it to
-        the unified cache.
+        Looks only in the catalog of the request type. An expired catalog is
+        served while it refreshes in the background, except for a model it
+        lacks (perhaps added since), which waits for the fresh catalog. In
+        the retry delay after a failed refresh such a model is not found
+        without a fetch, so unknown ids cannot start one per request.
 
         Args:
             model_id: Model identifier (e.g. 'openai/gpt-4o-mini').
@@ -687,20 +854,12 @@ class OpenRouterProvider(BaseProvider):
         Raises:
             ProviderError: If the model is not found or the API call fails.
         """
-        current_time = time.time()
+        models = await self._catalogs.get(output_modalities)
+        if model_id not in models and self._catalogs.may_fetch(output_modalities):
+            models = await self._catalogs.load(output_modalities)
 
-        if self._models_cache and (current_time - self._cache_updated_at > self._cache_ttl):
-            logger.info("OpenRouter models cache expired (1 day TTL), clearing...")
-            self._models_cache.clear()
-            self._fetched_catalogs.clear()
-
-        if output_modalities not in self._fetched_catalogs:
-            await self._fetch_models_list(output_modalities=output_modalities)
-            self._fetched_catalogs.add(output_modalities)
-            self._cache_updated_at = time.time()
-
-        if model_id in self._models_cache:
-            return self._models_cache[model_id]
+        if model_id in models:
+            return models[model_id]
 
         raise ProviderError(
             provider=self.name,
@@ -708,8 +867,18 @@ class OpenRouterProvider(BaseProvider):
             status_code=404,
         )
 
-    async def _fetch_models_list(self, output_modalities: str = "") -> None:
-        """Fetch models from OpenRouter and add to cache."""
+    async def warm_up(self) -> None:
+        """Load the chat, embeddings and transcription catalogs at startup."""
+        results = await asyncio.gather(
+            *(self._catalogs.load(key) for key in ("", _EMBEDDINGS, _TRANSCRIPTION)),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+
+    async def _fetch_models_list(self, output_modalities: str = "") -> Catalog:
+        """Fetch one catalog from OpenRouter, keyed by model id."""
         url = f"{self._config.base_url.rstrip('/')}/models"
         if output_modalities:
             url += f"?output_modalities={output_modalities}"
@@ -720,8 +889,7 @@ class OpenRouterProvider(BaseProvider):
 
         for attempt in range(1 + max_retries):
             try:
-                async with httpx.AsyncClient(timeout=15.0) as client:
-                    resp = await client.get(url)
+                resp = await http.shared_client().get(url, timeout=http.timeout(15.0))
 
                 if resp.status_code >= 500 and attempt < max_retries:
                     delay = retry_delay * (2**attempt)
@@ -742,21 +910,14 @@ class OpenRouterProvider(BaseProvider):
                         status_code=resp.status_code,
                     )
 
-                models_list = resp.json().get("data", [])
-                count = 0
-                for model in models_list:
+                models: Catalog = {}
+                for model in resp.json().get("data", []):
                     mid = model.get("id", "")
                     if mid:
-                        self._models_cache[mid] = model
-                        count += 1
+                        models[mid] = model
                 label = f" ({output_modalities})" if output_modalities else ""
-                logger.info(
-                    "Cached %d models from OpenRouter%s (total: %d)",
-                    count,
-                    label,
-                    len(self._models_cache),
-                )
-                return
+                logger.info("Cached %d models from OpenRouter%s", len(models), label)
+                return models
 
             except ProviderError:
                 raise
@@ -792,20 +953,26 @@ class OpenRouterProvider(BaseProvider):
             status_code=503,
         ) from last_error
 
-    async def _estimate_stt_price(
-        self,
-        model_id: str,
-        inputs: dict[str, Any],
-        model_info: dict[str, Any],
-        prompt_price_dec: Decimal,
-    ) -> Decimal:
+    def _stt_billing_seconds(self, inputs: dict[str, Any]) -> int:
+        """Billing seconds of the request audio.
+
+        Decoding up to 25 MB of base64 and reading the duration can take a
+        second on a crafted file, so get_price runs this in a thread.
+        """
         audio_bytes, fmt = _extract_stt_audio(
             inputs,
             self.name,
             max_audio_bytes=self._max_stt_audio_bytes,
         )
-        duration = get_audio_duration_seconds(audio_bytes, fmt, provider=self.name)
-        seconds = billing_seconds(duration)
+        return billing_seconds(get_audio_duration_seconds(audio_bytes, fmt, provider=self.name))
+
+    def _estimate_stt_price(
+        self,
+        model_id: str,
+        seconds: int,
+        model_info: dict[str, Any],
+        prompt_price_dec: Decimal,
+    ) -> Decimal:
         pricing = model_info.get("pricing", {})
 
         if _is_duration_based_stt(pricing):
@@ -886,7 +1053,7 @@ class OpenRouterProvider(BaseProvider):
                     )
             reject_non_text_output(body, self.name)
             reasoning_budget(body, self.name)  # rejects a malformed budget
-            chat_input_size(body, self.name)  # rejects unpriced content parts
+            check_content_parts(body, self.name)
         return kind
 
     def _web_results(self, plugin: dict[str, Any]) -> int:
@@ -929,7 +1096,7 @@ class OpenRouterProvider(BaseProvider):
         ``models`` fallback list each rate is the highest among the
         candidates, since OpenRouter may route to any of them. When the
         client's routing picks endpoints, submit caps the endpoint price at
-        those same rates.
+        rates no higher than these, even if the catalog refreshed in between.
 
         Args:
             model_path: API sub-path (e.g. 'chat/completions').
@@ -947,7 +1114,7 @@ class OpenRouterProvider(BaseProvider):
         label = ",".join(candidates)
 
         if kind == _TRANSCRIPTION:
-            return max([await self._estimate_stt(model_id, inputs) for model_id in candidates])
+            return await self._estimate_stt(candidates, inputs)
 
         rates = await self._max_rates(kind, candidates)
 
@@ -968,6 +1135,7 @@ class OpenRouterProvider(BaseProvider):
             )
             return _apply_cost_floor(estimated_cost)
 
+        # Weighed once here; _check_request only checked the part types.
         estimated_input_tokens, images = chat_input_size(inputs, self.name)
 
         # A cache_control breakpoint can bill the whole prompt at the write
@@ -1025,7 +1193,10 @@ class OpenRouterProvider(BaseProvider):
             model_id,
             output_modalities=output_modalities,
         )
+        return self._model_rates(model_id, model_info)
 
+    def _model_rates(self, model_id: str, model_info: dict[str, Any]) -> dict[str, Decimal]:
+        """Rates of ``_rates`` from a catalog entry already looked up."""
         pricing = model_info.get("pricing", {})
         prompt_price = pricing.get("prompt")
         completion_price = pricing.get("completion")
@@ -1061,11 +1232,21 @@ class OpenRouterProvider(BaseProvider):
         per_model = [await self._rates(kind, model_id) for model_id in model_ids]
         return {key: max(rates[key] for rates in per_model) for key in per_model[0]}
 
-    async def _estimate_stt(self, model_id: str, inputs: dict[str, Any]) -> Decimal:
-        """Maximum cost of a transcription on one model."""
-        rates = await self._rates(_TRANSCRIPTION, model_id)
-        model_info = await self._fetch_model_info(model_id, output_modalities=_TRANSCRIPTION)
-        return await self._estimate_stt_price(model_id, inputs, model_info, rates["prompt"])
+    async def _estimate_stt(self, model_ids: list[str], inputs: dict[str, Any]) -> Decimal:
+        """Maximum cost of a transcription on any of the candidate models.
+
+        The audio is decoded and measured once for all candidates, off the
+        event loop, so a large file does not stall other requests.
+        """
+        priced = []
+        for model_id in model_ids:
+            model_info = await self._fetch_model_info(model_id, output_modalities=_TRANSCRIPTION)
+            priced.append((model_id, model_info, self._model_rates(model_id, model_info)))
+        seconds = await asyncio.to_thread(self._stt_billing_seconds, inputs)
+        return max(
+            self._estimate_stt_price(model_id, seconds, model_info, rates["prompt"])
+            for model_id, model_info, rates in priced
+        )
 
     async def _routing_with_price_cap(self, kind: str, body: dict[str, Any]) -> dict[str, Any]:
         """The client's provider preferences plus a max_price at the priced rates.
@@ -1075,7 +1256,21 @@ class OpenRouterProvider(BaseProvider):
         above the catalog rate instead of billing above the reservation. A
         lower cap the client sent itself is kept.
         """
-        rates = await self._max_rates(kind, self._candidate_models(body))
+        model_ids = self._candidate_models(body)
+        rates = await self._max_rates(kind, model_ids)
+        # get_price may have priced the request from the catalog a refresh
+        # replaced since; a rate raised in between must not lift the cap
+        # above what was reserved.
+        replaced = self._catalogs.replaced("" if kind == _CHAT else kind, _CAP_GRACE_S)
+        if replaced is not None and all(model_id in replaced for model_id in model_ids):
+            try:
+                per_model = [self._model_rates(m, replaced[m]) for m in model_ids]
+            except ProviderError:
+                # Not priceable from the old catalog, so not priced from it.
+                per_model = []
+            if per_model:
+                for key in ("prompt", "completion", "request"):
+                    rates[key] = min(rates[key], max(r[key] for r in per_model))
         cap = {
             "prompt": float(rates["prompt"] * _MILLION),
             "completion": float(rates["completion"] * _MILLION),

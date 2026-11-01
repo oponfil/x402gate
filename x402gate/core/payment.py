@@ -16,16 +16,15 @@ import time
 from decimal import Decimal
 from typing import Any
 
-import httpx
 from fastapi import Request
 from fastapi.responses import JSONResponse
-from solders.signature import Signature as SolSignature
 from web3 import Web3
 from x402 import PaymentPayload, PaymentRequirements
 from x402.mechanisms.evm.exact.facilitator import ExactEvmScheme
 from x402.mechanisms.evm.signers import FacilitatorWeb3Signer
 from x402.mechanisms.svm.exact.facilitator import ExactSvmScheme
 
+from x402gate.core import http
 from x402gate.core.config import NetworkConfig
 from x402gate.core.pricing import format_price_for_x402
 from x402gate.core.svm_signer import SolanaSigner
@@ -35,33 +34,46 @@ logger = logging.getLogger(__name__)
 # Cached token prices for gas cost estimation
 _price_cache: dict[str, float] = {"ethereum": 0.0, "solana": 0.0, "ts": 0.0, "failed_at": 0.0}
 _PRICE_TTL = 300  # 5 minutes
-# Base settles before its result goes out, so a CoinGecko outage must not
-# add its 5 s timeout to every response. A failed fetch waits this long.
+# A failed fetch waits this long before the next try.
 _PRICE_RETRY_AFTER_FAILURE = 60
+_PRICE_TIMEOUT_S = 5.0
+_COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
+# Two signatures, the fee of a payment without a priority fee.
+_SVM_FALLBACK_FEE_LAMPORTS = 10_000
+
+# The price only converts gas to USD for the dashboard, so settlement never
+# waits for it: a stale price is refreshed in the background, and a running
+# refresh is held here so it is not garbage-collected.
+_background_tasks: set[asyncio.Task] = set()
+_price_refresh: asyncio.Task | None = None
 
 
-def _fetch_prices_sync() -> dict:
-    """Fetch ETH and SOL prices from CoinGecko (blocking)."""
-
-    r = httpx.get(
-        "https://api.coingecko.com/api/v3/simple/price",
+async def _fetch_prices() -> dict:
+    """Fetch ETH and SOL prices from CoinGecko."""
+    r = await http.shared_client().get(
+        _COINGECKO_URL,
         params={"ids": "ethereum,solana", "vs_currencies": "usd"},
-        timeout=5.0,
+        timeout=http.timeout(_PRICE_TIMEOUT_S),
     )
     return r.json()
 
 
-async def _refresh_prices() -> None:
-    """Refresh cached ETH and SOL prices from CoinGecko."""
-    now = time.time()
+def _prices_fresh(now: float) -> bool:
+    """True when the cache needs no fetch: fresh, or a fetch failed recently."""
     if now - _price_cache["ts"] < _PRICE_TTL and (
         _price_cache["ethereum"] > 0 or _price_cache["solana"] > 0
     ):
-        return
-    if now - _price_cache["failed_at"] < _PRICE_RETRY_AFTER_FAILURE:
+        return True
+    return now - _price_cache["failed_at"] < _PRICE_RETRY_AFTER_FAILURE
+
+
+async def _refresh_prices() -> None:
+    """Refresh cached ETH and SOL prices from CoinGecko. Never raises."""
+    now = time.time()
+    if _prices_fresh(now):
         return
     try:
-        data = await asyncio.to_thread(_fetch_prices_sync)
+        data = await _fetch_prices()
         if not isinstance(data, dict) or not (
             data.get("ethereum", {}).get("usd") or data.get("solana", {}).get("usd")
         ):
@@ -77,14 +89,39 @@ async def _refresh_prices() -> None:
         logger.warning("Failed to fetch prices from CoinGecko: %s", e)
 
 
-async def _get_eth_price() -> float:
-    await _refresh_prices()
-    return _price_cache["ethereum"]
+def _spawn(coro: Any) -> asyncio.Task:
+    """Run ``coro`` in the background, keeping a reference until it ends."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_done)
+    return task
 
 
-async def _get_sol_price() -> float:
-    await _refresh_prices()
-    return _price_cache["solana"]
+def _background_done(task: asyncio.Task) -> None:
+    _background_tasks.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        logger.warning("Background payment task failed: %s", task.exception())
+
+
+def _schedule_price_refresh() -> None:
+    """Start a background price refresh when the cache is stale."""
+    global _price_refresh
+    if _prices_fresh(time.time()):
+        return
+    running = _price_refresh
+    if (
+        running is not None
+        and not running.done()
+        and running.get_loop() is asyncio.get_running_loop()
+    ):
+        return
+    _price_refresh = _spawn(_refresh_prices())
+
+
+def _cached_price(coin: str) -> float:
+    """Return the cached USD price of ``coin`` (0 if never fetched) without waiting."""
+    _schedule_price_refresh()
+    return _price_cache[coin]
 
 
 def _settlement_failure_reason(result: Any) -> str:
@@ -402,6 +439,9 @@ class PaymentHandler:
         Returns:
             Tuple of (is_valid, network_id, payer_address, invalid_reason).
         """
+        # Settle follows a passed verify, so the gas price is fetched now and
+        # is in the cache by then.
+        _schedule_price_refresh()
         try:
             network, payload_dict = self._detect_network(payment_signature)
             ns = self._schemes.get(network)
@@ -548,31 +588,24 @@ class PaymentHandler:
                         )
                         gas_cost_wei = receipt.gasUsed * receipt.effectiveGasPrice
                         gas_cost_native = gas_cost_wei / 1e18
-                        eth_price = await _get_eth_price()
+                        eth_price = _cached_price("ethereum")
                         gas_cost_usd = gas_cost_native * eth_price if eth_price else 0
                         gas_label = "ETH"
                     except Exception as e:
                         logger.warning("EVM gas cost lookup failed: %s", e)
                         gas_label = "ETH"
                 elif ns.config.type == "svm" and ns.svm_signer:
+                    # The fee follows from the signed message, so no RPC call:
+                    # a getTransaction here delayed every Solana job.
                     try:
-                        tx_sig = SolSignature.from_string(result.transaction)
-                        tx_resp = await ns.svm_signer.get_transaction_async(
-                            tx_sig,
-                            commitment="confirmed",
-                            max_supported_transaction_version=0,
-                        )
-                        fee_lamports = tx_resp.value.transaction.meta.fee
-                        gas_cost_native = fee_lamports / 1e9
-                        sol_price = await _get_sol_price()
-                        gas_cost_usd = gas_cost_native * sol_price if sol_price else 0
-                        gas_label = "SOL"
+                        fee_lamports = ns.svm_signer.fee_lamports(payload.payload["transaction"])
                     except Exception as e:
                         logger.warning("SVM gas cost lookup failed: %s", e)
-                        gas_cost_native = 0.000005
-                        sol_price = await _get_sol_price()
-                        gas_cost_usd = gas_cost_native * sol_price if sol_price else 0
-                        gas_label = "SOL"
+                        fee_lamports = _SVM_FALLBACK_FEE_LAMPORTS
+                    gas_cost_native = fee_lamports / 1e9
+                    sol_price = _cached_price("solana")
+                    gas_cost_usd = gas_cost_native * sol_price if sol_price else 0
+                    gas_label = "SOL"
 
                 settle_data["gas_cost_native"] = gas_cost_native
                 settle_data["gas_cost_usd"] = gas_cost_usd

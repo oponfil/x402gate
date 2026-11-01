@@ -123,6 +123,13 @@ class BaseProvider(ABC):
         """
         return None
 
+    async def warm_up(self) -> None:  # noqa: B027
+        """Load what the first request would otherwise wait for (catalogs).
+
+        Called in the background at startup; a failure is logged and the
+        provider loads lazily as before. Override if needed.
+        """
+
     async def close(self) -> None:  # noqa: B027
         """Clean up provider resources. Override if needed."""
 

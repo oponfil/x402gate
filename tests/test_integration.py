@@ -6,8 +6,10 @@ and httpx.AsyncClient with FastAPI's TestClient for request testing.
 
 import asyncio
 import base64
+import contextlib
 import json
 import os
+import threading
 import time
 from decimal import Decimal
 from unittest.mock import AsyncMock, patch
@@ -24,9 +26,9 @@ from x402gate.app import _pending_settlements, app, providers
 from x402gate.core.config import load_config as real_load
 from x402gate.core.payment import payment_key
 from x402gate.core.prepaid import deposit, get_balance, reset
-from x402gate.core.pricing import apply_commission
+from x402gate.core.pricing import PriceCache, apply_commission
 from x402gate.core.proxy import TaskTimeoutError
-from x402gate.providers.base import ProviderError
+from x402gate.providers.base import BaseProvider, ProviderError
 
 # Set env vars before importing the app
 os.environ.setdefault("WAVESPEED_API_KEY", "test-key-12345")
@@ -102,6 +104,8 @@ def client(config_file):
     with (
         patch("x402gate.app.load_config") as mock_load,
         patch("x402gate.app.fetch_balances", new=AsyncMock(return_value={})),
+        # Startup warm-up would fetch real catalogs; TestWarmUp covers it.
+        patch("x402gate.app._warm_up", new=AsyncMock()),
     ):
         mock_load.return_value = real_load(config_file)
         # Tests reuse the same fake payment header across requests.
@@ -1932,3 +1936,230 @@ class TestRequestGuards:
         ]
         assert submit_calls == []
         assert mock_ph.settle.await_count == 0
+
+
+class TestWarmUp:
+    """Startup loads provider catalogs in the background."""
+
+    def test_managed_providers_warm_up_and_a_failure_is_ignored(self, config_file):
+        warmed: list[str] = []
+
+        async def _fake_warm_up(self):
+            warmed.append(type(self).__name__)
+            if type(self).__name__ == "OpenRouterProvider":
+                raise RuntimeError("catalog down")
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                patch("x402gate.app.load_config", return_value=real_load(config_file))
+            )
+            stack.enter_context(
+                patch("x402gate.app.fetch_balances", new=AsyncMock(return_value={}))
+            )
+            for cls in {*gateway.PROVIDER_REGISTRY.values(), BaseProvider}:
+                stack.enter_context(patch.object(cls, "warm_up", _fake_warm_up))
+            with TestClient(app) as c:
+                deadline = time.monotonic() + 2
+                while len(warmed) < 3 and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert c.get("/health").status_code == 200
+
+        # Enabled managed providers only; blockrun is a passthrough.
+        assert sorted(warmed) == [
+            "CloudConvertProvider",
+            "OpenRouterProvider",
+            "WaveSpeedProvider",
+        ]
+
+
+class TestSharedUpstreamClient:
+    """Upstream calls reuse pooled connections instead of a new handshake each time."""
+
+    def test_passthrough_uses_a_pooled_client(self, client):
+        upstream = AsyncMock()
+        upstream.post.return_value = httpx.Response(200, json={"ok": True})
+        with patch("x402gate.app._passthrough_client", return_value=upstream):
+            for _ in range(2):
+                response = client.post(
+                    "/v1/blockrun/v1/chat/completions",
+                    json={"model": "openai/gpt-4o", "messages": []},
+                    headers={"Payment-Signature": "sig"},
+                )
+                assert response.status_code == 200
+                assert response.json() == {"ok": True}
+
+        assert upstream.post.await_count == 2
+        call = upstream.post.await_args
+        assert call.args[0] == "https://blockrun.ai/api/v1/chat/completions"
+        assert call.kwargs["headers"]["payment-signature"] == "sig"
+        # Same 120 s read limit as before; a dead host fails within 10 s.
+        assert call.kwargs["timeout"].read == 120.0
+        assert call.kwargs["timeout"].connect == 10.0
+        # The pool belongs to every caller, so a request never closes it.
+        upstream.aclose.assert_not_called()
+        upstream.__aexit__.assert_not_called()
+
+    @respx.mock
+    def test_passthrough_reuses_one_client_and_closes_it_on_shutdown(self, config_file):
+        respx.post("https://blockrun.ai/api/v1/chat/completions").mock(
+            return_value=httpx.Response(200, json={"ok": True})
+        )
+        seen: list[httpx.AsyncClient] = []
+        real = gateway._passthrough_client
+
+        def _spy() -> httpx.AsyncClient:
+            seen.append(real())
+            return seen[-1]
+
+        with (
+            patch("x402gate.app.load_config", return_value=real_load(config_file)),
+            patch("x402gate.app.fetch_balances", new=AsyncMock(return_value={})),
+            patch("x402gate.app._warm_up", new=AsyncMock()),
+            patch("x402gate.app._passthrough_client", side_effect=_spy),
+            TestClient(app) as c,
+        ):
+            for _ in range(2):
+                response = c.post(
+                    "/v1/blockrun/v1/chat/completions",
+                    json={"model": "openai/gpt-4o", "messages": []},
+                )
+                assert response.status_code == 200
+
+        assert len(seen) == 2 and seen[0] is seen[1]
+        assert seen[0].is_closed
+
+    @respx.mock
+    def test_passthrough_does_not_carry_cookies_between_users(self, client):
+        """A Set-Cookie for one user must not reach the next user's request."""
+        route = respx.post("https://blockrun.ai/api/v1/chat/completions")
+        route.side_effect = [
+            httpx.Response(200, json={"ok": 1}, headers={"Set-Cookie": "session=userA; Path=/"}),
+            httpx.Response(200, json={"ok": 2}),
+        ]
+
+        for sig in ("sig-a", "sig-b"):
+            response = client.post(
+                "/v1/blockrun/v1/chat/completions",
+                json={"model": "openai/gpt-4o", "messages": []},
+                headers={"Payment-Signature": sig},
+            )
+            assert response.status_code == 200
+
+        assert route.call_count == 2
+        second = route.calls[1].request
+        assert second.headers["payment-signature"] == "sig-b"
+        assert "cookie" not in second.headers
+
+    def test_passthrough_pool_is_separate_from_the_managed_pool(self):
+        async def _clients():
+            from x402gate.core.http import close_shared_client, shared_client
+
+            try:
+                return gateway._passthrough_client(), shared_client()
+            finally:
+                await gateway._close_passthrough_client()
+                await close_shared_client()
+
+        passthrough, managed = asyncio.run(_clients())
+        # Long passthrough calls cannot use up the managed providers' connections.
+        assert passthrough is not managed
+
+    def test_shutdown_waits_for_cancelled_warm_ups_before_closing_pools(self, config_file):
+        events: list[str] = []
+        started = threading.Event()
+
+        async def _slow_warm_up(self):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await asyncio.sleep(0)
+                events.append("warm-up unwound")
+                raise
+
+        async def _close():
+            events.append("pool closed")
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                patch("x402gate.app.load_config", return_value=real_load(config_file))
+            )
+            stack.enter_context(
+                patch("x402gate.app.fetch_balances", new=AsyncMock(return_value={}))
+            )
+            stack.enter_context(patch("x402gate.app.close_shared_client", new=_close))
+            for cls in {*gateway.PROVIDER_REGISTRY.values(), BaseProvider}:
+                stack.enter_context(patch.object(cls, "warm_up", _slow_warm_up))
+            with TestClient(app):
+                assert started.wait(2)
+
+        assert events[-1] == "pool closed"
+        assert events.count("warm-up unwound") >= 1
+        assert "pool closed" not in events[:-1]
+
+
+class TestPriceCacheOnRequests:
+    """The price cache hashes each body once and serves repeats without a quote."""
+
+    @pytest.fixture
+    def cache(self, monkeypatch):
+        cache = PriceCache(ttl=60)
+        monkeypatch.setattr(gateway, "price_cache", cache)
+        return cache
+
+    @respx.mock
+    def test_repeat_prepaid_request_skips_the_quote(self, client, cache):
+        reset()
+        kp = Keypair()
+        asyncio.run(deposit(str(kp.pubkey()), Decimal("1.00")))
+        price_route = respx.post(WAVESPEED_PRICE).mock(
+            return_value=httpx.Response(200, json={"data": {"unit_price": 0.003}})
+        )
+        respx.post(WAVESPEED_SUBMIT).mock(
+            return_value=httpx.Response(200, json={"data": {"output": {"images": ["ok"]}}})
+        )
+
+        with patch.object(PriceCache, "_make_key", wraps=PriceCache._make_key) as make_key:
+            for _ in range(2):
+                response = client.post(
+                    "/v1/wavespeed/wavespeed-ai/flux-dev",
+                    json={"prompt": "a cat"},
+                    headers=_prepaid_headers(kp, "wavespeed/wavespeed-ai/flux-dev"),
+                )
+                assert response.status_code == 200
+                assert response.json()["prepaid"]["cost"] == "0.003"
+
+        assert price_route.call_count == 1
+        # One hash per request, of the raw JSON bytes.
+        assert make_key.call_count == 2
+        assert all(isinstance(call.args[2], bytes) for call in make_key.call_args_list)
+        assert get_balance(str(kp.pubkey())) == Decimal("0.994")
+
+    @respx.mock
+    def test_large_body_is_hashed_off_the_event_loop(self, client, cache, monkeypatch):
+        monkeypatch.setattr(gateway, "_HASH_IN_THREAD_BYTES", 10)
+        _price_ok()
+        hash_threads: list[int] = []
+        loop_threads: list[int] = []
+        make_key = PriceCache._make_key
+        get_by_key = PriceCache.get_by_key
+
+        def _make_key(*args):
+            hash_threads.append(threading.get_ident())
+            return make_key(*args)
+
+        def _get_by_key(self, key):
+            loop_threads.append(threading.get_ident())
+            return get_by_key(self, key)
+
+        with (
+            patch.object(PriceCache, "_make_key", side_effect=_make_key),
+            patch.object(PriceCache, "get_by_key", _get_by_key),
+        ):
+            response = client.post(
+                "/v1/wavespeed/wavespeed-ai/flux-dev", json={"prompt": "a cat " * 10}
+            )
+
+        assert response.status_code == 402
+        assert len(hash_threads) == 1 and len(loop_threads) == 1
+        assert hash_threads[0] != loop_threads[0]

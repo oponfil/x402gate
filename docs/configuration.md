@@ -19,7 +19,7 @@ x402gate is configured via `config.yaml` in the project root. Secrets are stored
 | `web_search_tokens_per_result` | int | `2048` | Estimated extra input tokens per web search result |
 | `default_web_search_max_results` | int | `3` | Default `max_results` for the OpenRouter web plugin when the client omits it or sends a value that is not a positive integer. Client values above 10 are capped at 10, and the plugin is always sent with `engine: "exa"` |
 | `web_search_cost_per_result` | float | `0.004` | Fixed cost per web search result ($0.004, OpenRouter Exa: $4/1000) |
-| `price_cache_ttl` | int | `60` | Price cache TTL in seconds. `0` = disabled |
+| `price_cache_ttl` | int | `60` | Price cache TTL in seconds. `0` = disabled. Also bounds WaveSpeed's own price cache, which reuses a quote across prompts for image and video models whose price does not depend on the prompt |
 | `max_upload_mb` | int | `300` | Maximum file upload size in MB (all in RAM, no disk on Railway) |
 | `max_json_mb` | int | `40` | Maximum JSON request body in MB (fits 25 MB of base64 STT audio). Bodies are read before payment, so larger ones, or ones with more than 200,000 JSON objects and arrays, get HTTP 413 |
 | `max_prepaid_topup` | float | `10.0` | Maximum single top-up amount in USD |
@@ -59,7 +59,7 @@ Each provider is a key under `providers`:
 | `api_key` | string | `""` | Provider API key (use `${ENV_VAR}` syntax; if the provider is enabled, the env var must exist at startup) |
 | `fixed_price_usd` | float | `0.0` | Fixed price per request in USD (when provider has no pricing API) |
 | `description` | string | `""` | Short description shown on the landing page |
-| `poll_interval` | int | `2` | Seconds between async task status polls |
+| `poll_interval` | int | `2` | Seconds between async task status polls. WaveSpeed polls sooner at first (0.3 s, growing to this value); CloudConvert waits on its sync API and uses this only when falling back to polling |
 | `poll_timeout` | int | `600` | Max seconds to wait for task completion |
 | `docs_url` | string | `""` | Link to provider API documentation |
 | `example_request` | dict | `{}` | Example request for the landing page (`{model, body}`) |

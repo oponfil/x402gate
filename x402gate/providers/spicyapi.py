@@ -30,7 +30,9 @@ from typing import Any, NoReturn
 
 import httpx
 
+from x402gate.core import http
 from x402gate.core.config import ProviderConfig
+from x402gate.core.http import shared_client
 from x402gate.core.proxy import (
     _GATEWAY_TIMEOUT_STATUSES,
     _NOT_FOUND_GRACE_POLLS,
@@ -55,7 +57,12 @@ _IMAGE_REQUEST_TIMEOUT = 75.0
 _DEFAULT_TIMEOUT = 30.0
 _MAX_RETRIES = 2
 _RETRY_DELAY = 2.0
-_COST_LOOKUP_TRIES = 3
+# Pauses between reads of a finished chat's settled cost. SpicyAPI settles a
+# moment after the stream ends, so the first read goes out at once and the
+# next ones follow quickly. They add up to about the two poll intervals
+# (2 s each) the lookup used to wait, so a settlement that lands as late as
+# before is still found and billed exactly instead of at the quote.
+_COST_LOOKUP_DELAYS = (0.25, 0.5, 1.0, 2.0)
 # Unpaid quote requests fill the quote and price caches, so both are bounded.
 # A price outlives the gateway's price cache (60s by default) and has the same
 # entry cap, so a price served from that cache still finds its record here.
@@ -107,7 +114,6 @@ class SpicyApiProvider(BaseProvider):
     def __init__(self, config: ProviderConfig, *, default_max_tokens: int = 2048) -> None:
         super().__init__(name="spicyapi", config=config)
         self._default_max_tokens = default_max_tokens
-        self._client: httpx.AsyncClient | None = None
         self._quotes: dict[str, _Quote] = {}
         # Price shown to the client per request key, with its monotonic time.
         self._priced: dict[str, tuple[Decimal, float]] = {}
@@ -282,10 +288,7 @@ class SpicyApiProvider(BaseProvider):
         return None
 
     async def close(self) -> None:
-        """Close the shared HTTP client."""
-        if self._client and not self._client.is_closed:
-            await self._client.aclose()
-            self._client = None
+        """Nothing to close: calls use the gateway's shared pool, closed on shutdown."""
 
     def _payload(self, model_path: str, body: dict[str, Any]) -> dict[str, Any]:
         """Validate the gateway body and return the quoted SpicyAPI request."""
@@ -401,8 +404,12 @@ class SpicyApiProvider(BaseProvider):
             "Content-Type": "application/json",
             "Idempotency-Key": str(uuid.uuid4()),
         }
-        timeout = httpx.Timeout(30.0, read=float(self._config.poll_timeout))
-        client = await self._get_client()
+        timeout = httpx.Timeout(
+            30.0,
+            connect=http.CONNECT_TIMEOUT_S,
+            read=float(self._config.poll_timeout),
+        )
+        client = self._get_client()
         try:
             async with client.stream(
                 "POST",
@@ -442,7 +449,9 @@ class SpicyApiProvider(BaseProvider):
         """Read the settled chat cost once the stream has finished."""
         if not task_id:
             return None
-        for attempt in range(_COST_LOOKUP_TRIES):
+        delays = (0.0, *_COST_LOOKUP_DELAYS)
+        for attempt, delay in enumerate(delays):
+            await self._sleep(delay)
             try:
                 response = await self._send(
                     "GET",
@@ -450,8 +459,25 @@ class SpicyApiProvider(BaseProvider):
                     params={"taskId": task_id},
                     request_timeout=_DEFAULT_TIMEOUT,
                     retry=False,
+                    check=False,
                 )
-            except ProviderError:
+            except ProviderError as exc:
+                # A read that timed out already waited its full timeout, so
+                # the quote is used rather than making the client wait again.
+                # A connection that failed or dropped is read again.
+                if isinstance(exc.__cause__, httpx.TimeoutException):
+                    return None
+                logger.debug("SpicyAPI cost read %s for %s failed: %s", attempt + 1, task_id, exc)
+                continue
+            status = response.status_code
+            if not 200 <= status < 300:
+                if status in (404, 429) or status >= 500:
+                    # Not readable yet, rate limited or a hiccup: read again.
+                    logger.debug(
+                        "SpicyAPI cost read %s for %s got %s", attempt + 1, task_id, status
+                    )
+                    continue
+                # A rejected key or a bad request will not change on another read.
                 return None
             try:
                 data = _envelope_data(response)
@@ -465,8 +491,7 @@ class SpicyApiProvider(BaseProvider):
                 return cost
             if data.get("state") == "succeeded" and cost is not None:
                 return cost
-            if attempt + 1 < _COST_LOOKUP_TRIES:
-                await self._sleep(self._config.poll_interval)
+            logger.debug("SpicyAPI cost of %s not settled (read %s)", task_id, attempt + 1)
         return None
 
     def _task_request(self, model_path: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -775,7 +800,7 @@ class SpicyApiProvider(BaseProvider):
 
         attempts = 1 + _MAX_RETRIES if retry else 1
         may_have_run = ""
-        client = await self._get_client()
+        client = self._get_client()
 
         for attempt in range(attempts):
             cause: BaseException | None = None
@@ -786,7 +811,7 @@ class SpicyApiProvider(BaseProvider):
                     json=json_body,
                     params=params,
                     headers=headers,
-                    timeout=request_timeout,
+                    timeout=http.timeout(request_timeout),
                 )
             except httpx.TimeoutException as exc:
                 cause = exc
@@ -881,10 +906,11 @@ class SpicyApiProvider(BaseProvider):
             status_code=status,
         )
 
-    async def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(timeout=_IMAGE_REQUEST_TIMEOUT)
-        return self._client
+    @staticmethod
+    def _get_client() -> httpx.AsyncClient:
+        # The shared pool keeps the connection opened by the quote for the
+        # create or stream call that follows, and for the next request.
+        return shared_client()
 
     @staticmethod
     def _cache_key(payload: dict[str, Any]) -> str:

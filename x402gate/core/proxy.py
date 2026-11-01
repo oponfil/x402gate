@@ -12,6 +12,8 @@ from typing import Any
 
 import httpx
 
+from x402gate.core import http
+
 logger = logging.getLogger(__name__)
 
 # Our own API key was refused or ran out of credit. Passed on as is, a 402
@@ -38,6 +40,14 @@ _NOT_FOUND_GRACE_S = 20
 
 # Longest wait between polls while the provider keeps failing transiently.
 _MAX_POLL_BACKOFF = 30
+
+# Polling starts fast and slows to poll_interval: most jobs are short, and a
+# fixed interval leaves a finished result waiting up to a whole interval. The
+# first poll comes this soon after submit; a task not readable yet gets the
+# 404 grace above.
+_FIRST_POLL_DELAY_S = 0.3
+_EARLY_POLL_INTERVAL_S = 0.4
+_POLL_INTERVAL_GROWTH = 1.5
 
 
 class ProxyError(Exception):
@@ -126,15 +136,16 @@ async def proxy_request(
 
     for attempt in range(1 + max_retries):
         try:
-            async with httpx.AsyncClient(timeout=request_timeout) as client:
-                response = await client.post(
-                    url,
-                    json=body,
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                    },
-                )
+            # The pooled client reuses an open connection to the provider.
+            response = await http.shared_client().post(
+                url,
+                json=body,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                timeout=http.timeout(request_timeout),
+            )
         except httpx.TimeoutException as exc:
             last_error = ProxyError(
                 status_code=504,
@@ -229,11 +240,16 @@ async def poll_result(
     unknown outcome rather than a known failure: the job may still run, and
     bill, upstream.
 
+    The first poll comes shortly after submit and the gaps grow from
+    ``_EARLY_POLL_INTERVAL_S`` to poll_interval, so a short job is seen
+    finished soon after it is.
+
     Args:
         base_url: Provider API base URL.
         task_id: Task ID to poll.
         api_key: Provider API key.
-        poll_interval: Seconds between poll requests.
+        poll_interval: Seconds between poll requests once the early fast
+            polls are over.
         poll_timeout: Maximum seconds to wait before timing out.
 
     Returns:
@@ -246,189 +262,195 @@ async def poll_result(
             is redirected (3xx) or our key is rejected (401/402/403).
     """
     url = f"{base_url.rstrip('/')}/predictions/{task_id}/result"
-    elapsed = 0
     poll_count = 0
     not_found = 0  # consecutive 404 answers
-    not_found_since = 0  # elapsed seconds at the first of them
+    not_found_since = 0.0  # elapsed seconds at the first of them
     transient = 0  # consecutive transient failures, drives the backoff
+    interval = min(_EARLY_POLL_INTERVAL_S, poll_interval)  # grows to poll_interval
 
-    # Brief delay before first poll to let the task register
-    await asyncio.sleep(1)
+    # A short pause so the first poll rarely finds the task not created yet
+    elapsed = min(_FIRST_POLL_DELAY_S, poll_timeout)
+    await asyncio.sleep(elapsed)
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        while elapsed < poll_timeout:
-            poll_count += 1
-            failed_transiently = False
-            try:
-                response = await client.get(
-                    url,
-                    headers={"Authorization": f"Bearer {api_key}"},
-                )
-                if response.status_code != 404:
-                    not_found = 0
+    # The pooled client keeps the connection open between polls; never close it.
+    client = http.shared_client()
+    while elapsed < poll_timeout:
+        poll_count += 1
+        failed_transiently = False
+        try:
+            response = await client.get(
+                url,
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=http.timeout(30.0),
+            )
+            if response.status_code != 404:
+                not_found = 0
 
-                if response.status_code >= 500 or response.status_code == 429:
-                    # Server error or rate limit — transient, the task keeps running
-                    failed_transiently = True
-                    logger.warning(
-                        "Task %s poll #%d: HTTP %d after %ds — %s",
-                        task_id,
-                        poll_count,
-                        response.status_code,
-                        elapsed,
-                        response.text[:200],
-                    )
-                    # Fall through to sleep and retry
-
-                elif response.status_code == 404:
-                    if not not_found:
-                        not_found_since = elapsed
-                    not_found += 1
-                    logger.warning(
-                        "Task %s poll #%d: HTTP 404 (%d in a row) after %ds",
-                        task_id,
-                        poll_count,
-                        not_found,
-                        elapsed,
-                    )
-                    if (
-                        not_found > _NOT_FOUND_GRACE_POLLS
-                        and elapsed - not_found_since >= _NOT_FOUND_GRACE_S
-                    ):
-                        raise ProxyError(
-                            status_code=502,
-                            detail=f"Provider no longer finds task {task_id}",
-                        ) from UpstreamMayHaveRun(f"Task {task_id} not found")
-
-                elif rejected_credentials(response.status_code):
-                    logger.error(
-                        "Task %s poll #%d: HTTP %d — %s",
-                        task_id,
-                        poll_count,
-                        response.status_code,
-                        response.text[:200],
-                    )
-                    # The task was accepted with this key and may still run
-                    # upstream, so the payment is kept, as for a lost task.
-                    raise ProxyError(
-                        status_code=502, detail=UPSTREAM_CREDENTIALS_DETAIL
-                    ) from UpstreamMayHaveRun(f"Poll of task {task_id} rejected our key")
-
-                elif 300 <= response.status_code < 400:
-                    # httpx does not follow redirects, so the task cannot be
-                    # read here, but it was accepted and may still run.
-                    logger.error(
-                        "Task %s poll #%d: HTTP %d redirect to %s",
-                        task_id,
-                        poll_count,
-                        response.status_code,
-                        response.headers.get("location", "?"),
-                    )
-                    raise ProxyError(
-                        status_code=502,
-                        detail=f"Provider redirected the poll of task {task_id}",
-                    ) from UpstreamMayHaveRun(f"Poll redirect {response.status_code}")
-
-                elif response.status_code >= 400:
-                    # Client error (4xx) — won't change on retry, fail immediately
-                    logger.warning(
-                        "Task %s poll #%d: HTTP %d after %ds — %s",
-                        task_id,
-                        poll_count,
-                        response.status_code,
-                        elapsed,
-                        response.text[:200],
-                    )
-                    raise ProxyError(
-                        status_code=response.status_code,
-                        detail=response.text,
-                    )
-
-                else:
-                    try:
-                        data = response.json()
-                    except ValueError:
-                        data = None
-                    task_data = data.get("data", data) if isinstance(data, dict) else None
-                    if not isinstance(task_data, dict):
-                        # A garbled answer says nothing about the task; ask again
-                        failed_transiently = True
-                        task_data = {}
-                        logger.warning(
-                            "Task %s poll #%d: unreadable body — %s",
-                            task_id,
-                            poll_count,
-                            response.text[:200],
-                        )
-                    status = task_data.get("status", "")
-
-                    if status == "completed":
-                        logger.info(
-                            "Task %s completed after %ds (%d polls)",
-                            task_id,
-                            elapsed,
-                            poll_count,
-                        )
-                        return task_data
-
-                    if status == "failed":
-                        error_msg = task_data.get("error", "Task failed without details")
-                        logger.error(
-                            "Task %s failed after %ds (%d polls): %s",
-                            task_id,
-                            elapsed,
-                            poll_count,
-                            str(error_msg)[:200],
-                        )
-                        # Try to extract clean validation errors from provider response
-                        if isinstance(error_msg, dict):
-                            # Some providers return structured errors
-                            error_msg = error_msg.get("message", str(error_msg))
-                        elif isinstance(error_msg, str):
-                            # Try to extract "Validation errors: [...]" patterns
-                            match = re.search(r"Validation errors: \[(.+?)\]", error_msg)
-                            if match:
-                                error_msg = match.group(1).strip("'\"")
-                        raise ProxyError(
-                            status_code=502,
-                            detail=error_msg,
-                        )
-
-                    # Log every poll at INFO for first 5, then every 10th
-                    if poll_count <= 5 or poll_count % 10 == 0:
-                        logger.info(
-                            "Task %s poll #%d: status=%s, elapsed=%ds/%ds",
-                            task_id,
-                            poll_count,
-                            status,
-                            elapsed,
-                            poll_timeout,
-                        )
-
-            except httpx.RequestError as e:
+            if response.status_code >= 500 or response.status_code == 429:
+                # Server error or rate limit — transient, the task keeps running
+                failed_transiently = True
                 logger.warning(
-                    "Task %s poll #%d failed after %ds: %s: %s",
+                    "Task %s poll #%d: HTTP %d after %ds — %s",
                     task_id,
                     poll_count,
+                    response.status_code,
                     elapsed,
-                    type(e).__name__,
-                    e,
+                    response.text[:200],
                 )
-                failed_transiently = True
                 # Fall through to sleep and retry
 
-            transient = transient + 1 if failed_transiently else 0
-            delay = poll_interval
-            if transient:
-                delay = min(poll_interval * 2**transient, max(poll_interval, _MAX_POLL_BACKOFF))
-            # Do not sleep past the deadline.
-            delay = min(delay, poll_timeout - elapsed)
-            await asyncio.sleep(delay)
-            # NOTE: elapsed counts sleep time only, not HTTP request duration.
-            # Real wall-clock time may be higher if requests are slow (up to
-            # 30s httpx timeout each).  Actual user-facing latency is tracked
-            # via time.monotonic() in app.py, not here.
-            elapsed += delay
+            elif response.status_code == 404:
+                if not not_found:
+                    not_found_since = elapsed
+                not_found += 1
+                logger.warning(
+                    "Task %s poll #%d: HTTP 404 (%d in a row) after %ds",
+                    task_id,
+                    poll_count,
+                    not_found,
+                    elapsed,
+                )
+                if (
+                    not_found > _NOT_FOUND_GRACE_POLLS
+                    and elapsed - not_found_since >= _NOT_FOUND_GRACE_S
+                ):
+                    raise ProxyError(
+                        status_code=502,
+                        detail=f"Provider no longer finds task {task_id}",
+                    ) from UpstreamMayHaveRun(f"Task {task_id} not found")
+
+            elif rejected_credentials(response.status_code):
+                logger.error(
+                    "Task %s poll #%d: HTTP %d — %s",
+                    task_id,
+                    poll_count,
+                    response.status_code,
+                    response.text[:200],
+                )
+                # The task was accepted with this key and may still run
+                # upstream, so the payment is kept, as for a lost task.
+                raise ProxyError(
+                    status_code=502, detail=UPSTREAM_CREDENTIALS_DETAIL
+                ) from UpstreamMayHaveRun(f"Poll of task {task_id} rejected our key")
+
+            elif 300 <= response.status_code < 400:
+                # httpx does not follow redirects, so the task cannot be
+                # read here, but it was accepted and may still run.
+                logger.error(
+                    "Task %s poll #%d: HTTP %d redirect to %s",
+                    task_id,
+                    poll_count,
+                    response.status_code,
+                    response.headers.get("location", "?"),
+                )
+                raise ProxyError(
+                    status_code=502,
+                    detail=f"Provider redirected the poll of task {task_id}",
+                ) from UpstreamMayHaveRun(f"Poll redirect {response.status_code}")
+
+            elif response.status_code >= 400:
+                # Client error (4xx) — won't change on retry, fail immediately
+                logger.warning(
+                    "Task %s poll #%d: HTTP %d after %ds — %s",
+                    task_id,
+                    poll_count,
+                    response.status_code,
+                    elapsed,
+                    response.text[:200],
+                )
+                raise ProxyError(
+                    status_code=response.status_code,
+                    detail=response.text,
+                )
+
+            else:
+                try:
+                    data = response.json()
+                except ValueError:
+                    data = None
+                task_data = data.get("data", data) if isinstance(data, dict) else None
+                if not isinstance(task_data, dict):
+                    # A garbled answer says nothing about the task; ask again
+                    failed_transiently = True
+                    task_data = {}
+                    logger.warning(
+                        "Task %s poll #%d: unreadable body — %s",
+                        task_id,
+                        poll_count,
+                        response.text[:200],
+                    )
+                status = task_data.get("status", "")
+
+                if status == "completed":
+                    logger.info(
+                        "Task %s completed after %ds (%d polls)",
+                        task_id,
+                        elapsed,
+                        poll_count,
+                    )
+                    return task_data
+
+                if status == "failed":
+                    error_msg = task_data.get("error", "Task failed without details")
+                    logger.error(
+                        "Task %s failed after %ds (%d polls): %s",
+                        task_id,
+                        elapsed,
+                        poll_count,
+                        str(error_msg)[:200],
+                    )
+                    # Try to extract clean validation errors from provider response
+                    if isinstance(error_msg, dict):
+                        # Some providers return structured errors
+                        error_msg = error_msg.get("message", str(error_msg))
+                    elif isinstance(error_msg, str):
+                        # Try to extract "Validation errors: [...]" patterns
+                        match = re.search(r"Validation errors: \[(.+?)\]", error_msg)
+                        if match:
+                            error_msg = match.group(1).strip("'\"")
+                    raise ProxyError(
+                        status_code=502,
+                        detail=error_msg,
+                    )
+
+                # Log every poll at INFO for first 5, then every 10th
+                if poll_count <= 5 or poll_count % 10 == 0:
+                    logger.info(
+                        "Task %s poll #%d: status=%s, elapsed=%ds/%ds",
+                        task_id,
+                        poll_count,
+                        status,
+                        elapsed,
+                        poll_timeout,
+                    )
+
+        except httpx.RequestError as e:
+            logger.warning(
+                "Task %s poll #%d failed after %ds: %s: %s",
+                task_id,
+                poll_count,
+                elapsed,
+                type(e).__name__,
+                e,
+            )
+            failed_transiently = True
+            # Fall through to sleep and retry
+
+        transient = transient + 1 if failed_transiently else 0
+        delay = interval
+        interval = min(interval * _POLL_INTERVAL_GROWTH, poll_interval)
+        if transient:
+            # Rate limits and outages back off from the full interval.
+            delay = min(poll_interval * 2**transient, max(poll_interval, _MAX_POLL_BACKOFF))
+        # Do not sleep past the deadline.
+        delay = min(delay, poll_timeout - elapsed)
+        await asyncio.sleep(delay)
+        # NOTE: elapsed counts sleep time only, not HTTP request duration.
+        # Real wall-clock time may be higher if requests are slow (up to
+        # 30s httpx timeout each).  Actual user-facing latency is tracked
+        # via time.monotonic() in app.py, not here. Rounded so the float sum
+        # lands on poll_timeout exactly instead of a hair below it.
+        elapsed = round(elapsed + delay, 6)
 
     logger.error(
         "Task %s timed out after %ds (%d polls, url=%s)",

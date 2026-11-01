@@ -1,7 +1,8 @@
 """Unit tests for OpenRouter provider."""
 
+import asyncio
 import json
-import time
+import threading
 from decimal import Decimal
 from unittest.mock import AsyncMock, patch
 
@@ -722,10 +723,8 @@ class TestSubmit:
     @pytest.fixture(autouse=True)
     def warm_catalog(self, provider, model_info_response):
         """submit reads the catalog get_price already loaded to cap the endpoint price."""
-        for model in model_info_response.json()["data"]:
-            provider._models_cache[model["id"]] = model
-        provider._fetched_catalogs.add("")
-        provider._cache_updated_at = time.time()
+        models = {model["id"]: model for model in model_info_response.json()["data"]}
+        provider._catalogs.put("", models)
 
     @pytest.mark.asyncio
     async def test_forwards_request(self, provider, chat_completion_response):
@@ -1299,11 +1298,11 @@ class TestEndpointPriceCap:
 
     @pytest.fixture(autouse=True)
     def warm_catalog(self, provider, model_info_response, embedding_model_info_response):
-        for response in (model_info_response, embedding_model_info_response):
-            for model in response.json()["data"]:
-                provider._models_cache[model["id"]] = model
-        provider._fetched_catalogs.update({"", "embeddings"})
-        provider._cache_updated_at = time.time()
+        for key, response in (
+            ("", model_info_response),
+            ("embeddings", embedding_model_info_response),
+        ):
+            provider._catalogs.put(key, {model["id"]: model for model in response.json()["data"]})
 
     async def _sent(self, provider, chat_completion_response, path, body):
         with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
@@ -1543,3 +1542,382 @@ class TestInputTokenEstimate:
 
     def test_lone_surrogate_does_not_raise(self):
         assert self._tokens("a\ud800b") >= 1
+
+
+def _expire(catalogs: openrouter.CatalogCache, key: str) -> None:
+    """Age a loaded catalog past its TTL."""
+    catalogs._loaded_at[key] -= 2 * catalogs._ttl
+    catalogs._refresh_at[key] -= 2 * catalogs._ttl
+
+
+def _gpt4o_mini(prompt: str) -> httpx.Response:
+    return _catalog({"id": "openai/gpt-4o-mini", "pricing": {"prompt": prompt, "completion": "0"}})
+
+
+class TestPooledClient:
+    """Billed calls and catalog fetches reuse one pooled client."""
+
+    async def test_submits_share_one_client_with_a_short_connect_timeout(
+        self, provider, chat_completion_response
+    ):
+        provider._catalogs.put("", {})
+        with patch.object(httpx.AsyncClient, "post", autospec=True) as mock_post:
+            mock_post.return_value = chat_completion_response
+            await provider.submit("chat/completions", _chat_body())
+            await provider.submit("chat/completions", _chat_body())
+
+        first, second = mock_post.call_args_list
+        assert first.args[0] is second.args[0]
+        assert not first.args[0].is_closed
+        sent_timeout = first.kwargs["timeout"]
+        assert sent_timeout.connect == 10.0
+        assert sent_timeout.read == float(provider._config.poll_timeout)
+        # A full shared pool fails fast (never sent: retried, then refunded).
+        assert sent_timeout.pool == 10.0
+
+    async def test_catalog_fetch_uses_the_shared_client(self, provider, model_info_response):
+        with (
+            patch.object(httpx.AsyncClient, "get", autospec=True) as mock_get,
+            patch.object(httpx.AsyncClient, "post", autospec=True) as mock_post,
+        ):
+            mock_get.return_value = model_info_response
+            mock_post.return_value = httpx.Response(200, json={"usage": {}})
+            await provider.get_price("chat/completions", _chat_body())
+            await provider.submit("chat/completions", _chat_body())
+
+        assert mock_get.call_args.args[0] is mock_post.call_args.args[0]
+        assert mock_get.call_args.kwargs["timeout"].read == 15.0
+
+
+class TestCatalogWarmUp:
+    """Catalogs load at startup, so the first request does not wait for them."""
+
+    async def test_warm_up_loads_every_catalog(
+        self,
+        provider,
+        model_info_response,
+        embedding_model_info_response,
+        transcription_model_info_response,
+    ):
+        def by_url(url, **kwargs):
+            if url.endswith("embeddings"):
+                return embedding_model_info_response
+            if url.endswith("transcription"):
+                return transcription_model_info_response
+            return model_info_response
+
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.side_effect = by_url
+            await provider.warm_up()
+            assert mock_get.call_count == 3
+            await provider.get_price("chat/completions", _chat_body())
+            await provider.get_price(
+                "embeddings", {"model": "openai/text-embedding-3-small", "input": "hi"}
+            )
+            await provider.get_price(
+                "audio/transcriptions",
+                {
+                    "model": "openai/whisper-1",
+                    "input_audio": {"data": make_wav_b64(1.0), "format": "wav"},
+                },
+            )
+
+        assert mock_get.call_count == 3
+
+    async def test_warm_up_failure_is_raised_for_the_log(self, provider, model_info_response):
+        """One failed catalog is reported; the ones that loaded are kept."""
+
+        def by_url(url, **kwargs):
+            if url.endswith("transcription"):
+                return httpx.Response(400, text="bad request")
+            return model_info_response
+
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.side_effect = by_url
+            with pytest.raises(ProviderError):
+                await provider.warm_up()
+            await provider.get_price("chat/completions", _chat_body())
+
+        assert mock_get.call_count == 3
+
+    async def test_concurrent_first_requests_share_one_fetch(self, provider, model_info_response):
+        release = asyncio.Event()
+
+        async def slow_catalog(url, **kwargs):
+            await release.wait()
+            return model_info_response
+
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.side_effect = slow_catalog
+            requests = [
+                asyncio.create_task(provider.get_price("chat/completions", _chat_body()))
+                for _ in range(5)
+            ]
+            await asyncio.sleep(0)
+            release.set()
+            prices = await asyncio.gather(*requests)
+
+        assert mock_get.call_count == 1
+        assert len(set(prices)) == 1
+
+    async def test_cancelled_request_does_not_cancel_the_shared_fetch(
+        self, provider, model_info_response
+    ):
+        release = asyncio.Event()
+
+        async def slow_catalog(url, **kwargs):
+            await release.wait()
+            return model_info_response
+
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.side_effect = slow_catalog
+            first = asyncio.create_task(provider.get_price("chat/completions", _chat_body()))
+            second = asyncio.create_task(provider.get_price("chat/completions", _chat_body()))
+            await asyncio.sleep(0)
+            first.cancel()
+            release.set()
+            price = await second
+
+        assert price == _mini_price(_chat_tokens(len("Hi")))
+        assert mock_get.call_count == 1
+
+
+class TestCatalogStaleWhileRevalidate:
+    """An expired catalog is served while one background task refreshes it."""
+
+    async def test_expired_catalog_is_served_while_one_refresh_runs(self, provider):
+        provider._catalogs.put("", {"openai/gpt-4o-mini": _gpt4o_mini("0.001").json()["data"][0]})
+        _expire(provider._catalogs, "")
+        release = asyncio.Event()
+
+        async def slow_catalog(url, **kwargs):
+            await release.wait()
+            return _gpt4o_mini("0.002")
+
+        body = _chat_body(max_tokens=1024)
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.side_effect = slow_catalog
+            # Both answer at once from the old prices; only one fetch starts.
+            old = await provider.get_price("chat/completions", body)
+            refresh = provider._catalogs._tasks[""]
+            again = await provider.get_price("chat/completions", body)
+            assert provider._catalogs._tasks[""] is refresh
+            await asyncio.sleep(0)
+            assert mock_get.call_count == 1
+            release.set()
+            await refresh
+            new = await provider.get_price("chat/completions", body)
+
+        tokens = _chat_tokens(len("Hi"))
+        assert old == again == Decimal(tokens) * Decimal("0.001")
+        assert new == Decimal(tokens) * Decimal("0.002")
+        assert mock_get.call_count == 1
+
+    async def test_failed_refresh_keeps_the_old_catalog_and_retries_later(self, provider):
+        provider._catalogs.put("", {"openai/gpt-4o-mini": _gpt4o_mini("0.001").json()["data"][0]})
+        _expire(provider._catalogs, "")
+        body = _chat_body(max_tokens=1024)
+        expected = Decimal(_chat_tokens(len("Hi"))) * Decimal("0.001")
+
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = httpx.Response(400, text="down")
+            assert await provider.get_price("chat/completions", body) == expected
+            await asyncio.gather(provider._catalogs._tasks[""], return_exceptions=True)
+            # Within the retry delay no new fetch starts.
+            assert await provider.get_price("chat/completions", body) == expected
+            assert mock_get.call_count == 1
+
+            provider._catalogs._refresh_at[""] -= openrouter._CATALOG_RETRY_S
+            mock_get.return_value = _gpt4o_mini("0.002")
+            assert await provider.get_price("chat/completions", body) == expected
+            await provider._catalogs._tasks[""]
+
+        assert mock_get.call_count == 2
+        assert await provider.get_price("chat/completions", body) == expected * 2
+
+    async def test_empty_refresh_keeps_the_old_catalog(self, provider):
+        provider._catalogs.put("", {"openai/gpt-4o-mini": _gpt4o_mini("0.001").json()["data"][0]})
+        _expire(provider._catalogs, "")
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = _catalog()
+            await provider.get_price("chat/completions", _chat_body())
+            await asyncio.gather(provider._catalogs._tasks[""], return_exceptions=True)
+
+        assert "openai/gpt-4o-mini" in provider._catalogs._catalogs[""]
+
+    async def test_empty_first_load_is_an_error(self, provider):
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = _catalog()
+            with pytest.raises(ProviderError) as exc_info:
+                await provider.get_price("chat/completions", _chat_body())
+
+        assert exc_info.value.status_code == 503
+
+    async def test_model_missing_from_an_expired_catalog_waits_for_the_refresh(
+        self, provider, model_info_response
+    ):
+        provider._catalogs.put("", {"old/model": {"id": "old/model", "pricing": {}}})
+        _expire(provider._catalogs, "")
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = model_info_response
+            price = await provider.get_price("chat/completions", _chat_body())
+
+        assert price == _mini_price(_chat_tokens(len("Hi")))
+        assert mock_get.call_count == 1
+
+    async def test_model_missing_from_a_fresh_catalog_is_not_refetched(
+        self, provider, model_info_response
+    ):
+        provider._catalogs.put("", {"old/model": {"id": "old/model", "pricing": {}}})
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = model_info_response
+            with pytest.raises(ProviderError) as exc_info:
+                await provider.get_price("chat/completions", _chat_body())
+
+        assert exc_info.value.status_code == 404
+        mock_get.assert_not_called()
+
+    async def test_unknown_model_after_a_failed_refresh_does_not_fetch_again(self, provider):
+        """In the retry delay an unknown id is a 404 at once, not a fetch per request."""
+        provider._catalogs.put("", {"old/model": {"id": "old/model", "pricing": {}}})
+        _expire(provider._catalogs, "")
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = httpx.Response(400, text="down")
+            statuses = []
+            for _ in range(3):
+                with pytest.raises(ProviderError) as exc_info:
+                    await provider.get_price("chat/completions", _chat_body())
+                statuses.append(exc_info.value.status_code)
+            # The first one waited for the refresh and got its error.
+            assert statuses == [400, 404, 404]
+            assert mock_get.call_count == 1
+
+            # After the retry delay a missing model waits for a fetch again.
+            provider._catalogs._refresh_at[""] -= openrouter._CATALOG_RETRY_S
+            mock_get.return_value = _gpt4o_mini("0.001")
+            price = await provider.get_price("chat/completions", _chat_body(max_tokens=1024))
+
+        assert price == Decimal(_chat_tokens(len("Hi"))) * Decimal("0.001")
+        assert mock_get.call_count == 2
+
+
+class TestCapAfterRefresh:
+    """A refresh between get_price and submit never lifts the cap above the priced rates."""
+
+    _ROUTING = {"order": ["pricey-host"]}
+
+    async def _refreshed_cap(self, provider, chat_completion_response, old, new, model=None):
+        provider._catalogs.put("", old)
+        provider._catalogs.put("", new)
+        body = _chat_body(provider=self._ROUTING, **({"model": model} if model else {}))
+        with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = chat_completion_response
+            await provider.submit("chat/completions", body)
+        return mock_post.call_args.kwargs["json"]["provider"]["max_price"]
+
+    @staticmethod
+    def _mini(prompt: str, completion: str = "0.000001") -> dict:
+        return {
+            "openai/gpt-4o-mini": {
+                "id": "openai/gpt-4o-mini",
+                "pricing": {"prompt": prompt, "completion": completion},
+            }
+        }
+
+    async def test_raised_rate_keeps_the_replaced_cap(self, provider, chat_completion_response):
+        cap = await self._refreshed_cap(
+            provider,
+            chat_completion_response,
+            self._mini("0.000001"),
+            self._mini("0.000003", completion="0.0000005"),
+        )
+        # Prompt at the old (priced) rate; completion fell, so the new one.
+        assert cap == {"prompt": 1.0, "completion": 0.5, "request": 0.0}
+
+    async def test_model_new_in_the_refresh_uses_the_fresh_rates(
+        self, provider, chat_completion_response
+    ):
+        new = {
+            **self._mini("0.000001"),
+            "new/model": {"id": "new/model", "pricing": {"prompt": "0.000002", "completion": "0"}},
+        }
+        cap = await self._refreshed_cap(
+            provider, chat_completion_response, self._mini("0.000001"), new, model="new/model"
+        )
+        assert cap["prompt"] == 2.0
+
+    async def test_cap_follows_the_fresh_rates_after_the_grace_window(
+        self, provider, chat_completion_response
+    ):
+        provider._catalogs.put("", self._mini("0.000001"))
+        provider._catalogs.put("", self._mini("0.000003"))
+        old, replaced_at = provider._catalogs._previous[""]
+        provider._catalogs._previous[""] = (old, replaced_at - openrouter._CAP_GRACE_S - 1)
+        with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = chat_completion_response
+            await provider.submit("chat/completions", _chat_body(provider=self._ROUTING))
+        assert mock_post.call_args.kwargs["json"]["provider"]["max_price"]["prompt"] == 3.0
+
+
+class TestRequestWeighing:
+    """Large bodies are weighed once per request, and audio off the event loop."""
+
+    async def test_get_price_weighs_chat_text_once_and_submit_not_at_all(
+        self, provider, model_info_response, chat_completion_response
+    ):
+        with (
+            patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get,
+            patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post,
+            patch.object(openrouter, "chat_input_size", wraps=openrouter.chat_input_size) as weigh,
+        ):
+            mock_get.return_value = model_info_response
+            mock_post.return_value = chat_completion_response
+            await provider.get_price("chat/completions", _chat_body())
+            assert weigh.call_count == 1
+            await provider.submit("chat/completions", _chat_body())
+
+        assert weigh.call_count == 1
+
+    async def test_submit_still_refuses_unpriced_content_parts(self, provider):
+        body = _chat_body(
+            messages=[{"role": "user", "content": [{"type": "file", "file": {"data": "x"}}]}]
+        )
+        with (
+            patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post,
+            pytest.raises(ProviderError) as exc_info,
+        ):
+            await provider.submit("chat/completions", body)
+
+        assert exc_info.value.status_code == 400
+        assert "file" in exc_info.value.detail
+        mock_post.assert_not_called()
+
+    async def test_stt_audio_is_measured_once_in_a_worker_thread(
+        self, provider, transcription_model_info_response
+    ):
+        threads = []
+        real_duration = openrouter.get_audio_duration_seconds
+
+        def recording_duration(*args, **kwargs):
+            threads.append(threading.current_thread())
+            return real_duration(*args, **kwargs)
+
+        body = {
+            "model": "openai/whisper-1",
+            "models": ["openai/whisper-1", "openai/whisper-1-copy"],
+            "input_audio": {"data": make_wav_b64(2.0), "format": "wav"},
+        }
+        catalog = transcription_model_info_response.json()["data"]
+        catalog.append(
+            {"id": "openai/whisper-1-copy", "pricing": {"prompt": "0.0003", "completion": "0"}}
+        )
+        with (
+            patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get,
+            patch.object(openrouter, "get_audio_duration_seconds", recording_duration),
+        ):
+            mock_get.return_value = _catalog(*catalog)
+            price = await provider.get_price("audio/transcriptions", body)
+
+        assert price == Decimal(2) * Decimal("0.0003")
+        assert len(threads) == 1
+        assert threads[0] is not threading.main_thread()

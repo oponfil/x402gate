@@ -1,5 +1,6 @@
 """Unit tests for the NanoGPT chat provider."""
 
+import asyncio
 import json
 from decimal import Decimal
 from unittest.mock import AsyncMock, patch
@@ -8,9 +9,10 @@ import httpx
 import pytest
 
 from x402gate.core.config import ProviderConfig
+from x402gate.providers import nanogpt
 from x402gate.providers.base import ProviderError, outcome_unknown
 from x402gate.providers.nanogpt import NanoGptProvider
-from x402gate.providers.openrouter import estimate_chat_input_tokens
+from x402gate.providers.openrouter import _CATALOG_RETRY_S, estimate_chat_input_tokens
 
 PROMPT_PER_MILLION = Decimal("1")
 COMPLETION_PER_MILLION = Decimal("2")
@@ -460,8 +462,7 @@ class TestActualCost:
 
     @pytest.mark.asyncio
     async def test_cache_read_is_not_billed_as_fresh_input(self, provider):
-        provider._models_cache = {"demo/model": _priced("demo/model")}
-        provider._cache_updated_at = 10**12
+        provider._catalog.put("", {"demo/model": _priced("demo/model")})
         result = {
             "usage": {
                 "prompt_tokens": 1000,
@@ -596,3 +597,146 @@ class TestReasoningBudget:
             mock_get.return_value = _catalog(_priced("demo/model"))
             await provider.get_price("chat/completions", body)
         assert caught.value.status_code == 400
+
+
+def _expire(provider: NanoGptProvider) -> None:
+    """Age the loaded catalog past its TTL."""
+    catalogs = provider._catalog
+    catalogs._loaded_at[""] -= 2 * catalogs._ttl
+    catalogs._refresh_at[""] -= 2 * catalogs._ttl
+
+
+class TestCatalogLoading:
+    """The catalog loads at startup and refreshes without making requests wait."""
+
+    async def test_warm_up_loads_the_catalog(self, provider):
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = _catalog(_priced("demo/model"))
+            await provider.warm_up()
+            price = await provider.get_price("chat/completions", _chat_body())
+
+        assert price == _expected(_tokens(len("Hi")))
+        assert mock_get.call_count == 1
+        assert mock_get.call_args.kwargs["timeout"].connect == 10.0
+
+    async def test_expired_catalog_is_served_while_it_refreshes(self, provider):
+        provider._catalog.put("", {"demo/model": _priced("demo/model")})
+        _expire(provider)
+        release = asyncio.Event()
+
+        async def slow_catalog(url, **kwargs):
+            await release.wait()
+            return _catalog(_priced("demo/model", prompt="2", completion="4"))
+
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.side_effect = slow_catalog
+            old = await provider.get_price("chat/completions", _chat_body())
+            refresh = provider._catalog._tasks[""]
+            await provider.get_price("chat/completions", _chat_body())
+            assert provider._catalog._tasks[""] is refresh
+            release.set()
+            await refresh
+            new = await provider.get_price("chat/completions", _chat_body())
+
+        assert old == _expected(_tokens(len("Hi")))
+        assert new == old * 2
+        assert mock_get.call_count == 1
+
+    async def test_failed_refresh_keeps_the_old_catalog(self, provider):
+        provider._catalog.put("", {"demo/model": _priced("demo/model")})
+        _expire(provider)
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = httpx.Response(400, text="down")
+            price = await provider.get_price("chat/completions", _chat_body())
+            await asyncio.gather(provider._catalog._tasks[""], return_exceptions=True)
+            again = await provider.get_price("chat/completions", _chat_body())
+
+        assert price == again == _expected(_tokens(len("Hi")))
+        assert mock_get.call_count == 1
+
+    async def test_model_missing_from_an_expired_catalog_waits_for_the_refresh(self, provider):
+        provider._catalog.put("", {"old/model": _priced("old/model")})
+        _expire(provider)
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = _catalog(_priced("demo/model"))
+            price = await provider.get_price("chat/completions", _chat_body())
+
+        assert price == _expected(_tokens(len("Hi")))
+        assert mock_get.call_count == 1
+
+    async def test_model_missing_from_a_fresh_catalog_is_not_refetched(self, provider):
+        provider._catalog.put("", {"old/model": _priced("old/model")})
+        with (
+            patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get,
+            pytest.raises(ProviderError) as exc_info,
+        ):
+            await provider.get_price("chat/completions", _chat_body())
+
+        assert exc_info.value.status_code == 404
+        mock_get.assert_not_called()
+
+    async def test_unknown_model_after_a_failed_refresh_does_not_fetch_again(self, provider):
+        """In the retry delay an unknown id is a 404 at once, not a fetch per request."""
+        provider._catalog.put("", {"old/model": _priced("old/model")})
+        _expire(provider)
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = httpx.Response(400, text="down")
+            statuses = []
+            for _ in range(3):
+                with pytest.raises(ProviderError) as exc_info:
+                    await provider.get_price("chat/completions", _chat_body())
+                statuses.append(exc_info.value.status_code)
+            # The first one waited for the refresh and got its error.
+            assert statuses == [400, 404, 404]
+            assert mock_get.call_count == 1
+
+            # After the retry delay a missing model waits for a fetch again.
+            provider._catalog._refresh_at[""] -= _CATALOG_RETRY_S
+            mock_get.return_value = _catalog(_priced("demo/model"))
+            price = await provider.get_price("chat/completions", _chat_body())
+
+        assert price == _expected(_tokens(len("Hi")))
+        assert mock_get.call_count == 2
+
+    async def test_suffixed_model_is_found_in_a_stale_catalog_without_waiting(self, provider):
+        provider._catalog.put("", {"demo/model": _priced("demo/model")})
+        _expire(provider)
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.side_effect = asyncio.Event().wait  # never answers
+            price = await provider.get_price(
+                "chat/completions", _chat_body(model="demo/model:thinking")
+            )
+            provider._catalog._tasks[""].cancel()
+
+        assert price == _expected(_tokens(len("Hi")))
+
+
+class TestPooledSubmit:
+    """Completions go through the shared pooled client."""
+
+    async def test_submits_share_one_client(self, provider):
+        response = httpx.Response(200, json={"choices": [], "usage": {}})
+        with patch.object(httpx.AsyncClient, "post", autospec=True) as mock_post:
+            mock_post.return_value = response
+            await provider.submit("chat/completions", _chat_body())
+            await provider.submit("chat/completions", _chat_body())
+
+        first, second = mock_post.call_args_list
+        assert first.args[0] is second.args[0]
+        assert first.kwargs["timeout"].connect == 10.0
+        assert first.kwargs["timeout"].read == 10.0
+
+    async def test_get_price_weighs_once_and_submit_not_at_all(self, provider):
+        provider._catalog.put("", {"demo/model": _priced("demo/model")})
+        with (
+            patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post,
+            patch.object(
+                nanogpt, "estimate_chat_input_tokens", wraps=nanogpt.estimate_chat_input_tokens
+            ) as weigh,
+        ):
+            mock_post.return_value = httpx.Response(200, json={"choices": [], "usage": {}})
+            await provider.get_price("chat/completions", _chat_body())
+            assert weigh.call_count == 1
+            await provider.submit("chat/completions", _chat_body())
+
+        assert weigh.call_count == 1

@@ -6,9 +6,13 @@ import base64
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
+import respx
 
+from x402gate.core import http
 from x402gate.core.config import ProviderConfig
+from x402gate.providers.base import ProviderError, outcome_unknown
 from x402gate.providers.fishaudio import FishAudioProvider
 
 
@@ -101,11 +105,10 @@ class TestSubmit:
         mock_response.content = fake_audio
         mock_response.headers = {"content-type": "audio/mpeg"}
 
-        with patch("x402gate.providers.fishaudio.httpx.AsyncClient") as mock_cls:
+        with patch("x402gate.providers.fishaudio.shared_client") as mock_shared:
             mock_client = AsyncMock()
             mock_client.post.return_value = mock_response
-            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_shared.return_value = mock_client
 
             result = await provider.submit(
                 "tts",
@@ -130,11 +133,10 @@ class TestSubmit:
         mock_response.content = fake_audio
         mock_response.headers = {"content-type": "audio/mpeg"}
 
-        with patch("x402gate.providers.fishaudio.httpx.AsyncClient") as mock_cls:
+        with patch("x402gate.providers.fishaudio.shared_client") as mock_shared:
             mock_client = AsyncMock()
             mock_client.post.return_value = mock_response
-            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_shared.return_value = mock_client
 
             result = await provider.submit("tts", {"text": text})
 
@@ -156,11 +158,10 @@ class TestSubmit:
         mock_response.status_code = 403
         mock_response.text = "Forbidden"
 
-        with patch("x402gate.providers.fishaudio.httpx.AsyncClient") as mock_cls:
+        with patch("x402gate.providers.fishaudio.shared_client") as mock_shared:
             mock_client = AsyncMock()
             mock_client.post.return_value = mock_response
-            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_shared.return_value = mock_client
 
             with pytest.raises(Exception, match="FishAudio error"):
                 await provider.submit("tts", {"text": "Hello"})
@@ -180,3 +181,71 @@ class TestGetResult:
         provider = _make_provider()
         with pytest.raises(NotImplementedError, match="synchronous"):
             await provider.get_result("any_task_id")
+
+
+# ---------------------------------------------------------------------------
+# pooled connection
+# ---------------------------------------------------------------------------
+
+
+_TTS_URL = "https://api.fish.audio/v1/tts"
+
+
+@pytest.fixture
+async def pooled():
+    """Run against the real shared client and close it afterwards."""
+    yield
+    await http.close_shared_client()
+
+
+class TestPooledClient:
+    """Calls go through the shared pooled client, not a new client per call."""
+
+    @respx.mock
+    async def test_requests_reuse_one_client(self, pooled):
+        """Two calls build one client, so the second skips the TCP/TLS handshake."""
+        provider = _make_provider()
+        route = respx.post(_TTS_URL).mock(
+            return_value=httpx.Response(
+                200, content=b"audio", headers={"content-type": "audio/mpeg"}
+            )
+        )
+        with patch("x402gate.core.http.httpx.AsyncClient", wraps=httpx.AsyncClient) as ctor:
+            await provider.submit("tts", {"text": "Hello"})
+            await provider.submit("tts", {"text": "Hello"})
+        assert ctor.call_count == 1
+        assert route.call_count == 2
+
+    @respx.mock
+    async def test_keeps_the_read_timeout_with_a_short_connect_limit(self, pooled):
+        """The old per-call timeout still bounds the read; connecting fails fast."""
+        provider = _make_provider()
+        route = respx.post(_TTS_URL).mock(
+            return_value=httpx.Response(
+                200, content=b"audio", headers={"content-type": "audio/mpeg"}
+            )
+        )
+        await provider.submit("tts", {"text": "Hello"})
+        limits = route.calls.last.request.extensions["timeout"]
+        assert limits["read"] == 600
+        assert limits["connect"] == http.CONNECT_TIMEOUT_S
+
+    @respx.mock
+    async def test_read_timeout_keeps_the_payment(self, pooled):
+        """The request was sent and may have run: outcome unknown, as before."""
+        provider = _make_provider()
+        respx.post(_TTS_URL).mock(side_effect=httpx.ReadTimeout("slow"))
+        with pytest.raises(ProviderError) as caught:
+            await provider.submit("tts", {"text": "Hello"})
+        assert caught.value.status_code == 504
+        assert outcome_unknown(caught.value) is True
+
+    @respx.mock
+    @pytest.mark.parametrize("error", [httpx.ConnectError, httpx.ConnectTimeout])
+    async def test_connection_never_opened_is_refunded(self, pooled, error):
+        """Nothing was sent, so the client is refunded, as before."""
+        provider = _make_provider()
+        respx.post(_TTS_URL).mock(side_effect=error("down"))
+        with pytest.raises(ProviderError) as caught:
+            await provider.submit("tts", {"text": "Hello"})
+        assert outcome_unknown(caught.value) is False

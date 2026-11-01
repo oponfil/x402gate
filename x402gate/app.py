@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import http.cookiejar
 import json
 import logging
 import os
@@ -24,6 +25,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 from x402gate.core import stats
 from x402gate.core.balances import fetch_balances
 from x402gate.core.config import AppConfig, load_config
+from x402gate.core.http import KEEPALIVE_EXPIRY_S, close_shared_client
+from x402gate.core.http import timeout as upstream_timeout
 from x402gate.core.payment import (
     InFlightAmounts,
     PaymentClaims,
@@ -78,6 +81,48 @@ _TOPUP_BODY_LIMIT_BYTES = 64 * 1024
 _MAX_JSON_CONTAINERS = 200_000
 # Keys the gateway adds to the body itself; a client must not supply them.
 _INTERNAL_BODY_KEYS = frozenset({"_caller", "_file_bytes", "_file_name"})
+# A body above this is hashed for the price cache in a worker thread. sha256
+# releases the GIL, so a 24 MB upload (~30 ms) does not stall other requests.
+_HASH_IN_THREAD_BYTES = 1024 * 1024
+# The passthrough has its own pool, so long passthrough LLM calls never take
+# connections from managed provider calls. No cap on open connections, as
+# before pooling; only idle ones are limited.
+_PASSTHROUGH_LIMITS = httpx.Limits(
+    max_connections=None,
+    max_keepalive_connections=50,
+    keepalive_expiry=KEEPALIVE_EXPIRY_S,
+)
+# One passthrough client per event loop, like core/http.py's shared client.
+_passthrough: httpx.AsyncClient | None = None
+_passthrough_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _passthrough_client() -> httpx.AsyncClient:
+    """Return the pooled passthrough client for the running event loop.
+
+    It stores no cookies. The client is shared by every end user, so a
+    Set-Cookie the upstream sends one user must not reach the next.
+    """
+    global _passthrough, _passthrough_loop
+    loop = asyncio.get_running_loop()
+    if _passthrough is None or _passthrough.is_closed or _passthrough_loop is not loop:
+        no_cookies = http.cookiejar.CookieJar(
+            policy=http.cookiejar.DefaultCookiePolicy(allowed_domains=[])
+        )
+        _passthrough = httpx.AsyncClient(
+            timeout=upstream_timeout(120.0), limits=_PASSTHROUGH_LIMITS, cookies=no_cookies
+        )
+        _passthrough_loop = loop
+    return _passthrough
+
+
+async def _close_passthrough_client() -> None:
+    """Close the passthrough pool (on shutdown)."""
+    global _passthrough, _passthrough_loop
+    if _passthrough is not None and not _passthrough.is_closed:
+        await _passthrough.aclose()
+    _passthrough = None
+    _passthrough_loop = None
 
 
 def _error_response(
@@ -242,6 +287,14 @@ def _job_done(task: asyncio.Task) -> None:
         logger.error("Polled job crashed", exc_info=task.exception())
 
 
+async def _warm_up(name: str, provider: BaseProvider) -> None:
+    """Run a provider's warm-up; a failure leaves it to load lazily."""
+    try:
+        await provider.warm_up()
+    except Exception:
+        logger.warning("Provider '%s' warm-up failed; it will load on demand", name, exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application startup and shutdown lifecycle."""
@@ -278,6 +331,8 @@ async def lifespan(app: FastAPI):
                 kwargs["web_search_tokens_per_result"] = gw.web_search_tokens_per_result
                 kwargs["default_web_search_max_results"] = gw.default_web_search_max_results
                 kwargs["web_search_cost_per_result"] = gw.web_search_cost_per_result
+            elif name == "wavespeed":
+                kwargs["price_cache_ttl"] = config.gateway.price_cache_ttl
             elif name == "nanogpt" or name == "spicyapi":
                 kwargs["default_max_tokens"] = config.gateway.default_max_tokens
             elif name == "tungsten":
@@ -332,6 +387,13 @@ async def lifespan(app: FastAPI):
     )
     stats.install_log_handler()
 
+    # Load catalogs now, so the first paid request does not wait for them.
+    warm_ups = [
+        asyncio.create_task(_warm_up(name, provider))
+        for name, provider in providers.items()
+        if provider is not None
+    ]
+
     logger.info(
         "x402gate started on %s:%d with %d provider(s)",
         config.gateway.host,
@@ -341,6 +403,10 @@ async def lifespan(app: FastAPI):
 
     yield  # Application is running
 
+    # Let cancelled warm-ups unwind before the pools close, so none reopens one.
+    for task in warm_ups:
+        task.cancel()
+    await asyncio.gather(*warm_ups, return_exceptions=True)
     # Shutdown: finish polled jobs (they may start settlements), then settle
     if _pending_jobs:
         logger.info("Waiting for %d polled job(s)...", len(_pending_jobs))
@@ -351,6 +417,8 @@ async def lifespan(app: FastAPI):
     for provider in providers.values():
         if provider is not None:
             await provider.close()
+    await close_shared_client()
+    await _close_passthrough_client()
     logger.info("x402gate shut down")
 
 
@@ -794,8 +862,10 @@ async def _passthrough_proxy(provider_name: str, path: str, request: Request) ->
 
     t_start = time.monotonic()
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            resp = await client.post(url, content=body, headers=forward_headers)
+        # The pooled client keeps the upstream connection open between requests.
+        resp = await _passthrough_client().post(
+            url, content=body, headers=forward_headers, timeout=upstream_timeout(120.0)
+        )
     except httpx.TimeoutException:
         stats.record_request(
             provider_name,
@@ -870,6 +940,10 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
     # 1. Parse request body (JSON or multipart/form-data for file uploads)
     max_upload_bytes = config.gateway.max_upload_mb * 1024 * 1024
     content_type = request.headers.get("content-type", "")
+    # The JSON body as received: the price cache hashes these bytes instead of
+    # serializing the parsed body again. Multipart bodies have none.
+    raw_body: bytes | None = None
+    hashed_size = 0
     if "multipart/form-data" in content_type:
         declared = request.headers.get("content-length", "")
         if declared.isdigit() and int(declared) > max_upload_bytes + _MULTIPART_OVERHEAD_BYTES:
@@ -877,6 +951,7 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
                 413,
                 f"Request too large. Maximum file size: {config.gateway.max_upload_mb} MB",
             )
+        form = None
         try:
             form = await request.form()
             body: dict[str, Any] = {}
@@ -900,10 +975,15 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
                         )
                     body["_file_bytes"] = file_bytes
                     body["_file_name"] = getattr(value, "filename", "input_file")
+                    hashed_size = len(file_bytes)
                 elif key not in _INTERNAL_BODY_KEYS:
                     body[key] = value
         except Exception:
             return _error_response(400, "Invalid multipart form data")
+        finally:
+            # Uploads are spooled to temp files; free them once read.
+            if form is not None:
+                await form.close()
     else:
         raw_body = await _read_body_capped(request, config.gateway.max_json_mb * 1024 * 1024)
         if raw_body is None:
@@ -920,17 +1000,23 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
             return _error_response(400, "JSON body must be an object")
         for key in _INTERNAL_BODY_KEYS:
             body.pop(key, None)
+        hashed_size = len(raw_body)
 
     # 2. Fetch price (with cache)
     try:
         # Providers share paths such as chat/completions at different prices.
         price_key = f"{provider_name}/{path}"
-        cached_price = price_cache.get(price_key, body)
+        # One hash serves both the lookup and the store.
+        if hashed_size > _HASH_IN_THREAD_BYTES:
+            cache_key = await asyncio.to_thread(price_cache.key, price_key, body, raw_body)
+        else:
+            cache_key = price_cache.key(price_key, body, raw_body)
+        cached_price = price_cache.get_by_key(cache_key)
         if cached_price is not None:
             base_price = cached_price
         else:
             base_price = await provider.get_price(path, body)
-            price_cache.set(price_key, body, base_price)
+            price_cache.set_by_key(cache_key, base_price)
     except ProviderError as e:
         stats.record_request(provider_name, 0, False, error_msg=e.detail)
         return _error_response(e.status_code, e.detail, provider=e.provider)

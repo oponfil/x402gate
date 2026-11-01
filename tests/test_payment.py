@@ -3,7 +3,7 @@
 import json
 from decimal import Decimal
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -263,11 +263,11 @@ class TestPriceFetchBackoff:
 
         calls = []
 
-        def boom():
+        async def boom():
             calls.append(1)
             raise RuntimeError("down")
 
-        monkeypatch.setattr(payment, "_fetch_prices_sync", boom)
+        monkeypatch.setattr(payment, "_fetch_prices", boom)
         monkeypatch.setitem(payment._price_cache, "ethereum", 0.0)
         monkeypatch.setitem(payment._price_cache, "solana", 0.0)
         monkeypatch.setitem(payment._price_cache, "failed_at", 0.0)
@@ -279,9 +279,221 @@ class TestPriceFetchBackoff:
     async def test_empty_answer_counts_as_failure(self, monkeypatch):
         import x402gate.core.payment as payment
 
-        monkeypatch.setattr(payment, "_fetch_prices_sync", lambda: {"status": {"error_code": 429}})
+        async def rate_limited():
+            return {"status": {"error_code": 429}}
+
+        monkeypatch.setattr(payment, "_fetch_prices", rate_limited)
         monkeypatch.setitem(payment._price_cache, "ethereum", 0.0)
         monkeypatch.setitem(payment._price_cache, "solana", 0.0)
         monkeypatch.setitem(payment._price_cache, "failed_at", 0.0)
         await payment._refresh_prices()
         assert payment._price_cache["failed_at"] > 0
+
+
+@pytest.fixture
+def stale_prices(monkeypatch):
+    """A price cache old enough to need a refresh, holding SOL at $100."""
+    import x402gate.core.payment as payment
+
+    monkeypatch.setitem(payment._price_cache, "ethereum", 2000.0)
+    monkeypatch.setitem(payment._price_cache, "solana", 100.0)
+    monkeypatch.setitem(payment._price_cache, "ts", 0.0)
+    monkeypatch.setitem(payment._price_cache, "failed_at", 0.0)
+    monkeypatch.setattr(payment, "_price_refresh", None)
+    return payment
+
+
+async def _drain_background(payment) -> None:
+    import asyncio
+
+    while payment._background_tasks:
+        await asyncio.gather(*payment._background_tasks, return_exceptions=True)
+
+
+class TestPriceFetch:
+    """CoinGecko goes through the pooled client and never blocks a settlement."""
+
+    async def test_fetch_uses_the_shared_client(self, monkeypatch):
+        import httpx
+
+        import x402gate.core.payment as payment
+
+        response = Mock()
+        response.json.return_value = {"solana": {"usd": 150.0}}
+        client = Mock()
+        client.get = AsyncMock(return_value=response)
+        monkeypatch.setattr(payment.http, "shared_client", lambda: client)
+
+        assert await payment._fetch_prices() == {"solana": {"usd": 150.0}}
+        kwargs = client.get.await_args.kwargs
+        assert kwargs["params"] == {"ids": "ethereum,solana", "vs_currencies": "usd"}
+        assert isinstance(kwargs["timeout"], httpx.Timeout)
+        assert kwargs["timeout"].read == payment._PRICE_TIMEOUT_S
+
+    async def test_stale_cache_refreshes_once_in_the_background(self, stale_prices, monkeypatch):
+        payment = stale_prices
+        calls = []
+
+        async def fetch():
+            calls.append(1)
+            return {"ethereum": {"usd": 2500.0}, "solana": {"usd": 120.0}}
+
+        monkeypatch.setattr(payment, "_fetch_prices", fetch)
+        # Returns the stale value at once; one refresh runs behind it.
+        assert payment._cached_price("solana") == 100.0
+        assert payment._cached_price("solana") == 100.0
+        await _drain_background(payment)
+        assert calls == [1]
+        assert payment._price_cache["solana"] == 120.0
+
+    async def test_background_failure_is_logged_not_raised(self, caplog):
+        import x402gate.core.payment as payment
+
+        async def boom():
+            raise RuntimeError("bookkeeping broke")
+
+        task = payment._spawn(boom())
+        assert task in payment._background_tasks
+        await _drain_background(payment)
+        assert task not in payment._background_tasks
+        assert "bookkeeping broke" in caplog.text
+
+    async def test_verify_starts_the_price_refresh(self, stale_prices, handler, monkeypatch):
+        payment = stale_prices
+        calls = []
+
+        async def fetch():
+            calls.append(1)
+            return {"ethereum": {"usd": 2500.0}}
+
+        monkeypatch.setattr(payment, "_fetch_prices", fetch)
+        await handler.verify("not a payment", Decimal("1"))
+        await _drain_background(payment)
+        assert calls == [1]
+
+
+_SOLANA = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+_USDC_MINT = "EPjFWDvL5JKX8YQjKdL4o2G1uR7oAPpqCq2QvZJ3vJhW"
+
+
+def _solana_payment(fee_payer) -> tuple[str, dict]:
+    """A payment header carrying a real client transaction (2 signatures)."""
+    import base64
+
+    from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
+    from solders.hash import Hash
+    from solders.keypair import Keypair
+    from solders.message import MessageV0
+    from solders.system_program import TransferParams, transfer
+    from solders.transaction import VersionedTransaction
+
+    client = Keypair()
+    message = MessageV0.try_compile(
+        payer=fee_payer.pubkey(),
+        instructions=[
+            set_compute_unit_limit(20_000),
+            set_compute_unit_price(1),
+            transfer(
+                TransferParams(from_pubkey=client.pubkey(), to_pubkey=client.pubkey(), lamports=1)
+            ),
+        ],
+        address_lookup_table_accounts=[],
+        recent_blockhash=Hash.default(),
+    )
+    tx = base64.b64encode(bytes(VersionedTransaction(message, [fee_payer, client]))).decode()
+    accepted = {
+        "scheme": "exact",
+        "network": _SOLANA,
+        "asset": _USDC_MINT,
+        "amount": "1000000",
+        "payTo": str(Keypair().pubkey()),
+        "maxTimeoutSeconds": 3600,
+        "extra": {"feePayer": str(fee_payer.pubkey())},
+    }
+    header = _encoded({"x402Version": 2, "accepted": accepted, "payload": {"transaction": tx}})
+    return header, accepted
+
+
+class TestSolanaSettleGas:
+    """Settle reports gas from the transaction itself, without waiting on the network."""
+
+    def _handler(self, fee_payer, accepted, settle_result) -> PaymentHandler:
+        from x402gate.core.payment import _NetworkScheme
+        from x402gate.core.svm_signer import SolanaSigner
+
+        handler = PaymentHandler(networks={})
+        cfg = NetworkConfig(
+            type="svm",
+            network=_SOLANA,
+            pay_to=accepted["payTo"],
+            token_address=_USDC_MINT,
+            rpc_url="http://127.0.0.1:9",
+            facilitator_key="unused",
+        )
+        scheme = Mock()
+        scheme.get_extra.return_value = {"feePayer": str(fee_payer.pubkey())}
+        scheme.settle.return_value = settle_result
+        signer = SolanaSigner.__new__(SolanaSigner)
+        handler._schemes[_SOLANA] = _NetworkScheme(cfg, scheme, svm_signer=signer)
+        return handler
+
+    async def test_gas_fields_are_ready_without_rpc_or_price_wait(self, stale_prices, monkeypatch):
+        import asyncio
+
+        from solders.keypair import Keypair
+        from x402 import SettleResponse
+
+        payment = stale_prices
+        fee_payer = Keypair()
+        header, accepted = _solana_payment(fee_payer)
+        handler = self._handler(
+            fee_payer,
+            accepted,
+            SettleResponse(success=True, transaction="sig", network=_SOLANA, payer="p"),
+        )
+        release = asyncio.Event()
+
+        async def slow_fetch():
+            await release.wait()
+            return {"solana": {"usd": 120.0}}
+
+        monkeypatch.setattr(payment, "_fetch_prices", slow_fetch)
+        settled = await asyncio.wait_for(
+            handler.settle(header, Decimal("1"), _SOLANA, {"provider_name": "x"}), 1
+        )
+        # The price fetch is still hanging; settle did not wait for it.
+        assert payment._background_tasks
+        release.set()
+        await _drain_background(payment)
+
+        assert settled["success"] is True
+        assert settled["amount_usdc"] == 1.0
+        assert settled["network_type"] == "svm"
+        assert settled["gas_label"] == "SOL"
+        assert settled["gas_cost_native"] == pytest.approx(10_001 / 1e9)
+        assert settled["gas_cost_usd"] == pytest.approx(10_001 / 1e9 * 100.0)
+
+    async def test_failed_settle_is_unchanged(self, stale_prices):
+        from solders.keypair import Keypair
+        from x402 import SettleResponse
+
+        fee_payer = Keypair()
+        header, accepted = _solana_payment(fee_payer)
+        handler = self._handler(
+            fee_payer,
+            accepted,
+            SettleResponse(
+                success=False,
+                error_reason="transaction_failed",
+                error_message="Simulation failed",
+                network=_SOLANA,
+                payer="p",
+                transaction="",
+            ),
+        )
+        settled = await handler.settle(header, Decimal("1"), _SOLANA)
+        await _drain_background(stale_prices)
+
+        assert settlement_state(settled) == "failed"
+        assert settled["error_reason"] == "transaction_failed: Simulation failed"
+        assert "gas_cost_usd" not in settled

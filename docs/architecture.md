@@ -86,6 +86,10 @@ The diagram is the Base order. If the settlement fails, the client gets 402 inst
 
 Provider routes (`/v1/{provider}/{path}`) are generated automatically from `config.yaml` at startup. A provider with `enabled: false` is not routed and is omitted from the public manifest. Tungsten and the BlockRun passthrough are disabled this way. Adding a passthrough provider requires only a config entry — no code changes. Adding a managed provider requires a config entry plus a provider class registered in `PROVIDER_REGISTRY`.
 
+### Upstream Connections
+
+Managed providers share one pooled HTTP client (`x402gate/core/http.py`), so a request reuses an open TLS connection to the provider instead of a new handshake (50-200 ms) per call. Idle connections are kept 30 seconds. Connecting and waiting for a free connection give up after 10 seconds, which means nothing was sent, so the request is refunded. The pool stores no cookies. The BlockRun passthrough has its own cookie-free pool, so one user's upstream cookies never reach another user. At startup each provider loads its catalog in the background (`warm_up`), and OpenRouter and NanoGPT keep serving an expired catalog while one background task refreshes it, so no paid request waits for a catalog.
+
 ### Transparent Proxy
 
 The gateway forwards request bodies to providers **as-is**, with two exceptions. Before payment it checks only what it needs to price the request and refuses, with HTTP 400, anything it cannot price or that can never succeed (for chat: `stream: true`, unpriced options, a missing `model`). For chat it also adds caps that keep the cost within the quote (`max_tokens`, `provider.max_price`, web plugin limits). Keys the gateway adds itself (`_file_bytes`, `_file_name`, `_caller`) are dropped from client bodies. Otherwise it does not modify model-specific parameters. This means:

@@ -6,8 +6,11 @@ from contextlib import contextmanager
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
+import respx
 
+from x402gate.core import http
 from x402gate.core.config import ProviderConfig
 from x402gate.core.proxy import UPSTREAM_CREDENTIALS_DETAIL
 from x402gate.providers.base import ProviderError, outcome_unknown
@@ -202,11 +205,10 @@ class TestSubmit:
             }
         ]
 
-        with patch("x402gate.providers.socialdownload.httpx.AsyncClient") as mock_cls:
+        with patch("x402gate.providers.socialdownload.shared_client") as mock_shared:
             mock_client = AsyncMock()
             mock_client.post.return_value = mock_response
-            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_shared.return_value = mock_client
 
             result = await provider.submit(
                 "download", {"url": "https://www.youtube.com/watch?v=test"}
@@ -232,11 +234,10 @@ class TestSubmit:
         mock_response.status_code = 429
         mock_response.text = "Too Many Requests"
 
-        with patch("x402gate.providers.socialdownload.httpx.AsyncClient") as mock_cls:
+        with patch("x402gate.providers.socialdownload.shared_client") as mock_shared:
             mock_client = AsyncMock()
             mock_client.post.return_value = mock_response
-            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_shared.return_value = mock_client
 
             with pytest.raises(Exception, match="RapidAPI error"):
                 await provider.submit("download", {"url": "https://www.youtube.com/watch?v=test"})
@@ -261,11 +262,10 @@ class TestSubmit:
         mock_response.status_code = 200
         mock_response.json.return_value = [item]
 
-        with patch("x402gate.providers.socialdownload.httpx.AsyncClient") as mock_cls:
+        with patch("x402gate.providers.socialdownload.shared_client") as mock_shared:
             mock_client = AsyncMock()
             mock_client.post.return_value = mock_response
-            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_shared.return_value = mock_client
 
             with pytest.raises(ProviderError) as exc_info:
                 await provider.submit("download", {"url": "https://www.youtube.com/watch?v=test"})
@@ -288,11 +288,10 @@ class TestSubmit:
             }
         ]
 
-        with patch("x402gate.providers.socialdownload.httpx.AsyncClient") as mock_cls:
+        with patch("x402gate.providers.socialdownload.shared_client") as mock_shared:
             mock_client = AsyncMock()
             mock_client.post.return_value = mock_response
-            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_shared.return_value = mock_client
 
             result = await provider.submit(
                 "download", {"url": "https://www.tiktok.com/@user/video/123"}
@@ -304,11 +303,10 @@ class TestSubmit:
 @contextmanager
 def _rapidapi_answers(response: MagicMock):
     """Patch RapidAPI to answer with ``response``."""
-    with patch("x402gate.providers.socialdownload.httpx.AsyncClient") as mock_cls:
+    with patch("x402gate.providers.socialdownload.shared_client") as mock_shared:
         mock_client = AsyncMock()
         mock_client.post.return_value = response
-        mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+        mock_shared.return_value = mock_client
         yield
 
 
@@ -389,3 +387,67 @@ class TestGetResult:
         provider = _make_provider()
         with pytest.raises(NotImplementedError, match="synchronous"):
             await provider.get_result("any_task_id")
+
+
+# ---------------------------------------------------------------------------
+# pooled connection
+# ---------------------------------------------------------------------------
+
+
+_API_URL = "https://social-download-all-in-one.p.rapidapi.com/v1/social/autolink"
+
+
+@pytest.fixture
+async def pooled():
+    """Run against the real shared client and close it afterwards."""
+    yield
+    await http.close_shared_client()
+
+
+class TestPooledClient:
+    """Calls go through the shared pooled client, not a new client per call."""
+
+    @respx.mock
+    async def test_requests_reuse_one_client(self, pooled):
+        """Two calls build one client, so the second skips the TCP/TLS handshake."""
+        provider = _make_provider()
+        route = respx.post(_API_URL).mock(
+            return_value=httpx.Response(200, json=[{"title": "T", "medias": []}])
+        )
+        with patch("x402gate.core.http.httpx.AsyncClient", wraps=httpx.AsyncClient) as ctor:
+            await provider.submit("download", {"url": "https://youtu.be/x"})
+            await provider.submit("download", {"url": "https://youtu.be/x"})
+        assert ctor.call_count == 1
+        assert route.call_count == 2
+
+    @respx.mock
+    async def test_keeps_the_read_timeout_with_a_short_connect_limit(self, pooled):
+        """The old per-call timeout still bounds the read; connecting fails fast."""
+        provider = _make_provider()
+        route = respx.post(_API_URL).mock(
+            return_value=httpx.Response(200, json=[{"title": "T", "medias": []}])
+        )
+        await provider.submit("download", {"url": "https://youtu.be/x"})
+        limits = route.calls.last.request.extensions["timeout"]
+        assert limits["read"] == 30
+        assert limits["connect"] == http.CONNECT_TIMEOUT_S
+
+    @respx.mock
+    async def test_read_timeout_keeps_the_payment(self, pooled):
+        """The request was sent and may have run: outcome unknown, as before."""
+        provider = _make_provider()
+        respx.post(_API_URL).mock(side_effect=httpx.ReadTimeout("slow"))
+        with pytest.raises(ProviderError) as caught:
+            await provider.submit("download", {"url": "https://youtu.be/x"})
+        assert caught.value.status_code == 504
+        assert outcome_unknown(caught.value) is True
+
+    @respx.mock
+    @pytest.mark.parametrize("error", [httpx.ConnectError, httpx.ConnectTimeout])
+    async def test_connection_never_opened_is_refunded(self, pooled, error):
+        """Nothing was sent, so the client is refunded, as before."""
+        provider = _make_provider()
+        respx.post(_API_URL).mock(side_effect=error("down"))
+        with pytest.raises(ProviderError) as caught:
+            await provider.submit("download", {"url": "https://youtu.be/x"})
+        assert outcome_unknown(caught.value) is False

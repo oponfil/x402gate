@@ -18,7 +18,9 @@ from typing import Any
 
 import httpx
 
+from x402gate.core import http
 from x402gate.core.config import ProviderConfig
+from x402gate.core.http import shared_client
 from x402gate.core.proxy import (
     UPSTREAM_CREDENTIALS_DETAIL,
     UpstreamMayHaveRun,
@@ -185,12 +187,12 @@ class SocialDownloadProvider(BaseProvider):
         }
 
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.post(
-                    api_url,
-                    json={"url": url},
-                    headers=headers,
-                )
+            resp = await shared_client().post(
+                api_url,
+                json={"url": url},
+                headers=headers,
+                timeout=http.timeout(30.0),
+            )
         except httpx.TimeoutException:
             raise ProviderError(
                 provider=self.name,

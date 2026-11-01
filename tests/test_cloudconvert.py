@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
+from x402gate.core import http
 from x402gate.core.config import ProviderConfig
-from x402gate.core.proxy import UPSTREAM_CREDENTIALS_DETAIL
+from x402gate.core.proxy import UPSTREAM_CREDENTIALS_DETAIL, TaskTimeoutError
+from x402gate.providers import cloudconvert
 from x402gate.providers.base import ProviderError, outcome_unknown
-from x402gate.providers.cloudconvert import CloudConvertProvider
+from x402gate.providers.cloudconvert import CloudConvertProvider, _sync_wait_url
 
 
 def _make_config(**overrides) -> ProviderConfig:
@@ -31,6 +36,9 @@ def _make_provider(**overrides) -> CloudConvertProvider:
     config = _make_config(**overrides)
     return CloudConvertProvider(config=config)
 
+
+# A base URL with no known sync host: get_result() polls, as it always did.
+_POLL_ONLY = "https://cloudconvert-proxy.example/v2"
 
 _VALID_BODY = {"output_format": "pdf", "_file_bytes": b"data", "_file_name": "a.docx"}
 
@@ -154,11 +162,9 @@ class TestSubmit:
         upload_response = MagicMock()
         upload_response.status_code = 200
 
-        with patch("httpx.AsyncClient") as mock_client_cls:
+        with patch("x402gate.providers.cloudconvert.shared_client") as mock_client_cls:
             mock_client = AsyncMock()
             mock_client.post.side_effect = [job_response, upload_response]
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
             mock_client_cls.return_value = mock_client
 
             result = await provider.submit(
@@ -183,11 +189,9 @@ class TestSubmit:
         error_response.status_code = 422
         error_response.text = "Invalid output format"
 
-        with patch("httpx.AsyncClient") as mock_client_cls:
+        with patch("x402gate.providers.cloudconvert.shared_client") as mock_client_cls:
             mock_client = AsyncMock()
             mock_client.post.return_value = error_response
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
             mock_client_cls.return_value = mock_client
 
             with pytest.raises(Exception, match="Failed to create job"):
@@ -207,7 +211,7 @@ class TestGetResult:
     @pytest.mark.asyncio
     async def test_poll_until_finished(self):
         """Polls until job status is 'finished'."""
-        provider = _make_provider(poll_interval=0, poll_timeout=10)
+        provider = _make_provider(base_url=_POLL_ONLY, poll_interval=0, poll_timeout=10)
 
         # First poll: processing; second poll: finished
         processing_response = MagicMock()
@@ -239,11 +243,9 @@ class TestGetResult:
             }
         }
 
-        with patch("httpx.AsyncClient") as mock_client_cls:
+        with patch("x402gate.providers.cloudconvert.shared_client") as mock_client_cls:
             mock_client = AsyncMock()
             mock_client.get.side_effect = [processing_response, finished_response]
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
             mock_client_cls.return_value = mock_client
 
             result = await provider.get_result("job_123")
@@ -255,7 +257,7 @@ class TestGetResult:
     @pytest.mark.asyncio
     async def test_poll_job_error(self):
         """Raises ProviderError when job fails."""
-        provider = _make_provider(poll_interval=0, poll_timeout=10)
+        provider = _make_provider(base_url=_POLL_ONLY, poll_interval=0, poll_timeout=10)
 
         error_response = MagicMock()
         error_response.status_code = 200
@@ -274,11 +276,9 @@ class TestGetResult:
             }
         }
 
-        with patch("httpx.AsyncClient") as mock_client_cls:
+        with patch("x402gate.providers.cloudconvert.shared_client") as mock_client_cls:
             mock_client = AsyncMock()
             mock_client.get.return_value = error_response
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
             mock_client_cls.return_value = mock_client
 
             with pytest.raises(Exception, match="Conversion failed"):
@@ -287,7 +287,7 @@ class TestGetResult:
     @pytest.mark.asyncio
     async def test_poll_timeout(self):
         """Raises TaskTimeoutError when polling exceeds timeout."""
-        provider = _make_provider(poll_interval=0, poll_timeout=0)
+        provider = _make_provider(base_url=_POLL_ONLY, poll_interval=0, poll_timeout=0)
 
         processing_response = MagicMock()
         processing_response.status_code = 200
@@ -295,11 +295,9 @@ class TestGetResult:
             "data": {"id": "job_slow", "status": "processing", "tasks": []}
         }
 
-        with patch("httpx.AsyncClient") as mock_client_cls:
+        with patch("x402gate.providers.cloudconvert.shared_client") as mock_client_cls:
             mock_client = AsyncMock()
             mock_client.get.return_value = processing_response
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
             mock_client_cls.return_value = mock_client
 
             with pytest.raises(Exception, match="did not complete"):
@@ -320,8 +318,6 @@ def _response(status_code: int, payload=None, text: str = "") -> MagicMock:
 def _mock_client(method: str, responses: list) -> MagicMock:
     mock_client = AsyncMock()
     getattr(mock_client, method).side_effect = responses
-    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_client.__aexit__ = AsyncMock(return_value=False)
     return mock_client
 
 
@@ -350,7 +346,7 @@ class TestUpstreamStatuses:
         provider = _make_provider()
         client = _mock_client("post", [_response(status, text="Invalid API key")])
         with (
-            patch("httpx.AsyncClient", return_value=client),
+            patch("x402gate.providers.cloudconvert.shared_client", return_value=client),
             pytest.raises(ProviderError) as caught,
         ):
             await provider.submit("convert", {"output_format": "pdf", "_file_bytes": b"data"})
@@ -361,10 +357,10 @@ class TestUpstreamStatuses:
     @pytest.mark.asyncio
     async def test_poll_rejected_key_is_502(self):
         """The job was created with this key and may still run: keep the payment."""
-        provider = _make_provider(poll_interval=1, poll_timeout=10)
+        provider = _make_provider(base_url=_POLL_ONLY, poll_interval=1, poll_timeout=10)
         client = _mock_client("get", [_response(403, text="Forbidden")])
         with (
-            patch("httpx.AsyncClient", return_value=client),
+            patch("x402gate.providers.cloudconvert.shared_client", return_value=client),
             patch("x402gate.providers.cloudconvert.asyncio.sleep", new_callable=AsyncMock),
             pytest.raises(ProviderError) as caught,
         ):
@@ -376,10 +372,10 @@ class TestUpstreamStatuses:
     @pytest.mark.asyncio
     async def test_poll_rate_limit_keeps_polling(self):
         """A 429 while polling is transient; the job keeps running."""
-        provider = _make_provider(poll_interval=1, poll_timeout=10)
+        provider = _make_provider(base_url=_POLL_ONLY, poll_interval=1, poll_timeout=10)
         client = _mock_client("get", [_response(429, text="Too Many"), _response(200, _FINISHED)])
         with (
-            patch("httpx.AsyncClient", return_value=client),
+            patch("x402gate.providers.cloudconvert.shared_client", return_value=client),
             patch("x402gate.providers.cloudconvert.asyncio.sleep", new_callable=AsyncMock),
         ):
             result = await provider.get_result("job_1")
@@ -388,7 +384,7 @@ class TestUpstreamStatuses:
     @pytest.mark.asyncio
     async def test_poll_unreadable_body_keeps_polling(self):
         """A garbled body must not escape get_result() as a raw exception."""
-        provider = _make_provider(poll_interval=1, poll_timeout=10)
+        provider = _make_provider(base_url=_POLL_ONLY, poll_interval=1, poll_timeout=10)
         client = _mock_client(
             "get",
             [
@@ -398,7 +394,7 @@ class TestUpstreamStatuses:
             ],
         )
         with (
-            patch("httpx.AsyncClient", return_value=client),
+            patch("x402gate.providers.cloudconvert.shared_client", return_value=client),
             patch("x402gate.providers.cloudconvert.asyncio.sleep", new_callable=AsyncMock),
         ):
             result = await provider.get_result("job_1")
@@ -458,3 +454,452 @@ class TestExtractError:
         job = {"tasks": [{"name": "upload-file", "status": "finished"}]}
         error = CloudConvertProvider._extract_error(job)
         assert error == "Unknown error"
+
+
+# ---------------------------------------------------------------------------
+# shared client and the sync wait API
+# ---------------------------------------------------------------------------
+
+_POLL_URL = "https://api.cloudconvert.com/v2/jobs/job_1"
+_WAIT_URL = "https://sync.api.cloudconvert.com/v2/jobs/job_1"
+_PROCESSING = {"data": {"id": "job_1", "status": "processing", "tasks": []}}
+_FAILED = {
+    "data": {
+        "id": "job_1",
+        "status": "error",
+        "tasks": [{"name": "process-file", "status": "error", "code": "X", "message": "bad"}],
+    }
+}
+
+
+def _routed_client(wait: list, poll: list) -> AsyncMock:
+    """Return a client whose GET answers the sync and the poll URL from their own lists.
+
+    An item is a response or an exception to raise.
+    """
+    answers = {_WAIT_URL: list(wait), _POLL_URL: list(poll)}
+
+    async def get(url, **kwargs):
+        answer = answers[url].pop(0)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    client = AsyncMock()
+    client.get.side_effect = get
+    return client
+
+
+def _urls(client: AsyncMock) -> list[str]:
+    return [call.args[0] for call in client.get.call_args_list]
+
+
+class TestSubmitUsesSharedClient:
+    """Job creation and upload go through the pooled client with the old timeouts."""
+
+    @pytest.mark.asyncio
+    async def test_job_and_upload_timeouts(self):
+        provider = _make_provider()
+        job = _response(
+            200,
+            {
+                "data": {
+                    "id": "job_1",
+                    "tasks": [
+                        {
+                            "name": "upload-file",
+                            "result": {"form": {"url": "https://up.example", "parameters": {}}},
+                        }
+                    ],
+                }
+            },
+        )
+        client = _mock_client("post", [job, _response(201)])
+        with patch("x402gate.providers.cloudconvert.shared_client", return_value=client):
+            await provider.submit("convert", dict(_VALID_BODY))
+        create, upload = client.post.call_args_list
+        assert create.kwargs["timeout"] == http.timeout(30.0)
+        assert upload.kwargs["timeout"] == http.timeout(120.0)
+
+
+class TestSyncWaitUrl:
+    """Which base URLs have a sync host."""
+
+    @pytest.mark.parametrize(
+        ("base_url", "expected"),
+        [
+            ("https://api.cloudconvert.com/v2", _WAIT_URL),
+            ("https://api.cloudconvert.com/v2/", _WAIT_URL),
+            (
+                "https://api.sandbox.cloudconvert.com/v2",
+                "https://sync.api.sandbox.cloudconvert.com/v2/jobs/job_1",
+            ),
+            (_POLL_ONLY, None),
+            ("http://api.cloudconvert.com/v2", None),
+            ("https://api.cloudconvert.com.evil.example/v2", None),
+        ],
+    )
+    def test_maps_base_url(self, base_url, expected):
+        assert _sync_wait_url(base_url, "job_1") == expected
+
+
+class TestSyncWait:
+    """get_result() learns the job ended from the sync API, without a poll delay."""
+
+    @pytest.mark.asyncio
+    async def test_finished_job_returns_at_once(self):
+        """One sync request, no sleep and no poll."""
+        provider = _make_provider(poll_interval=2, poll_timeout=600)
+        client = _routed_client(wait=[_response(200, _FINISHED)], poll=[])
+        sleep = AsyncMock()
+        with (
+            patch("x402gate.providers.cloudconvert.shared_client", return_value=client),
+            patch("x402gate.providers.cloudconvert.asyncio.sleep", sleep),
+        ):
+            result = await provider.get_result("job_1")
+        assert result["url"] == "https://out.pdf"
+        assert _urls(client) == [_WAIT_URL]
+        sleep.assert_not_called()
+        # Each wait is capped, so a proxy never sees an endless silent request.
+        assert client.get.call_args.kwargs["timeout"] == http.timeout(60.0)
+
+    @pytest.mark.asyncio
+    async def test_wait_is_capped_by_poll_timeout(self):
+        """A wait never runs past the budget: poll_timeout plus the old first second."""
+        provider = _make_provider(poll_timeout=5)
+        client = _routed_client(wait=[_response(200, _FINISHED)], poll=[])
+        with patch("x402gate.providers.cloudconvert.shared_client", return_value=client):
+            await provider.get_result("job_1")
+        assert client.get.call_args.kwargs["timeout"].read == 6.0
+
+    @pytest.mark.asyncio
+    async def test_failed_job_is_refunded(self):
+        """A job CloudConvert reports failed is a known failure, as when polled."""
+        provider = _make_provider()
+        client = _routed_client(wait=[_response(200, _FAILED)], poll=[])
+        with (
+            patch("x402gate.providers.cloudconvert.shared_client", return_value=client),
+            pytest.raises(ProviderError, match="Conversion failed") as caught,
+        ):
+            await provider.get_result("job_1")
+        assert caught.value.status_code == 502
+        assert outcome_unknown(caught.value) is False
+
+    @pytest.mark.asyncio
+    async def test_wait_that_runs_out_is_checked_and_reopened(self):
+        """After a capped wait runs out, one poll checks the job, then the wait reopens."""
+        provider = _make_provider(poll_interval=2)
+        client = _routed_client(
+            wait=[httpx.ReadTimeout("cap"), _response(200, _FINISHED)],
+            poll=[_response(200, _PROCESSING)],
+        )
+        sleep = AsyncMock()
+        with (
+            patch("x402gate.providers.cloudconvert.shared_client", return_value=client),
+            patch("x402gate.providers.cloudconvert.asyncio.sleep", sleep),
+        ):
+            result = await provider.get_result("job_1")
+        assert result["url"] == "https://out.pdf"
+        assert _urls(client) == [_WAIT_URL, _POLL_URL, _WAIT_URL]
+        sleep.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_poll_after_a_hung_wait_finds_the_finished_job(self):
+        """A sync API that never answers cannot hide a finished job."""
+        provider = _make_provider()
+        client = _routed_client(
+            wait=[httpx.ReadTimeout("cap")],
+            poll=[_response(200, _FINISHED)],
+        )
+        with patch("x402gate.providers.cloudconvert.shared_client", return_value=client):
+            result = await provider.get_result("job_1")
+        assert result["url"] == "https://out.pdf"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "answer",
+        [
+            _response(404, text="no route"),
+            _response(403, text="forbidden"),
+            _response(302, text=""),
+            _response(200, ValueError("bad json"), text="<html>"),
+            _response(200, _PROCESSING),
+        ],
+    )
+    async def test_sync_api_that_does_not_work_falls_back_to_polling(self, answer):
+        """The sync API is dropped for this job; polling (with its pause) takes over."""
+        provider = _make_provider(poll_interval=2)
+        client = _routed_client(
+            wait=[answer],
+            poll=[_response(200, _PROCESSING), _response(200, _FINISHED)],
+        )
+        sleep = AsyncMock()
+        with (
+            patch("x402gate.providers.cloudconvert.shared_client", return_value=client),
+            patch("x402gate.providers.cloudconvert.asyncio.sleep", sleep),
+        ):
+            result = await provider.get_result("job_1")
+        assert result["url"] == "https://out.pdf"
+        assert _urls(client) == [_WAIT_URL, _POLL_URL, _POLL_URL]
+        sleep.assert_awaited_once_with(2)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "answer",
+        [
+            _response(500, text="oops"),
+            _response(429, text="slow down"),
+            httpx.ConnectError("down"),
+            httpx.RemoteProtocolError("dropped"),
+            httpx.PoolTimeout("pool full"),
+        ],
+    )
+    async def test_passing_sync_failure_is_retried_after_a_poll(self, answer):
+        """A dropped pooled connection or a 5xx/429 keeps the sync API for the next round."""
+        provider = _make_provider(poll_interval=2)
+        client = _routed_client(
+            wait=[answer, _response(200, _FINISHED)],
+            poll=[_response(200, _PROCESSING)],
+        )
+        sleep = AsyncMock()
+        with (
+            patch("x402gate.providers.cloudconvert.shared_client", return_value=client),
+            patch("x402gate.providers.cloudconvert.asyncio.sleep", sleep),
+        ):
+            result = await provider.get_result("job_1")
+        assert result["url"] == "https://out.pdf"
+        assert _urls(client) == [_WAIT_URL, _POLL_URL, _WAIT_URL]
+        # A pause before retrying, so a failing sync host is never hit in a tight loop.
+        sleep.assert_awaited_once_with(2)
+
+    @pytest.mark.asyncio
+    async def test_sync_api_dropped_after_three_failures_in_a_row(self):
+        """Three passing failures in a row mean the sync host is down: poll the rest."""
+        provider = _make_provider(poll_interval=2)
+        oops = _response(500, text="oops")
+        client = _routed_client(
+            wait=[oops, oops, oops],
+            poll=[_response(200, _PROCESSING)] * 3 + [_response(200, _FINISHED)],
+        )
+        sleep = AsyncMock()
+        with (
+            patch("x402gate.providers.cloudconvert.shared_client", return_value=client),
+            patch("x402gate.providers.cloudconvert.asyncio.sleep", sleep),
+        ):
+            result = await provider.get_result("job_1")
+        assert result["url"] == "https://out.pdf"
+        assert _urls(client) == [_WAIT_URL, _POLL_URL] * 3 + [_POLL_URL]
+        assert sleep.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_wait_that_runs_out_resets_the_failure_count(self):
+        """Only failures in a row count: a working wait in between starts over."""
+        provider = _make_provider(poll_interval=2)
+        oops = _response(500, text="oops")
+        client = _routed_client(
+            wait=[oops, oops, httpx.ReadTimeout("cap"), oops, oops, _response(200, _FINISHED)],
+            poll=[_response(200, _PROCESSING)] * 5,
+        )
+        with (
+            patch("x402gate.providers.cloudconvert.shared_client", return_value=client),
+            patch("x402gate.providers.cloudconvert.asyncio.sleep", new_callable=AsyncMock),
+        ):
+            result = await provider.get_result("job_1")
+        assert result["url"] == "https://out.pdf"
+        assert _urls(client) == [_WAIT_URL, _POLL_URL] * 5 + [_WAIT_URL]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("status", "unknown"), [(403, True), (404, False)])
+    async def test_sync_errors_are_classified_by_the_poll(self, status, unknown):
+        """A sync 403/404 decides nothing; the poll's answer keeps today's rules."""
+        provider = _make_provider()
+        client = _routed_client(
+            wait=[_response(status, text="nope")],
+            poll=[_response(status, text="nope")],
+        )
+        with (
+            patch("x402gate.providers.cloudconvert.shared_client", return_value=client),
+            pytest.raises(ProviderError) as caught,
+        ):
+            await provider.get_result("job_1")
+        assert caught.value.status_code == (502 if status == 403 else 404)
+        assert outcome_unknown(caught.value) is unknown
+
+    @pytest.mark.asyncio
+    async def test_times_out_after_poll_timeout(self):
+        """Time spent inside sync waits counts: they end in a timeout, payment kept."""
+        provider = _make_provider(poll_timeout=100)
+        clock = _FakeClock()
+
+        async def get(url, **kwargs):
+            if url == _WAIT_URL:
+                clock.now += kwargs["timeout"].read
+                raise httpx.ReadTimeout("cap")
+            return _response(200, _PROCESSING)
+
+        client = AsyncMock()
+        client.get.side_effect = get
+        with (
+            patch("x402gate.providers.cloudconvert.shared_client", return_value=client),
+            patch("x402gate.providers.cloudconvert.asyncio.get_running_loop", return_value=clock),
+            pytest.raises(TaskTimeoutError) as caught,
+        ):
+            await provider.get_result("job_1")
+        assert outcome_unknown(caught.value) is True
+        # poll_timeout plus the old uncounted first second, in capped waits.
+        waits = [
+            c.kwargs["timeout"].read for c in client.get.call_args_list if c.args[0] == _WAIT_URL
+        ]
+        assert waits == [60.0, 41.0]
+        # The job is still checked once after the last wait.
+        assert _urls(client)[-1] == _POLL_URL
+
+
+class _FakeClock:
+    """Stands in for the event loop's clock; tests move ``now`` by hand."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def time(self) -> float:
+        return self.now
+
+
+class TestTimeBudget:
+    """poll_timeout gives every job at least the time the old polling loop gave it."""
+
+    @pytest.mark.asyncio
+    async def test_poll_latency_is_not_counted(self):
+        """Polls that take time do not eat into poll_timeout, as before.
+
+        poll_interval=2, poll_timeout=10: the old loop polled at 0, 2, 4, 6 and
+        8 s of sleep. With each poll taking 1 s, the fifth poll runs 12 s in,
+        past poll_timeout of wall-clock time, and must still see the result.
+        """
+        provider = _make_provider(base_url=_POLL_ONLY, poll_interval=2, poll_timeout=10)
+        clock = _FakeClock()
+        answers = [_response(200, _PROCESSING)] * 4 + [_response(200, _FINISHED)]
+
+        async def get(url, **kwargs):
+            clock.now += 1.0
+            return answers.pop(0)
+
+        async def sleep(seconds):
+            clock.now += seconds
+
+        client = AsyncMock()
+        client.get.side_effect = get
+        with (
+            patch("x402gate.providers.cloudconvert.shared_client", return_value=client),
+            patch("x402gate.providers.cloudconvert.asyncio.get_running_loop", return_value=clock),
+            patch("x402gate.providers.cloudconvert.asyncio.sleep", side_effect=sleep),
+        ):
+            result = await provider.get_result("job_1")
+        assert result["url"] == "https://out.pdf"
+        assert clock.now > 10
+
+    @pytest.mark.asyncio
+    async def test_polling_stops_after_the_old_number_of_polls(self):
+        """The budget is not open-ended: the same polls as the old loop, then a timeout."""
+        provider = _make_provider(base_url=_POLL_ONLY, poll_interval=2, poll_timeout=10)
+        client = AsyncMock()
+        client.get.return_value = _response(200, _PROCESSING)
+        with (
+            patch("x402gate.providers.cloudconvert.shared_client", return_value=client),
+            patch("x402gate.providers.cloudconvert.asyncio.sleep", new_callable=AsyncMock),
+            pytest.raises(TaskTimeoutError),
+        ):
+            await provider.get_result("job_1")
+        # Old loop: polls at 0, 2, 4, 6, 8 s; the first second of grace adds one at 10 s.
+        assert client.get.await_count == 6
+
+    @pytest.mark.asyncio
+    async def test_sync_waits_are_charged_at_the_old_polling_rate(self):
+        """With polls taking 0.5 s and poll_interval=2, 1 s of waiting counted 0.8 s before.
+
+        The old loop's last poll came about 1 + 49 x 2.5 = 123.5 s in for
+        poll_timeout=100; sync waits must reach past that, not stop at 100 s.
+        """
+        provider = _make_provider(poll_interval=2, poll_timeout=100)
+        clock = _FakeClock()
+
+        async def get(url, **kwargs):
+            if url == _WAIT_URL:
+                clock.now += kwargs["timeout"].read
+                raise httpx.ReadTimeout("cap")
+            clock.now += 0.5
+            return _response(200, _PROCESSING)
+
+        client = AsyncMock()
+        client.get.side_effect = get
+        with (
+            patch("x402gate.providers.cloudconvert.shared_client", return_value=client),
+            patch("x402gate.providers.cloudconvert.asyncio.get_running_loop", return_value=clock),
+            pytest.raises(TaskTimeoutError),
+        ):
+            await provider.get_result("job_1")
+        waits = [
+            c.kwargs["timeout"].read for c in client.get.call_args_list if c.args[0] == _WAIT_URL
+        ]
+        # 101 s of budget at 0.8 per second is 126.25 s of waiting.
+        assert sum(waits) == pytest.approx(126.25)
+        assert clock.now > 123.5
+
+
+class TestSyncWaitSlots:
+    """Sync waits hold pooled connections, so only so many run at once."""
+
+    @pytest.mark.asyncio
+    async def test_polls_when_every_slot_is_busy(self):
+        provider = _make_provider(poll_interval=2)
+        client = _routed_client(
+            wait=[], poll=[_response(200, _PROCESSING), _response(200, _FINISHED)]
+        )
+        sleep = AsyncMock()
+        with (
+            patch("x402gate.providers.cloudconvert.shared_client", return_value=client),
+            patch("x402gate.providers.cloudconvert.asyncio.sleep", sleep),
+            patch.object(cloudconvert, "_SYNC_WAIT_SLOTS", asyncio.Semaphore(0)),
+        ):
+            result = await provider.get_result("job_1")
+        assert result["url"] == "https://out.pdf"
+        assert _urls(client) == [_POLL_URL, _POLL_URL]
+        sleep.assert_awaited_once_with(2)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "wait",
+        [
+            [_response(200, _FINISHED)],
+            [_response(200, _FAILED)],
+            [_response(404), httpx.ReadTimeout("cap")],
+        ],
+    )
+    async def test_slot_is_given_back(self, wait):
+        provider = _make_provider()
+        client = _routed_client(wait=wait, poll=[_response(200, _FINISHED)])
+        slots = asyncio.Semaphore(1)
+        with (
+            patch("x402gate.providers.cloudconvert.shared_client", return_value=client),
+            patch.object(cloudconvert, "_SYNC_WAIT_SLOTS", slots),
+            contextlib.suppress(ProviderError),
+        ):
+            await provider.get_result("job_1")
+        assert not slots.locked()
+
+
+class TestPollWithoutDelay:
+    """Polling (no sync host) starts at once instead of after a fixed second."""
+
+    @pytest.mark.asyncio
+    async def test_first_poll_is_immediate(self):
+        provider = _make_provider(base_url=_POLL_ONLY, poll_interval=2)
+        client = _mock_client("get", [_response(200, _FINISHED)])
+        sleep = AsyncMock()
+        with (
+            patch("x402gate.providers.cloudconvert.shared_client", return_value=client),
+            patch("x402gate.providers.cloudconvert.asyncio.sleep", sleep),
+        ):
+            await provider.get_result("job_1")
+        sleep.assert_not_called()
+        assert client.get.call_args.kwargs["timeout"] == http.timeout(30.0)
