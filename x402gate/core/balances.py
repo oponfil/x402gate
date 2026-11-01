@@ -9,6 +9,9 @@ A balance is marked low when it is time to top up:
 - dollars: under $20
 - CloudConvert credits: under 300
 - ElevenLabs characters: under 10,000 left
+
+A MiniMax balance of $0 is never low: requests are then paid from Audio
+Package points, and MiniMax does not report how many points are left.
 """
 
 from __future__ import annotations
@@ -40,12 +43,15 @@ _SUPPORTED = {
     "cloudconvert",
     "fishaudio",
     "elevenlabs",
+    "minimax",
 }
 _FETCHERS: dict[str, str] = {
     "wavespeed": "/balance",
     "spicyapi": "/api/v1/chat/credit",
     "cloudconvert": "/users/me",
     "fishaudio": "/wallet/self/api-credit",
+    # Not in MiniMax's docs; the official MiniMax CLI reads it for sk-api keys.
+    "minimax": "/account/query_balance",
 }
 
 
@@ -184,6 +190,27 @@ def parse_fishaudio(body: dict[str, Any]) -> dict[str, Any]:
     return _usd(_decimal(body["credit"]))
 
 
+def parse_minimax(body: dict[str, Any]) -> dict[str, Any]:
+    """MiniMax pay-as-you-go balance in dollars.
+
+    Audio Package points are spent before this balance and are not exposed
+    by the API, so $0 usually means the package is paying. That case is
+    shown with a note instead of being marked low.
+    """
+    status = body.get("base_resp", {}).get("status_code", 0)
+    if status != 0:
+        raise ValueError("minimax balance was not successful")
+    amount = _decimal(body["available_amount"])
+    if amount > 0:
+        return _usd(amount)
+    payload = _payload(amount, "usd", low=False)
+    payload["label"] = "$0 + points?"
+    payload["note"] = (
+        "Paid from MiniMax Audio Package points. MiniMax does not report how many are left."
+    )
+    return payload
+
+
 def parse_elevenlabs(body: dict[str, Any]) -> dict[str, Any]:
     """ElevenLabs characters still left in the current period."""
     subscription = body.get("subscription", body)
@@ -313,6 +340,7 @@ async def _read(
         "spicyapi": parse_spicyapi,
         "cloudconvert": parse_cloudconvert,
         "fishaudio": parse_fishaudio,
+        "minimax": parse_minimax,
     }
     return parsers[name](body)
 

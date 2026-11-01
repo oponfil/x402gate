@@ -149,6 +149,12 @@
             border-color: #f85149;
         }
 
+        .card-note {
+            margin-top: 10px;
+            font-size: 0.8em;
+            color: #8b949e;
+        }
+
         .card-error {
             margin-top: 10px;
             font-size: 0.8em;
@@ -468,6 +474,9 @@
                     const balanceHtml = p.balance && p.balance.label
                         ? `<div class="metric${p.balance.low ? ' low' : ''}">Balance<strong>${escHtml(p.balance.label)}</strong></div>`
                         : '';
+                    const noteHtml = p.balance && p.balance.note
+                        ? `<div class="card-note">${escHtml(p.balance.note)}</div>`
+                        : '';
                     return `
                     <div class="card${lowCard}">
                         <div class="card-header">
@@ -483,6 +492,7 @@
                             <div class="metric">Revenue<strong>$${p.revenue_usd}</strong></div>
                             <div class="metric">Profit<strong>$${p.profit_usd}</strong></div>
                         </div>
+                        ${noteHtml}
                         ${errHtml}
                     </div>`;
                 }).join('');

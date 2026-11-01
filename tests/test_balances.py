@@ -15,6 +15,7 @@ from x402gate.core.balances import (
     parse_cloudconvert,
     parse_elevenlabs,
     parse_fishaudio,
+    parse_minimax,
     parse_nanogpt,
     parse_openrouter,
     parse_openrouter_key,
@@ -26,6 +27,17 @@ from x402gate.core.config import ProviderConfig
 
 def _config(base_url: str, api_key: str = "test-key") -> ProviderConfig:
     return ProviderConfig(base_url=base_url, api_key=api_key)
+
+
+def _minimax_body(available: str) -> dict:
+    return {
+        "available_amount": available,
+        "cash_balance": available,
+        "voucher_balance": "0.00",
+        "credit_balance": "0.00",
+        "owed_amount": "0.00",
+        "base_resp": {"status_code": 0, "status_msg": "success"},
+    }
 
 
 class TestParsers:
@@ -127,6 +139,27 @@ class TestParsers:
         parsed = parse_elevenlabs({"character_limit": 10000, "character_count": 12000})
         assert parsed["label"] == "-2,000 chars"
         assert parsed["low"] is True
+
+    def test_minimax_dollar_balance(self):
+        parsed = parse_minimax(_minimax_body("25.40"))
+        assert parsed["label"] == "$25.40"
+        assert parsed["low"] is False
+        assert "note" not in parsed
+
+    def test_minimax_small_dollar_balance_is_low(self):
+        assert parse_minimax(_minimax_body("3.10"))["low"] is True
+
+    def test_minimax_zero_dollars_means_audio_package_points(self):
+        """At $0 the requests are paid from package points the API does not report."""
+        parsed = parse_minimax(_minimax_body("0.00"))
+        assert parsed["label"] == "$0 + points?"
+        assert parsed["low"] is False
+        assert "Audio Package" in parsed["note"]
+
+    def test_minimax_rejects_a_failed_envelope(self):
+        body = {"base_resp": {"status_code": 1004, "status_msg": "authentication failed"}}
+        with pytest.raises(ValueError):
+            parse_minimax(body)
 
 
 class TestFetch:
@@ -238,11 +271,20 @@ class TestFetch:
         assert "authorization" not in route.calls[0].request.headers
 
     @respx.mock
+    async def test_fetches_minimax_account_balance(self):
+        route = respx.get("https://api.minimax.io/account/query_balance").mock(
+            return_value=httpx.Response(200, json=_minimax_body("7.5"))
+        )
+        configs = {"minimax": _config("https://api.minimax.io", api_key="mm-key")}
+        result = await fetch_balances(configs)
+        assert result["minimax"]["label"] == "$7.50"
+        assert route.calls[0].request.headers["authorization"] == "Bearer mm-key"
+
+    @respx.mock
     async def test_skips_providers_without_a_balance_api(self):
         respx.get(url__regex=r".*").mock(return_value=httpx.Response(200, json={}))
         configs = {
             "blockrun": _config("https://blockrun.ai/api", api_key=""),
-            "minimax": _config("https://api.minimax.io"),
             "socialdownload": _config("https://example.test"),
             "openrouter": _config("https://openrouter.ai/api/v1", api_key=""),
         }
