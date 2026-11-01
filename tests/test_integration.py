@@ -18,12 +18,14 @@ import respx
 from fastapi.testclient import TestClient
 from solders.keypair import Keypair
 
+import x402gate.app as gateway
 from tests.helpers import make_wav_b64
 from x402gate.app import _pending_settlements, app, providers
 from x402gate.core.config import load_config as real_load
 from x402gate.core.prepaid import deposit, get_balance, reset
 from x402gate.core.pricing import apply_commission
 from x402gate.core.proxy import TaskTimeoutError
+from x402gate.providers.base import ProviderError
 
 # Set env vars before importing the app
 os.environ.setdefault("WAVESPEED_API_KEY", "test-key-12345")
@@ -756,6 +758,7 @@ class TestSolanaUpfrontSettlement:
         assert mock_ph.settle.await_args.args[2] == SOLANA_NETWORK
         assert "refunded_to_prepaid" not in response.json()
         assert "x-prepaid-cost" not in response.headers
+        assert "prepaid" not in response.json()
 
     @respx.mock
     def test_failed_settle_does_not_call_provider(self, client):
@@ -818,6 +821,7 @@ class TestSolanaUpfrontSettlement:
         assert response.status_code == 502
         assert "x-prepaid-cost" not in response.headers
         body = response.json()
+        assert "prepaid" not in body
         assert Decimal(body["refunded_to_prepaid"]) == get_balance(SOL_PAYER)
         assert Decimal(body["prepaid_balance"]) == get_balance(SOL_PAYER)
         assert mock_ph.settle.await_count == 1
@@ -854,8 +858,8 @@ class TestSolanaUpfrontSettlement:
         assert Decimal(body["refunded_to_prepaid"]) == get_balance(SOL_PAYER)
 
     @respx.mock
-    def test_provider_timeout_refunds_prepaid(self, client):
-        """A task timeout after Solana settle credits prepaid."""
+    def test_provider_timeout_keeps_the_payment(self, client):
+        """A poll timeout may still bill us, so the settled Solana payment stays."""
         reset()
         _price_ok()
         respx.post(WAVESPEED_SUBMIT).mock(
@@ -880,8 +884,9 @@ class TestSolanaUpfrontSettlement:
         assert response.status_code == 504
         body = response.json()
         assert body["task_id"] == "task-1"
-        assert Decimal(body["refunded_to_prepaid"]) == get_balance(SOL_PAYER)
-        assert Decimal(body["prepaid_balance"]) == get_balance(SOL_PAYER)
+        assert body["outcome_unknown"] is True
+        assert "refunded_to_prepaid" not in body
+        assert get_balance(SOL_PAYER) == 0
 
     @respx.mock
     def test_long_poll_sends_whitespace_before_json(self, client):
@@ -1079,6 +1084,8 @@ class TestPrepaidReservation:
         assert response.status_code == 502
         assert get_balance(pubkey) == Decimal("1.00")
         assert response.headers["x-prepaid-cost"] == "0"
+        assert response.headers["x-prepaid-balance"] == "1"
+        assert response.json()["prepaid"] == {"cost": "0", "balance": "1"}
 
     @respx.mock
     def test_cost_header_is_the_actual_charge(self, client):
@@ -1109,6 +1116,40 @@ class TestPrepaidReservation:
         cost = Decimal(response.headers["x-prepaid-cost"])
         assert Decimal(response.headers["x-prepaid-balance"]) == Decimal("1.00") - cost
         assert get_balance(pubkey) == Decimal("1.00") - cost
+        assert response.json()["prepaid"] == {
+            "cost": response.headers["x-prepaid-cost"],
+            "balance": response.headers["x-prepaid-balance"],
+        }
+
+    @respx.mock
+    def test_tiny_cost_is_plain_decimal_and_balances_add_up(self, client):
+        """Sub-micro amounts never use exponent notation, and old - cost == new exactly."""
+        reset()
+        kp = Keypair()
+        pubkey = str(kp.pubkey())
+        asyncio.run(deposit(pubkey, Decimal("0.61609766143")))
+        respx.post(WAVESPEED_PRICE).mock(
+            return_value=httpx.Response(200, json={"data": {"unit_price": 0.003}})
+        )
+        respx.post(WAVESPEED_SUBMIT).mock(
+            return_value=httpx.Response(200, json={"data": {"output": {"images": ["ok"]}}})
+        )
+
+        async def _tiny(body, result):
+            return Decimal("5.8653E-7")
+
+        providers["wavespeed"].calculate_actual_cost = _tiny
+        response = client.post(
+            "/v1/wavespeed/wavespeed-ai/flux-dev",
+            json={"prompt": "a cat"},
+            headers=_prepaid_headers(kp, "wavespeed/wavespeed-ai/flux-dev"),
+        )
+
+        assert response.status_code == 200
+        assert response.headers["x-prepaid-cost"] == "0.00000058"
+        assert response.headers["x-prepaid-balance"] == "0.61609708"
+        assert Decimal("0.61609766") - Decimal("0.00000058") == Decimal("0.61609708")
+        assert get_balance(pubkey) == Decimal("0.61609766143") - Decimal("0.00000058")
 
     @respx.mock
     def test_cost_header_falls_back_to_estimate(self, client):
@@ -1167,6 +1208,65 @@ class TestPrepaidReservation:
         assert Decimal(response.headers["x-prepaid-balance"]) == Decimal("0")
         assert Decimal(response.headers["x-prepaid-cost"]) == Decimal("0.002")
 
+    def _post_long_job(self, client, kp, get_result):
+        """POST a prepaid WaveSpeed job that outlives the heartbeat interval."""
+        respx.post(WAVESPEED_PRICE).mock(
+            return_value=httpx.Response(200, json={"data": {"unit_price": 0.003}})
+        )
+        respx.post(WAVESPEED_SUBMIT).mock(
+            return_value=httpx.Response(
+                200, json={"data": {"id": "task-1", "status": "processing"}}
+            )
+        )
+        providers["wavespeed"].get_result = get_result
+        with patch("x402gate.app._HEARTBEAT_INTERVAL_S", 0.01):
+            return client.post(
+                "/v1/wavespeed/wavespeed-ai/flux-dev",
+                json={"prompt": "a cat"},
+                headers=_prepaid_headers(kp, "wavespeed/wavespeed-ai/flux-dev"),
+            )
+
+    @respx.mock
+    def test_long_job_reports_the_charge_in_the_body(self, client):
+        """A heartbeat response has no prepaid headers, so the body carries them."""
+        reset()
+        kp = Keypair()
+        pubkey = str(kp.pubkey())
+        asyncio.run(deposit(pubkey, Decimal("1.00")))
+
+        async def _slow(task_id):
+            await asyncio.sleep(0.1)
+            return {"id": task_id, "status": "completed", "outputs": ["ok"]}
+
+        response = self._post_long_job(client, kp, _slow)
+
+        assert response.status_code == 200
+        assert response.content.startswith(b"\n")
+        assert "x-prepaid-cost" not in response.headers
+        assert "x-prepaid-balance" not in response.headers
+        assert response.json()["prepaid"] == {"cost": "0.003", "balance": "0.997"}
+        assert get_balance(pubkey) == Decimal("0.997")
+
+    @respx.mock
+    def test_long_job_failure_reports_zero_cost_in_the_body(self, client):
+        """A long job that fails returns the hold, and the body says nothing was charged."""
+        reset()
+        kp = Keypair()
+        pubkey = str(kp.pubkey())
+        asyncio.run(deposit(pubkey, Decimal("1.00")))
+
+        async def _slow_failure(task_id):
+            await asyncio.sleep(0.1)
+            raise ProviderError(provider="wavespeed", detail="boom")
+
+        response = self._post_long_job(client, kp, _slow_failure)
+
+        body = response.json()
+        assert body["status"] == 502
+        assert "boom" in body["error"]
+        assert body["prepaid"] == {"cost": "0", "balance": "1"}
+        assert get_balance(pubkey) == Decimal("1.00")
+
     @respx.mock
     def test_concurrent_requests_spend_the_balance_once(self, client):
         """Five parallel requests on a one-request balance produce one success."""
@@ -1202,6 +1302,274 @@ class TestPrepaidReservation:
         assert codes.count(402) == 4
         assert get_balance(pubkey) >= 0
         assert get_balance(pubkey) == Decimal("0")
+
+
+def _drain(client) -> None:
+    """Wait for settlements and jobs the gateway finishes in the background."""
+
+    async def _wait() -> None:
+        for _ in range(20):
+            pending = [
+                task
+                for task in (*_pending_settlements, *getattr(gateway, "_pending_jobs", ()))
+                if not task.done()
+            ]
+            if not pending:
+                return
+            await asyncio.wait(pending, timeout=1)
+
+    client.portal.call(_wait)
+
+
+def _post_and_leave(client, path: str, headers: dict[str, str]) -> list[dict]:
+    """POST a WaveSpeed job over raw ASGI and disconnect after the first heartbeat."""
+
+    async def _run() -> list[dict]:
+        raw = json.dumps({"prompt": "a cat"}).encode()
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": path,
+            "raw_path": path.encode(),
+            "query_string": b"",
+            "root_path": "",
+            "headers": [
+                (b"host", b"test"),
+                (b"content-type", b"application/json"),
+                *[(k.lower().encode(), v.encode()) for k, v in headers.items()],
+            ],
+            "client": ("127.0.0.1", 50000),
+            "server": ("test", 80),
+            "state": {},
+        }
+        left = asyncio.Event()
+        request_sent = False
+        messages: list[dict] = []
+
+        async def receive() -> dict:
+            nonlocal request_sent
+            if not request_sent:
+                request_sent = True
+                return {"type": "http.request", "body": raw, "more_body": False}
+            await left.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message: dict) -> None:
+            messages.append(message)
+            if message["type"] == "http.response.body" and message.get("body"):
+                left.set()
+
+        await app(scope, receive, send)
+        return messages
+
+    return client.portal.call(_run)
+
+
+def _submitted_task() -> None:
+    """Mock WaveSpeed pricing and a submit that returns a polled task."""
+    _price_ok()
+    respx.post(WAVESPEED_SUBMIT).mock(
+        return_value=httpx.Response(200, json={"data": {"id": "task-1", "status": "processing"}})
+    )
+
+
+async def _slow_success(task_id: str) -> dict:
+    await asyncio.sleep(0.2)
+    return {"id": task_id, "status": "completed", "outputs": ["ok"]}
+
+
+async def _slow_failure(task_id: str) -> dict:
+    await asyncio.sleep(0.2)
+    raise ProviderError(provider="wavespeed", detail="task failed: nsfw")
+
+
+def _body_text(messages: list[dict]) -> bytes:
+    return b"".join(m.get("body", b"") for m in messages if m["type"] == "http.response.body")
+
+
+class TestUnknownOutcome:
+    """Funds go back only when the provider reported the failure itself."""
+
+    @respx.mock
+    def test_prepaid_poll_timeout_keeps_the_hold(self, client):
+        """The task may still finish and bill us, so the estimate is charged."""
+        reset()
+        kp = Keypair()
+        pubkey = str(kp.pubkey())
+        asyncio.run(deposit(pubkey, Decimal("1.00")))
+        _submitted_task()
+
+        with patch.object(
+            providers["wavespeed"],
+            "get_result",
+            AsyncMock(side_effect=TaskTimeoutError("task-1", 10)),
+        ):
+            response = client.post(
+                "/v1/wavespeed/wavespeed-ai/flux-dev",
+                json={"prompt": "a cat"},
+                headers=_prepaid_headers(kp, "wavespeed/wavespeed-ai/flux-dev"),
+            )
+
+        assert response.status_code == 504
+        body = response.json()
+        assert body["outcome_unknown"] is True
+        assert body["prepaid"] == {"cost": "0.003", "balance": "0.997"}
+        assert response.headers["x-prepaid-cost"] == "0.003"
+        assert get_balance(pubkey) == Decimal("0.997")
+
+    @respx.mock
+    def test_prepaid_submit_read_timeout_keeps_the_hold(self, client):
+        """A submit that timed out after sending may have started the job."""
+        reset()
+        kp = Keypair()
+        pubkey = str(kp.pubkey())
+        asyncio.run(deposit(pubkey, Decimal("1.00")))
+        _price_ok()
+        respx.post(WAVESPEED_SUBMIT).mock(side_effect=httpx.ReadTimeout("slow"))
+
+        with patch("x402gate.core.proxy.asyncio.sleep", new_callable=AsyncMock):
+            response = client.post(
+                "/v1/wavespeed/wavespeed-ai/flux-dev",
+                json={"prompt": "a cat"},
+                headers=_prepaid_headers(kp, "wavespeed/wavespeed-ai/flux-dev"),
+            )
+
+        assert response.json()["outcome_unknown"] is True
+        assert response.json()["prepaid"]["cost"] == "0.003"
+        assert get_balance(pubkey) == Decimal("0.997")
+
+    @respx.mock
+    def test_prepaid_connect_error_returns_the_hold(self, client):
+        """A connection that never opened cannot have started anything."""
+        reset()
+        kp = Keypair()
+        pubkey = str(kp.pubkey())
+        asyncio.run(deposit(pubkey, Decimal("1.00")))
+        _price_ok()
+        respx.post(WAVESPEED_SUBMIT).mock(side_effect=httpx.ConnectError("refused"))
+
+        response = client.post(
+            "/v1/wavespeed/wavespeed-ai/flux-dev",
+            json={"prompt": "a cat"},
+            headers=_prepaid_headers(kp, "wavespeed/wavespeed-ai/flux-dev"),
+        )
+
+        assert "outcome_unknown" not in response.json()
+        assert response.json()["prepaid"]["cost"] == "0"
+        assert get_balance(pubkey) == Decimal("1.00")
+
+    @respx.mock
+    def test_base_poll_timeout_settles(self, client):
+        """On Base, keeping the payment means settling the authorization."""
+        reset()
+        _submitted_task()
+
+        with (
+            patch("x402gate.app.payment_handler") as mock_ph,
+            patch.object(
+                providers["wavespeed"],
+                "get_result",
+                AsyncMock(side_effect=TaskTimeoutError("task-1", 10)),
+            ),
+        ):
+            _paid_handler(mock_ph, EVM_NETWORK, "0xPayer")
+            mock_ph.settle = AsyncMock(return_value=_settled_ok("ETH"))
+            response = _post_wavespeed(client)
+            _drain(client)
+
+        assert response.status_code == 504
+        assert response.json()["outcome_unknown"] is True
+        assert mock_ph.settle.await_count == 1
+        assert mock_ph.settle.await_args.args[1] == apply_commission(Decimal("0.003"), 0.04, 0.001)
+
+
+class TestClientDisconnect:
+    """A client that leaves mid-job does not stop the job or its billing."""
+
+    @respx.mock
+    def test_prepaid_success_after_leaving_is_charged(self, client):
+        reset()
+        kp = Keypair()
+        pubkey = str(kp.pubkey())
+        asyncio.run(deposit(pubkey, Decimal("1.00")))
+        _submitted_task()
+
+        with (
+            patch("x402gate.app._HEARTBEAT_INTERVAL_S", 0.01),
+            patch.object(providers["wavespeed"], "get_result", side_effect=_slow_success),
+        ):
+            messages = _post_and_leave(
+                client,
+                "/v1/wavespeed/wavespeed-ai/flux-dev",
+                _prepaid_headers(kp, "wavespeed/wavespeed-ai/flux-dev"),
+            )
+            _drain(client)
+
+        assert messages[0]["status"] == 200
+        assert b'"data"' not in _body_text(messages)
+        assert get_balance(pubkey) == Decimal("0.997")
+
+    @respx.mock
+    def test_prepaid_failure_after_leaving_is_returned(self, client):
+        reset()
+        kp = Keypair()
+        pubkey = str(kp.pubkey())
+        asyncio.run(deposit(pubkey, Decimal("1.00")))
+        _submitted_task()
+
+        with (
+            patch("x402gate.app._HEARTBEAT_INTERVAL_S", 0.01),
+            patch.object(providers["wavespeed"], "get_result", side_effect=_slow_failure),
+        ):
+            _post_and_leave(
+                client,
+                "/v1/wavespeed/wavespeed-ai/flux-dev",
+                _prepaid_headers(kp, "wavespeed/wavespeed-ai/flux-dev"),
+            )
+            _drain(client)
+
+        assert get_balance(pubkey) == Decimal("1.00")
+
+    @respx.mock
+    def test_base_success_after_leaving_settles(self, client):
+        reset()
+        _submitted_task()
+
+        with (
+            patch("x402gate.app.payment_handler") as mock_ph,
+            patch("x402gate.app._HEARTBEAT_INTERVAL_S", 0.01),
+            patch.object(providers["wavespeed"], "get_result", side_effect=_slow_success),
+        ):
+            _paid_handler(mock_ph, EVM_NETWORK, "0xPayer")
+            mock_ph.settle = AsyncMock(return_value=_settled_ok("ETH"))
+            _post_and_leave(
+                client, "/v1/wavespeed/wavespeed-ai/flux-dev", {"Payment-Signature": "fake-sig"}
+            )
+            _drain(client)
+
+        assert mock_ph.settle.await_count == 1
+
+    @respx.mock
+    def test_solana_failure_after_leaving_is_credited(self, client):
+        reset()
+        _submitted_task()
+
+        with (
+            patch("x402gate.app.payment_handler") as mock_ph,
+            patch("x402gate.app._HEARTBEAT_INTERVAL_S", 0.01),
+            patch.object(providers["wavespeed"], "get_result", side_effect=_slow_failure),
+        ):
+            _paid_handler(mock_ph, SOLANA_NETWORK, SOL_PAYER)
+            mock_ph.settle = AsyncMock(return_value=_settled_ok())
+            _post_and_leave(
+                client, "/v1/wavespeed/wavespeed-ai/flux-dev", {"Payment-Signature": "fake-sig"}
+            )
+            _drain(client)
+
+        assert get_balance(SOL_PAYER) == apply_commission(Decimal("0.003"), 0.04, 0.001)
 
 
 class TestRequestGuards:

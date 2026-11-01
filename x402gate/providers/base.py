@@ -11,7 +11,20 @@ from abc import ABC, abstractmethod
 from decimal import Decimal
 from typing import Any
 
+import httpx
+
 from x402gate.core.config import ProviderConfig
+from x402gate.core.proxy import TaskTimeoutError
+
+# Transport failures that happen after the request was sent. The provider may
+# have accepted it and started (and billed) the job.
+_MAY_HAVE_LANDED = (
+    httpx.ReadTimeout,
+    httpx.WriteTimeout,
+    httpx.ReadError,
+    httpx.WriteError,
+    httpx.RemoteProtocolError,
+)
 
 
 class BaseProvider(ABC):
@@ -137,6 +150,33 @@ def require_text(inputs: dict[str, Any], provider_name: str) -> str:
             status_code=400,
         )
     return text
+
+
+def outcome_unknown(exc: BaseException) -> bool:
+    """Return True when a failed call may still have run, and billed us.
+
+    A poll timeout leaves the job running. A request that timed out or
+    dropped after it was sent may have been accepted. Failures the provider
+    reported itself (an HTTP error status, a failed task) and connections
+    that never opened are known failures.
+
+    Providers wrap transport errors in ``ProviderError``, often with
+    ``from None``, so the whole ``__cause__`` / ``__context__`` chain is
+    checked.
+    """
+    if isinstance(exc, TaskTimeoutError):
+        return True
+    seen: set[int] = set()
+    stack: list[BaseException | None] = [exc]
+    while stack:
+        current = stack.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, _MAY_HAVE_LANDED):
+            return True
+        stack.extend((current.__cause__, current.__context__))
+    return False
 
 
 class ProviderError(Exception):

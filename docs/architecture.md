@@ -101,9 +101,17 @@ Prices are fetched from the provider's pricing API at request time. A TTL cache 
 
 Payment is verified before any work.
 
-On Base the client signs an EIP-3009 authorization that stays valid for `max_timeout` (3600 seconds). The gateway settles only after the provider succeeds. A failed or timed-out task is not settled, and the client keeps the USDC.
+On Base the client signs an EIP-3009 authorization that stays valid for `max_timeout` (3600 seconds). The gateway settles after the provider succeeds. A task the provider reports as failed is not settled, and the client keeps the USDC.
 
-On Solana the client signs a transaction whose blockhash expires in about a minute. The gateway settles that transaction immediately after verify, before calling the provider. While it waits, it rebroadcasts the same signed bytes. If the blockhash expires before the transaction lands, settlement fails and the client is not charged. If submit, polling, or the provider then fails, the settled amount is credited to the payer's in-memory prepaid balance. The error JSON includes `refunded_to_prepaid` and `prepaid_balance`.
+On Solana the client signs a transaction whose blockhash expires in about a minute. The gateway settles that transaction immediately after verify, before calling the provider. While it waits, it rebroadcasts the same signed bytes. If the blockhash expires before the transaction lands, settlement fails and the client is not charged. If the provider then reports a failure, the settled amount is credited to the payer's in-memory prepaid balance. The error JSON includes `refunded_to_prepaid` and `prepaid_balance`.
+
+### Unknown Outcome
+
+Funds go back only when the failure is known: the provider returned an error status, marked the task failed, or the connection never opened. When the gateway cannot tell how the job ended, it keeps the payment, because the provider may have run and billed the job. That happens when polling exceeds `poll_timeout`, or when a request times out or drops after it was sent. `outcome_unknown()` in `x402gate/providers/base.py` makes that call by walking the exception chain. Keeping the payment means settling the Base authorization, leaving the Solana payment settled, or charging the prepaid reservation. The error JSON carries `"outcome_unknown": true`.
+
+### Client Disconnects
+
+A polled job runs in its own task, tracked in `_pending_jobs`. If the client leaves while heartbeats are going out, only the stream stops. The job finishes and is charged or refunded as if the client had stayed. On shutdown the gateway waits for these jobs before it waits for settlements.
 
 ### Custom x402 Flow
 

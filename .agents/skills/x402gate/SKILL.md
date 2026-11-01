@@ -59,7 +59,7 @@ If you need deep technical details on specific features:
 - **x402 Protocol Specification:** [x402.org](https://x402.org)
 
 ## 5. Key Agent Rules
-- **Pay on success**: If the provider fails (HTTP 5xx), the payment signature is never collected. Do not hesitate to use the API.
+- **Pay on success**: If the provider reports a failure, you are not charged: a Base payment is never settled, and a Solana payment is credited to your prepaid balance. If the outcome is unknown (a timeout, or a dropped connection to the provider), the payment is kept and the error says `"outcome_unknown": true`.
 - **Do not invent endpoints**: Always refer to the discovery manifest (`GET /`).
 - **File Uploads**: For `cloudconvert`, use standard `multipart/form-data`. For OpenRouter STT, send JSON with base64-encoded audio in `input_audio.data`.
 

@@ -12,7 +12,7 @@ import logging
 import os
 import pathlib
 import time
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from decimal import Decimal
 from typing import Any
 
@@ -28,6 +28,7 @@ from x402gate.core.payment import PaymentHandler
 from x402gate.core.prepaid import (
     build_signing_message,
     deposit,
+    format_usd,
     get_balance,
     release,
     reserve,
@@ -39,7 +40,7 @@ from x402gate.core.prepaid import (
 )
 from x402gate.core.pricing import PriceCache, apply_commission
 from x402gate.core.proxy import TaskTimeoutError
-from x402gate.providers.base import BaseProvider, ProviderError
+from x402gate.providers.base import BaseProvider, ProviderError, outcome_unknown
 from x402gate.providers.cloudconvert import CloudConvertProvider
 from x402gate.providers.elevenlabs import ElevenLabsProvider
 from x402gate.providers.fishaudio import FishAudioProvider
@@ -73,6 +74,20 @@ def _error_response(
         body["provider"] = provider
     body.update(extra)
     return JSONResponse(status_code=status_code, content=body)
+
+
+def _prepaid_report(remaining: Decimal, charged: Decimal) -> dict[str, str]:
+    """Cost and balance of a prepaid request, as sent in the body and headers.
+
+    The body copy matters for heartbeat responses, whose headers go out
+    before the cost is known.
+    """
+    return {"cost": format_usd(charged), "balance": format_usd(remaining)}
+
+
+def _prepaid_headers(report: dict[str, str]) -> dict[str, str]:
+    """Response headers carrying a :func:`_prepaid_report`."""
+    return {"X-Prepaid-Balance": report["balance"], "X-Prepaid-Cost": report["cost"]}
 
 
 def _record_onchain_settlement(
@@ -169,6 +184,20 @@ providers: dict[str, BaseProvider | None] = {}  # None = passthrough (no provide
 payment_handler: PaymentHandler
 price_cache: PriceCache
 _pending_settlements: set[asyncio.Task] = set()
+_pending_jobs: set[asyncio.Task] = set()
+
+
+def _track_job(task: asyncio.Task) -> None:
+    """Keep a polled job alive until it is charged or refunded."""
+    _pending_jobs.add(task)
+    task.add_done_callback(_job_done)
+
+
+def _job_done(task: asyncio.Task) -> None:
+    """Forget a finished job, logging a crash nobody else may see."""
+    _pending_jobs.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        logger.error("Polled job crashed", exc_info=task.exception())
 
 
 @asynccontextmanager
@@ -270,7 +299,10 @@ async def lifespan(app: FastAPI):
 
     yield  # Application is running
 
-    # Shutdown: wait for pending settlements
+    # Shutdown: finish polled jobs (they may start settlements), then settle
+    if _pending_jobs:
+        logger.info("Waiting for %d polled job(s)...", len(_pending_jobs))
+        await asyncio.gather(*_pending_jobs, return_exceptions=True)
     if _pending_settlements:
         logger.info("Waiting for %d pending settlement(s)...", len(_pending_settlements))
         await asyncio.gather(*_pending_settlements, return_exceptions=True)
@@ -928,21 +960,121 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
             time.monotonic() - t_settle_start,
         )
 
+    def _settle_in_background(provider_cost: Decimal, generation_s: float, t_client: float) -> None:
+        """Settle the Base authorization and log the financial summary."""
+
+        async def background_settle() -> None:
+            """Settle payment and log financial summary in background."""
+            try:
+                ctx = {
+                    "provider_name": provider_name,
+                    "estimated_cost": float(base_price),
+                    "provider_cost": float(provider_cost),
+                    "generation_s": generation_s,
+                    "t_client": t_client,
+                    "commission_rate": config.gateway.commission,
+                    "gas_surcharge": config.gateway.gas_surcharge,
+                }
+                t_settle_start = time.monotonic()
+                settlement = await payment_handler.settle(
+                    payment_sig,
+                    final_price,
+                    payment_network,
+                    extra_context=ctx,
+                )
+                settle_latency = time.monotonic() - t_settle_start
+
+                if not settlement:
+                    logger.error(
+                        "Settlement returned None for %s — check logs above", payment_network
+                    )
+                elif not settlement.get("success"):
+                    logger.error(
+                        "Settlement FAILED for %s: %s",
+                        payment_network,
+                        settlement.get("error_reason", "unknown"),
+                    )
+                else:
+                    _record_onchain_settlement(
+                        provider_name, payment_network, settlement, settle_latency
+                    )
+                    stats.record_revenue(
+                        provider_name,
+                        Decimal(str(settlement.get("amount_usdc", 0))),
+                        provider_cost,
+                    )
+            except Exception:
+                logger.exception("Background settlement crashed for %s", payment_network)
+
+        task = asyncio.create_task(background_settle())
+        _pending_settlements.add(task)
+        task.add_done_callback(_pending_settlements.discard)
+
     async def _provider_error(
         status_code: int,
         detail: str,
         *,
         provider_label: str | None = None,
+        keep_payment: bool = False,
         **extra: Any,
     ) -> JSONResponse:
-        """Return a provider error, giving held funds back."""
-        if upfront_settlement is not None:
-            extra.update(await _refund_settled_payment(payer, final_price))
-        response = _error_response(status_code, detail, provider=provider_label, **extra)
+        """Return a provider error and settle the funds it held.
+
+        Funds go back only when the provider reported the failure. With
+        ``keep_payment`` the outcome is unknown: the job may have run and
+        billed us, so the prepaid hold is charged, a Solana payment stays
+        settled and a Base authorization is settled.
+        """
+        if keep_payment:
+            extra["outcome_unknown"] = True
+            logger.warning(
+                "%s outcome unknown, keeping the payment: %s", provider_name, detail[:200]
+            )
+        report = None
         if prepaid_reserved is not None:
-            _, charged = await release(prepaid_pubkey, prepaid_reserved, Decimal("0"))
-            response.headers["X-Prepaid-Cost"] = str(charged)
+            kept = prepaid_reserved if keep_payment else Decimal("0")
+            remaining, charged = await release(prepaid_pubkey, prepaid_reserved, kept)
+            if charged:
+                stats.record_prepaid_usage(provider_name, charged)
+            report = _prepaid_report(remaining, charged)
+            extra["prepaid"] = report
+        elif upfront_settlement is not None:
+            if keep_payment:
+                stats.record_revenue(
+                    provider_name,
+                    Decimal(str(upfront_settlement.get("amount_usdc", 0))),
+                    base_price,
+                )
+            else:
+                extra.update(await _refund_settled_payment(payer, final_price))
+        elif keep_payment:
+            _settle_in_background(
+                base_price, time.monotonic() - t_gen_start, time.monotonic() - t_start
+            )
+        response = _error_response(status_code, detail, provider=provider_label, **extra)
+        if report is not None:
+            response.headers.update(_prepaid_headers(report))
         return response
+
+    async def _job_failed(exc: TaskTimeoutError | ProviderError) -> JSONResponse:
+        """Record a failed provider call and build its error response."""
+        t_err = time.monotonic() - t_gen_start
+        if isinstance(exc, TaskTimeoutError):
+            stats.record_request(provider_name, t_err, False, error_msg=f"Timeout {exc.timeout}s")
+            return await _provider_error(
+                504,
+                f"Task timed out after {exc.timeout}s",
+                provider_label=provider.name,
+                keep_payment=True,
+                task_id=exc.task_id,
+            )
+        stats.record_request(provider_name, t_err, False, error_msg=exc.detail)
+        return await _provider_error(
+            exc.status_code,
+            exc.detail,
+            provider_label=exc.provider,
+            keep_payment=outcome_unknown(exc),
+        )
 
     # 6. Forward request to provider
     body["_caller"] = (prepaid_pubkey or payer or "x402")[:12]
@@ -950,9 +1082,7 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
     try:
         result = await provider.submit(path, body, prepaid=prepaid_mode)
     except ProviderError as e:
-        t_err = time.monotonic() - t_gen_start
-        stats.record_request(provider_name, t_err, False, error_msg=e.detail)
-        return await _provider_error(e.status_code, e.detail, provider_label=e.provider)
+        return await _job_failed(e)
 
     # 7. Determine if response is async (needs polling) or sync (ready)
     #    - Sync providers (OpenRouter, TTS, etc.) return results directly,
@@ -1014,13 +1144,9 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
                 content["data"] = output
             else:
                 content = {"data": output}
-            return JSONResponse(
-                content=content,
-                headers={
-                    "X-Prepaid-Balance": str(remaining),
-                    "X-Prepaid-Cost": str(charged),
-                },
-            )
+            report = _prepaid_report(remaining, charged)
+            content["prepaid"] = report
+            return JSONResponse(content=content, headers=_prepaid_headers(report))
 
         # 9. Settle. Solana already settled before the provider call.
         t_client = time.monotonic() - t_start
@@ -1038,53 +1164,7 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
                 generation_s,
             )
         else:
-
-            async def background_settle() -> None:
-                """Settle payment and log financial summary in background."""
-                try:
-                    ctx = {
-                        "provider_name": provider_name,
-                        "estimated_cost": float(base_price),
-                        "provider_cost": float(actual_base_price),
-                        "generation_s": generation_s,
-                        "t_client": t_client,
-                        "commission_rate": config.gateway.commission,
-                        "gas_surcharge": config.gateway.gas_surcharge,
-                    }
-                    t_settle_start = time.monotonic()
-                    settlement = await payment_handler.settle(
-                        payment_sig,
-                        final_price,
-                        payment_network,
-                        extra_context=ctx,
-                    )
-                    settle_latency = time.monotonic() - t_settle_start
-
-                    if not settlement:
-                        logger.error(
-                            "Settlement returned None for %s — check logs above", payment_network
-                        )
-                    elif not settlement.get("success"):
-                        logger.error(
-                            "Settlement FAILED for %s: %s",
-                            payment_network,
-                            settlement.get("error_reason", "unknown"),
-                        )
-                    else:
-                        _record_onchain_settlement(
-                            provider_name, payment_network, settlement, settle_latency
-                        )
-                        stats.record_revenue(
-                            provider_name,
-                            Decimal(str(settlement.get("amount_usdc", 0))),
-                            actual_base_price,
-                        )
-                except Exception:
-                    logger.exception("Background settlement crashed for %s", payment_network)
-
-            task = asyncio.create_task(background_settle())
-            _pending_settlements.add(task)
-            task.add_done_callback(_pending_settlements.discard)
+            _settle_in_background(actual_base_price, generation_s, t_client)
 
         # 10. Return result to client
         stats.record_request(provider_name, generation_s, True)
@@ -1108,9 +1188,21 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
         return await _respond(task_data)
 
     task_id = task_data["id"]
-    poll_task = asyncio.create_task(provider.get_result(task_id))
+
+    async def _finish_job() -> JSONResponse:
+        """Wait for the polled job, then charge or refund it."""
+        try:
+            output = await provider.get_result(task_id)
+        except (TaskTimeoutError, ProviderError) as e:
+            return await _job_failed(e)
+        return await _respond(output)
+
+    # The job runs in its own task, so a client that disconnects does not
+    # stop it. It still finishes and is charged or refunded on its outcome.
+    finish = asyncio.create_task(_finish_job())
+    _track_job(finish)
     try:
-        output = await asyncio.wait_for(asyncio.shield(poll_task), _HEARTBEAT_INTERVAL_S)
+        return await asyncio.wait_for(asyncio.shield(finish), _HEARTBEAT_INTERVAL_S)
     except TimeoutError:
         logger.info(
             "Holding %s task %s open with heartbeats",
@@ -1118,79 +1210,40 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
             task_id,
         )
         return StreamingResponse(
-            _stream_polled_job(poll_task, _respond, _provider_error, provider, t_gen_start),
+            _stream_finished_job(finish, provider_name, task_id),
             media_type="application/json",
             headers={
                 "Cache-Control": "no-cache",
                 "X-Accel-Buffering": "no",
             },
         )
-    except TaskTimeoutError as e:
-        t_err = time.monotonic() - t_gen_start
-        stats.record_request(provider_name, t_err, False, error_msg=f"Timeout {e.timeout}s")
-        return await _provider_error(
-            504,
-            f"Task timed out after {e.timeout}s",
-            provider_label=provider.name,
-            task_id=e.task_id,
-        )
-    except ProviderError as e:
-        t_err = time.monotonic() - t_gen_start
-        stats.record_request(provider_name, t_err, False, error_msg=e.detail)
-        return await _provider_error(e.status_code, e.detail, provider_label=e.provider)
-    return await _respond(output)
 
 
-async def _stream_polled_job(
-    poll_task: asyncio.Task[Any],
-    respond: Any,
-    provider_error: Any,
-    provider: BaseProvider,
-    t_gen_start: float,
+async def _stream_finished_job(
+    finish: asyncio.Task[JSONResponse],
+    provider_name: str,
+    task_id: str,
 ) -> Any:
     """Send JSON whitespace until a polled job finishes, then its body.
 
     The HTTP status is already 200 once the first pad goes out. A later
-    failure is the usual error JSON in that body.
+    failure is the usual error JSON in that body. If the client leaves,
+    only the stream stops: ``finish`` keeps running.
     """
     try:
-        while not poll_task.done():
+        while not finish.done():
             yield _HEARTBEAT_PAD
             try:
-                await asyncio.wait_for(asyncio.shield(poll_task), _HEARTBEAT_INTERVAL_S)
+                await asyncio.wait_for(asyncio.shield(finish), _HEARTBEAT_INTERVAL_S)
             except TimeoutError:
                 continue
             except Exception:
                 break
-        try:
-            output = poll_task.result()
-        except TaskTimeoutError as e:
-            t_err = time.monotonic() - t_gen_start
-            stats.record_request(
-                provider.name,
-                t_err,
-                False,
-                error_msg=f"Timeout {e.timeout}s",
-            )
-            response = await provider_error(
-                504,
-                f"Task timed out after {e.timeout}s",
-                provider_label=provider.name,
-                task_id=e.task_id,
-            )
-        except ProviderError as e:
-            t_err = time.monotonic() - t_gen_start
-            stats.record_request(provider.name, t_err, False, error_msg=e.detail)
-            response = await provider_error(
-                e.status_code,
-                e.detail,
-                provider_label=e.provider,
-            )
-        else:
-            response = await respond(output)
-        yield response.body
-    finally:
-        if not poll_task.done():
-            poll_task.cancel()
-            with suppress(asyncio.CancelledError, Exception):
-                await poll_task
+        yield finish.result().body
+    except (GeneratorExit, asyncio.CancelledError):
+        logger.warning(
+            "Client left %s task %s before the result; it is billed on its outcome",
+            provider_name,
+            task_id,
+        )
+        raise

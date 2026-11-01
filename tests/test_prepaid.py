@@ -11,6 +11,7 @@ from x402gate.core.prepaid import (
     build_signing_message,
     deduct,
     deposit,
+    format_usd,
     get_balance,
     release,
     reserve,
@@ -114,6 +115,40 @@ class TestReservation:
         assert results.count(True) == 1
         assert results.count(False) == 4
         assert get_balance("ABC123") == Decimal("0")
+
+    async def test_release_rounds_the_charge_down_to_the_step(self):
+        await deposit("ABC123", Decimal("1.00"))
+        assert await reserve("ABC123", Decimal("0.003")) is True
+        balance, charged = await release("ABC123", Decimal("0.003"), Decimal("0.0000000159"))
+        assert charged == Decimal("0.00000001")
+        assert balance == Decimal("1.00") - Decimal("0.00000001")
+
+    async def test_release_rounds_an_uneven_reservation_down(self):
+        await deposit("ABC123", Decimal("1.00"))
+        assert await reserve("ABC123", Decimal("0.0003027516")) is True
+        balance, charged = await release("ABC123", Decimal("0.0003027516"), Decimal("0.01"))
+        assert charged == Decimal("0.00030275")
+        assert balance == Decimal("1.00") - Decimal("0.00030275")
+
+
+class TestFormatUsd:
+    """Prepaid amounts are plain decimals, rounded down to $0.00000001."""
+
+    @pytest.mark.parametrize(
+        ("amount", "expected"),
+        [
+            (Decimal("0"), "0"),
+            (Decimal("0E-10"), "0"),
+            (Decimal("5.8E-7"), "0.00000058"),
+            (Decimal("0.00120000"), "0.0012"),
+            (Decimal("0.61609766143"), "0.61609766"),
+            (Decimal("0.000000019"), "0.00000001"),
+            (Decimal("0.000000009"), "0"),
+            (Decimal("10"), "10"),
+        ],
+    )
+    def test_format(self, amount, expected):
+        assert format_usd(amount) == expected
 
 
 # --- Ed25519 signature verification ---

@@ -43,7 +43,7 @@ Client                    x402gate                  WaveSpeed AI
 3. Client picks a network (Base or Solana), signs the payment, retries with `PAYMENT-SIGNATURE` header
 4. Gateway verifies the payment, then forwards the request and returns the result. On Base it settles after the provider succeeds. On Solana it settles first, because the signed transaction expires in about a minute.
 
-On Base, a failed or timed-out task is not settled and the client keeps the USDC. On Solana the payment is already settled, so a later provider failure credits that amount to the payer's prepaid balance.
+On Base, a task the provider reports as failed is not settled and the client keeps the USDC. On Solana the payment is already settled, so a reported failure credits that amount to the payer's prepaid balance. When the outcome is unknown (the task timed out, or the connection to the provider dropped after the request was sent), the payment is kept on both networks, because the provider may have run and billed the job. See [Error Handling](#error-handling).
 
 ### File Conversion (CloudConvert)
 
@@ -140,6 +140,20 @@ If the provider rejects a request (e.g. invalid parameters), the gateway returns
 }
 ```
 
+**Unknown outcome:** money goes back only when the provider itself reported the failure: an error status, a task marked failed, or a connection that never opened. If the gateway cannot tell how the job ended, the payment is kept, because the provider may have finished the job and billed it. That covers a task that does not finish within the provider's `poll_timeout`, and a request that timed out or dropped after it was sent. On Base the authorization is settled, on Solana the payment stays settled, and in prepaid mode the reserved estimate is charged. The error says so:
+
+```json
+{
+  "error": "Task timed out after 900s",
+  "status": 504,
+  "provider": "wavespeed",
+  "task_id": "abc123",
+  "outcome_unknown": true
+}
+```
+
+**Client disconnects:** a long job keeps running if the client closes the connection. It is charged or refunded by the same rules, as if the client had stayed, but the result cannot be delivered.
+
 **Payment rejection reasons:** When payment verification fails (e.g. insufficient USDC, stale transaction, network mismatch), the 402 response includes the specific reason:
 
 ```json
@@ -149,10 +163,10 @@ If the provider rejects a request (e.g. invalid parameters), the gateway returns
 }
 ```
 
-**Retry on 5xx:** If a provider returns a server error (502, 503, etc.), x402gate automatically retries the request up to **2 times** with exponential backoff (2s → 4s) before returning the error. This prevents payment loss during brief provider outages (e.g. CDN restarts). Timeouts are also retried. Client errors (4xx) are never retried.
+**Retry on 5xx:** If a provider returns a server error (502, 503, etc.), x402gate automatically retries the request up to **2 times** with exponential backoff (2s → 4s) before returning the error. This prevents payment loss during brief provider outages (e.g. CDN restarts). A timeout is retried only if the request never reached the provider (the connection did not open). A request that timed out after it was sent is not sent again, because the provider may already be running and billing it; that error has an unknown outcome. Client errors (4xx) are never retried.
 
 
-> **Note:** On Base, USDC moves only after the provider returns HTTP 200. On Solana, USDC moves before the provider is called. The gateway rebroadcasts that same signed transaction until it lands. If the blockhash expires first, the response is 402 and the client is not charged. If the job then fails, the error JSON includes `refunded_to_prepaid` and `prepaid_balance` — the full settled amount, credited in memory, not sent back on-chain.
+> **Note:** On Base, USDC moves only after the provider returns HTTP 200. On Solana, USDC moves before the provider is called. The gateway rebroadcasts that same signed transaction until it lands. If the blockhash expires first, the response is 402 and the client is not charged. If the provider then reports a failure, the error JSON includes `refunded_to_prepaid` and `prepaid_balance` — the full settled amount, credited in memory, not sent back on-chain.
 
 ### Prepaid Mode
 
@@ -171,7 +185,7 @@ Client                    x402gate
   │◄─── 200 + result ────────┤
 ```
 
-Commission and gas are charged **once at top-up**. Subsequent requests deduct the provider's actual cost, up to the estimate reserved before the call. OpenRouter and NanoGPT chat use the same `max_tokens` ceiling as a direct x402 payment, so a prepaid request cannot run past the reserved amount. If the provider fails, the reservation is returned to the balance.
+Commission and gas are charged **once at top-up**. Subsequent requests deduct the provider's actual cost, up to the estimate reserved before the call. OpenRouter and NanoGPT chat use the same `max_tokens` ceiling as a direct x402 payment, so a prepaid request cannot run past the reserved amount. If the provider reports a failure, the reservation is returned to the balance. If the outcome is unknown, the reservation is charged.
 
 Supports both **Solana** (Ed25519) and **Base/EVM** (EIP-191) wallets — auto-detected by address format.
 

@@ -104,18 +104,31 @@ When using prepaid balance, send these headers **instead of** `PAYMENT-SIGNATURE
 | `X-PREPAID-SIGNATURE` | Wallet signature (base58 for Solana, hex for EVM) |
 | `X-PREPAID-TIMESTAMP` | Unix timestamp (integer seconds) |
 
-### Response Header
+### Response Headers and Body
 
-Successful prepaid responses include the remaining balance and the cost of the request:
+Prepaid responses report the cost of the request and the remaining balance twice: in headers and in a top-level `prepaid` object in the JSON body.
 
-| Header | Description |
-|--------|-------------|
-| `X-Prepaid-Balance` | Remaining prepaid balance after deduction (e.g. `0.0535824`) |
-| `X-Prepaid-Cost` | Actual cost deducted for this request in USD (e.g. `0.0123`); `0` if nothing was deducted |
+| Header | Body field | Description |
+|--------|------------|-------------|
+| `X-Prepaid-Cost` | `prepaid.cost` | Actual cost deducted for this request in USD (e.g. `0.0123`); `0` if nothing was deducted |
+| `X-Prepaid-Balance` | `prepaid.balance` | Remaining prepaid balance after deduction (e.g. `0.0535824`) |
 
-A provider error after the reservation also carries `X-Prepaid-Cost: 0`, because the full hold goes back to the balance. Use `X-Prepaid-Cost` rather than the difference between two `X-Prepaid-Balance` values: parallel requests from one wallet interleave their balances.
+```json
+{
+  "data": { "...": "provider result" },
+  "prepaid": { "cost": "0.0012", "balance": "0.9988" }
+}
+```
 
-A polled job that runs longer than 20 seconds is kept open with whitespace heartbeats. Its headers go out with the first heartbeat, before the cost is known, so neither header is present on that response.
+Amounts are strings in plain decimal notation, never exponent notation, rounded down to $0.00000001 (a millionth of a cent). The charge itself is rounded the same way, so `old balance − cost = new balance` holds exactly. Use `cost` rather than the difference between two balances: parallel requests from one wallet interleave their balances.
+
+A failure the provider reported returns the full hold. Its error JSON has `"prepaid": {"cost": "0", "balance": "..."}` and the same headers. When the outcome is unknown (the task timed out, or the connection to the provider dropped after the request was sent), the job may have run and billed us, so the reserved estimate is charged. That error has `"outcome_unknown": true` and `prepaid.cost` equal to the estimate.
+
+If the client disconnects during a long job, the job still finishes and is charged or refunded by the same rules.
+
+**Long jobs:** a polled job that runs longer than 20 seconds is kept open with whitespace heartbeats. Its headers go out with the first heartbeat, before the cost is known, so that response has no `X-Prepaid-*` headers and the cost is **only in the body**. The HTTP status is already 200 by then. A failure shows up as the usual error JSON, with `status` and `prepaid`. Reading the body is the reliable way for every request.
+
+The `prepaid` object appears only on prepaid requests. Do not confuse it with `refunded_to_prepaid` and `prepaid_balance`: those appear on a failed **x402 Solana** payment, when the settled amount is credited to the payer's prepaid balance.
 
 ### Signing Message Format
 
@@ -204,5 +217,5 @@ print(response.json())
 - **In-memory storage only** — balances are lost on server restart
 - **Top-up limits** — min $0.10, max $10 (configurable in config.yaml)
 - **No cash-out** — prepaid balances cannot be withdrawn back to USDC
-- **Solana job refunds** — if a Solana payment was settled up front and the provider then fails, the amount is credited to that wallet's prepaid balance. It is still in-memory and lost on restart. This is not an on-chain refund
+- **Solana job refunds** — if a Solana payment was settled up front and the provider then reports a failure, the amount is credited to that wallet's prepaid balance. It is still in-memory and lost on restart. This is not an on-chain refund
 - **No multi-server** — balances are local to a single server instance

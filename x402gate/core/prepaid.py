@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 
 from eth_account import Account
 from eth_account.messages import encode_defunct
@@ -27,6 +27,23 @@ _lock = asyncio.Lock()
 
 # Signature timestamp validity window (seconds), set by init()
 _timestamp_window: int = 300  # default, overridden from config
+
+# Charges and reported amounts are rounded down to a millionth of a cent.
+# Charges land on this step, so the reported old balance minus the reported
+# cost equals the reported new balance exactly.
+USD_STEP = Decimal("0.00000001")
+
+
+def format_usd(amount: Decimal) -> str:
+    """Format a prepaid amount as plain decimal text, rounded down to USD_STEP.
+
+    Never uses exponent notation (``str(Decimal("5.8E-7"))`` would), and
+    drops trailing zeros: ``0.0012``, ``0.00000058``, ``0``.
+    """
+    text = format(amount.quantize(USD_STEP, rounding=ROUND_DOWN), "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
 
 
 async def deposit(pubkey: str, amount: Decimal) -> Decimal:
@@ -108,8 +125,9 @@ async def reserve(pubkey: str, amount: Decimal) -> bool:
 async def release(pubkey: str, reserved: Decimal, actual: Decimal) -> tuple[Decimal, Decimal]:
     """Settle a reservation and return the new balance and the charge.
 
-    Charges ``min(actual, reserved)`` and puts the rest back. A failed
-    provider call releases the whole hold by passing ``actual`` of 0.
+    Charges ``min(actual, reserved)``, rounded down to :data:`USD_STEP`,
+    and puts the rest back. A failed provider call releases the whole hold
+    by passing ``actual`` of 0.
 
     Args:
         pubkey: Wallet address (Solana base58 or EVM hex).
@@ -124,7 +142,7 @@ async def release(pubkey: str, reserved: Decimal, actual: Decimal) -> tuple[Deci
         reserved = Decimal("0")
     if actual < 0:
         actual = Decimal("0")
-    charged = min(actual, reserved)
+    charged = min(actual, reserved).quantize(USD_STEP, rounding=ROUND_DOWN)
     refund = reserved - charged
     async with _lock:
         current = _balances.get(pubkey, Decimal("0"))
