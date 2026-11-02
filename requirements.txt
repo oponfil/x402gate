@@ -1,11 +1,15 @@
 fastapi>=0.115.0
 uvicorn[standard]>=0.34.0
-x402[fastapi,evm,svm]>=0.1.0
+# Pinned: payment.py relies on exact SDK settle semantics (settlement_pending,
+# the pending store, the SVM duplicate cache, FacilitatorWeb3Signer internals).
+x402[fastapi,evm,svm]==2.25.0
 httpx>=0.28.0
 pyyaml>=6.0
 pydantic>=2.10.0
 pydantic-settings>=2.7.0
-mutagen>=1.47.0
+# Pinned: audio_duration.py calls private mutagen APIs (the Ogg infos'
+# _post_tags, mutagen.mp4.Atoms) that a release may change.
+mutagen==1.48.1
 # eth_keys uses libsecp256k1 through coincurve when it is installed: prepaid
 # EVM signature checks take 0.1 ms instead of 3 ms. Wheels only, no compiler.
 coincurve>=21.0.0

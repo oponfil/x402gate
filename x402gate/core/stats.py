@@ -81,6 +81,7 @@ class _GlobalStats:
     networks: dict[str, NetworkStats] = field(default_factory=dict)
     total_topups: int = 0
     total_topup_usd: Decimal = Decimal("0")
+    total_refund_credit_usd: Decimal = Decimal("0")
     logs: collections.deque = field(
         default_factory=lambda: collections.deque(maxlen=MAX_LOG_ENTRIES)
     )
@@ -205,6 +206,16 @@ def record_topup(amount_usd: Decimal) -> None:
     _stats.total_topup_usd += amount_usd
 
 
+def record_refund_credit(amount_usd: Decimal) -> None:
+    """Record a settled x402 payment credited back to prepaid.
+
+    The USDC was received, so the bottom line counts it as revenue, like
+    a top-up without commission. Spending the credit later adds its cost
+    through :func:`record_prepaid_usage`, and the two net out.
+    """
+    _stats.total_refund_credit_usd += amount_usd
+
+
 def record_settlement(
     network: str,
     settle_latency_s: float,
@@ -286,8 +297,9 @@ def get_stats() -> dict[str, Any]:
     total_prepaid_usage = sum(
         (ps.total_prepaid_usage_usd for ps in _stats.providers.values()), Decimal("0")
     )
-    # Bottom-line revenue excludes prepaid usage (real money came at top-up)
-    effective_revenue = total_revenue - total_prepaid_usage
+    # Bottom-line revenue excludes prepaid usage (real money came at top-up,
+    # or with a settled payment that was refunded to prepaid)
+    effective_revenue = total_revenue - total_prepaid_usage + _stats.total_refund_credit_usd
     # Bottom-line cost excludes topup net_credit: that money flows into
     # prepaid balance and appears as real provider costs when spent.
     topup_ps = _stats.providers.get("topup")
@@ -355,5 +367,6 @@ def reset() -> None:
     _stats.networks.clear()
     _stats.total_topups = 0
     _stats.total_topup_usd = Decimal("0")
+    _stats.total_refund_credit_usd = Decimal("0")
     _stats.logs = collections.deque(maxlen=MAX_LOG_ENTRIES)
     _stats.started_at = time.time()

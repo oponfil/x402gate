@@ -26,7 +26,7 @@ from x402gate.core.proxy import (
     UpstreamMayHaveRun,
     rejected_credentials,
 )
-from x402gate.providers.base import BaseProvider, ProviderError
+from x402gate.providers.base import BaseProvider, ProviderError, raise_for_gateway_timeout
 
 logger = logging.getLogger(__name__)
 
@@ -209,7 +209,11 @@ class SocialDownloadProvider(BaseProvider):
             logger.error("RapidAPI rejected our key (%d): %s", resp.status_code, resp.text[:300])
             raise ProviderError(provider=self.name, detail=UPSTREAM_CREDENTIALS_DETAIL)
 
-        # Only 2xx ran the call. httpx does not follow redirects, so a 3xx
+        # A gateway timeout came after the call was forwarded: it may have
+        # run and been billed, so the payment is kept.
+        raise_for_gateway_timeout(resp.status_code, self.name, "RapidAPI")
+
+        # Otherwise only 2xx ran the call. httpx does not follow redirects, so a 3xx
         # never reached the API and is refunded like a 4xx/5xx.
         if not 200 <= resp.status_code < 300:
             raise ProviderError(

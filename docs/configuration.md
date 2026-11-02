@@ -20,7 +20,7 @@ x402gate is configured via `config.yaml` in the project root. Secrets are stored
 | `default_web_search_max_results` | int | `3` | Default `max_results` for the OpenRouter web plugin when the client omits it or sends a value that is not a positive integer. Client values above 10 are capped at 10, and the plugin is always sent with `engine: "exa"` |
 | `web_search_cost_per_result` | float | `0.004` | Fixed cost per web search result ($0.004, OpenRouter Exa: $4/1000) |
 | `price_cache_ttl` | int | `60` | Price cache TTL in seconds. `0` = disabled. Also bounds WaveSpeed's own price cache, which reuses a quote across prompts for image and video models whose price does not depend on the prompt |
-| `max_upload_mb` | int | `300` | Maximum file upload size in MB (all in RAM, no disk on Railway) |
+| `max_upload_mb` | int | `300` | Maximum file upload size in MB (all in RAM, no disk on Railway). Applies to CloudConvert, the only provider that takes multipart; any other provider gets 400 without the body being read. Enforced while the body is read (413), with or without `Content-Length`. Unpaid uploads together may hold about 4 × (`max_upload_mb` + 1 MB) of memory, about 1.2 GB at 300; past that the gateway answers 503 with `Retry-After: 5` |
 | `max_json_mb` | int | `40` | Maximum JSON request body in MB (fits 25 MB of base64 STT audio). Bodies are read before payment, so larger ones, or ones with more than 200,000 JSON objects and arrays, get HTTP 413 |
 | `max_prepaid_topup` | float | `10.0` | Maximum single top-up amount in USD |
 | `min_prepaid_topup` | float | `0.10` | Minimum single top-up amount in USD |
@@ -60,14 +60,14 @@ Each provider is a key under `providers`:
 | `fixed_price_usd` | float | `0.0` | Fixed price per request in USD (when provider has no pricing API) |
 | `description` | string | `""` | Short description shown on the landing page |
 | `poll_interval` | int | `2` | Seconds between async task status polls. WaveSpeed polls sooner at first (0.3 s, growing to this value); CloudConvert waits on its sync API and uses this only when falling back to polling |
-| `poll_timeout` | int | `600` | Max seconds to wait for task completion |
+| `poll_timeout` | int | `600` | Max seconds to wait for task completion, in wall-clock time with one last poll at the deadline. Also the total deadline for a SpicyAPI chat stream |
 | `docs_url` | string | `""` | Link to provider API documentation |
 | `example_request` | dict | `{}` | Example request for the landing page (`{model, body}`) |
 | `example_request_2` | dict | `{}` | Second example request (e.g. video model) |
 | `example_request_3` | dict | `{}` | Third example request (e.g. embeddings) |
 | `example_request_4` | dict | `{}` | Fourth example request (e.g. STT / `audio/transcriptions`) |
 | `models_cache_ttl` | int | `86400` | Seconds to cache the list of models (for providers that fetch it dynamically) |
-| `max_stt_audio_mb` | int | `25` | Max STT audio upload size in MB (OpenRouter only) |
+| `max_stt_audio_mb` | int | `25` | Max size in MB of an STT upload (OpenRouter) and of each `input_audio` part in a chat request (OpenRouter, NanoGPT); larger gets 413 |
 | `jwt_token` | string | `""` | JWT token for cookie-based auth (Tungsten only) |
 | `cf_clearance` | string | `""` | Cloudflare clearance cookie (Tungsten only) |
 

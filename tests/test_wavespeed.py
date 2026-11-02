@@ -13,7 +13,9 @@ import pytest
 from x402gate.core.config import ProviderConfig
 from x402gate.core.proxy import UPSTREAM_CREDENTIALS_DETAIL
 from x402gate.providers.base import ProviderError, outcome_unknown
-from x402gate.providers.wavespeed import WaveSpeedProvider, _parse_catalog
+from x402gate.providers.wavespeed import WaveSpeedProvider, _parse_catalog, _rough_size
+
+CREATED_TASK = {"data": {"id": "t1", "status": "created"}}
 
 
 def _make_provider() -> WaveSpeedProvider:
@@ -57,6 +59,69 @@ class TestGetPrice:
             await _make_provider().get_price("wavespeed-ai/flux-dev", {"prompt": "x"})
         assert caught.value.status_code == 502
         assert caught.value.detail == UPSTREAM_CREDENTIALS_DETAIL
+
+    async def test_multipart_upload_is_refused_before_hashing(self):
+        """WaveSpeed takes JSON; the file bytes never reach the price key."""
+        post = AsyncMock(side_effect=AssertionError("sent"))
+        upload = {"prompt": "x", "_file_bytes": b"\0" * 1024, "_file_name": "a.png"}
+        with (
+            patch("httpx.AsyncClient.post", post),
+            patch("x402gate.providers.wavespeed._price_keys") as keys,
+            pytest.raises(ProviderError) as caught,
+        ):
+            await _make_provider().get_price("wavespeed-ai/flux-dev", upload)
+        assert caught.value.status_code == 400
+        keys.assert_not_called()
+
+    async def test_large_inputs_are_hashed_off_the_event_loop(self):
+        post = AsyncMock(return_value=httpx.Response(200, json={"data": {"unit_price": 0.01}}))
+        to_thread = AsyncMock(side_effect=asyncio.to_thread)
+        provider = _make_provider()
+        p1, p2 = _patched("post", post)
+        with p1, p2, patch("x402gate.providers.wavespeed.asyncio.to_thread", to_thread):
+            await provider.get_price("wavespeed-ai/flux-dev", {"prompt": "x"})
+            assert to_thread.await_count == 0
+            await provider.get_price(
+                "wavespeed-ai/flux-dev", {"prompt": "x", "images": ["a" * 2_000_000]}
+            )
+        assert to_thread.await_count == 1
+
+    @pytest.mark.parametrize(
+        "inputs",
+        [
+            {"prompt": "x", "loras": [{"path": "一" * 2_000_000}]},
+            {"prompt": "x", "extra": {"deep": {"text": "a" * 2_000_000}}},
+            {"prompt": "x", "options": {"k" * 2_000_000: 1}},
+            {"prompt": "x", "grid": [[0] * 1000 for _ in range(1100)]},
+            {"prompt": "x", "size": [10**4000 + i for i in range(300)]},
+        ],
+        ids=["list-of-dicts", "nested-dict", "long-key", "many-small-values", "long-ints"],
+    )
+    async def test_nested_large_inputs_are_hashed_off_the_event_loop(self, inputs):
+        """Text nested below the top level must not be hashed on the event loop."""
+        post = AsyncMock(return_value=httpx.Response(200, json={"data": {"unit_price": 0.01}}))
+        to_thread = AsyncMock(side_effect=asyncio.to_thread)
+        p1, p2 = _patched("post", post)
+        with p1, p2, patch("x402gate.providers.wavespeed.asyncio.to_thread", to_thread):
+            await _make_provider().get_price("wavespeed-ai/flux-dev", inputs)
+        assert to_thread.await_count == 1
+
+    def test_rough_size_counts_nested_text_and_stops_early(self):
+        assert _rough_size({"a": [{"b": "xyz"}]}) >= 3
+        assert _rough_size({"prompt": "x"}) < 10
+        big = {"items": ["a" * 10] * 1_000_000}
+        assert _rough_size(big, limit=100) <= 100 + 10
+
+    def test_rough_size_counts_long_ints_by_their_digits(self):
+        """Turning a 4000-digit int into text is slow, so it counts as long text."""
+        assert _rough_size({"seed": 2**63, "flag": True}) < 100
+        huge = {"size": [10**4000 + i for i in range(300)]}
+        assert _rough_size(huge) > 1024 * 1024
+
+    def test_rough_size_gives_up_on_many_small_values(self):
+        """200 000 tiny dicts are short as text but slow to walk and to hash."""
+        many = {"x": [{"a": "b"} for _ in range(200_000)]}
+        assert _rough_size(many, limit=10**9) > 10**9
 
 
 class TestSubmit:
@@ -126,6 +191,25 @@ class TestSubmit:
             await _make_provider().submit("wavespeed-ai/flux-dev", {"prompt": "x"})
         assert post.call_count == 1
         assert caught.value.status_code == 502
+        assert outcome_unknown(caught.value) is False
+
+    async def test_sync_mode_is_not_forwarded(self):
+        """A sync submit can outlast the read timeout and lose the task id."""
+        post = AsyncMock(return_value=httpx.Response(200, json=CREATED_TASK))
+        p1, p2 = _patched("post", post)
+        with p1, p2:
+            await _make_provider().submit(
+                "wavespeed-ai/flux-dev", {"prompt": "x", "enable_sync_mode": True}
+            )
+        assert post.await_args.kwargs["json"] == {"prompt": "x"}
+
+    async def test_multipart_upload_is_refused(self):
+        post = AsyncMock(side_effect=AssertionError("sent"))
+        with patch("httpx.AsyncClient.post", post), pytest.raises(ProviderError) as caught:
+            await _make_provider().submit(
+                "wavespeed-ai/flux-dev", {"prompt": "x", "_file_bytes": b"img"}
+            )
+        assert caught.value.status_code == 400
         assert outcome_unknown(caught.value) is False
 
 
@@ -374,6 +458,35 @@ class TestPriceCache:
         assert len(bodies) == 5
         assert bodies[-1]["inputs"]["prompt"] == "dog"
 
+    async def test_check_holds_only_for_the_text_fields_it_ran_with(self):
+        """A check probed on the prompt alone says nothing of a negative prompt."""
+
+        async def quote(url, json, **kwargs):
+            return _quote(0.05 if len(json["inputs"].get("negative_prompt", "")) > 1000 else 0.01)
+
+        post = AsyncMock(side_effect=quote)
+        provider = _provider_with_types({FLUX: "text-to-image"})
+        p1, p2 = _patched("post", post)
+        with p1, p2:
+            await provider.get_price(FLUX, {"prompt": "cat", "size": "512*512"})
+            await _probes_done(provider)
+            long_negative = {"prompt": "dog", "negative_prompt": "x" * 2000, "size": "512*512"}
+            price = await provider.get_price(FLUX, long_negative)
+        assert price == Decimal("0.05")
+        # Quoted again rather than served from the prompt-only check
+        assert _pricing_bodies(post)[2]["inputs"]["negative_prompt"] == "x" * 2000
+
+    async def test_request_without_text_does_not_share_the_text_free_quote(self):
+        post = AsyncMock(side_effect=[_quote(0.01), _quote(0.01), _quote(0.02)])
+        provider = _provider_with_types({FLUX: "text-to-image"})
+        p1, p2 = _patched("post", post)
+        with p1, p2:
+            await provider.get_price(FLUX, {"prompt": "cat", "size": "512*512"})
+            await _probes_done(provider)
+            price = await provider.get_price(FLUX, {"size": "512*512"})
+        assert price == Decimal("0.02")
+        assert post.call_count == 3
+
     async def test_quote_does_not_wait_for_the_probe(self):
         hang = asyncio.Event()
 
@@ -524,7 +637,7 @@ class TestFinishedAtSubmit:
         get = AsyncMock(side_effect=AssertionError("polled"))
         provider = _make_provider()
         with patch("httpx.AsyncClient.post", post), patch("httpx.AsyncClient.get", get):
-            await provider.submit(FLUX, {"prompt": "x", "enable_sync_mode": True})
+            await provider.submit(FLUX, {"prompt": "x"})
             result = await provider.get_result("t1")
         assert result == done
         assert get.call_count == 0

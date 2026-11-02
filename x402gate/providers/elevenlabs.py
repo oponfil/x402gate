@@ -19,7 +19,14 @@ import httpx
 from x402gate.core import http
 from x402gate.core.config import ProviderConfig
 from x402gate.core.http import shared_client
-from x402gate.providers.base import BaseProvider, ProviderError, require_text
+from x402gate.core.proxy import UPSTREAM_CREDENTIALS_DETAIL, rejected_credentials
+from x402gate.providers.base import (
+    BaseProvider,
+    ProviderError,
+    optional_str,
+    raise_for_gateway_timeout,
+    require_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +90,7 @@ class ElevenLabsProvider(BaseProvider):
         text = require_text(inputs, self.name)
         char_count = len(text)
 
-        model_id = inputs.get("model_id", "")
+        model_id = optional_str(inputs, "model_id", self.name)
         # Default to expensive standard rate; turbo rate only if "turbo"/"flash" in model name
         rate = self._price_turbo if _is_turbo_model(model_id) else self._price_standard
 
@@ -123,7 +130,7 @@ class ElevenLabsProvider(BaseProvider):
         # voice_id comes from the URL path; checked again in case submit()
         # is reached without get_price().
         voice_id = _require_voice_id(path, self.name)
-        model_id = body.get("model_id", "")
+        model_id = optional_str(body, "model_id", self.name)
         output_format = body.get("output_format", "mp3_44100_128")
 
         api_url = f"{self._config.base_url.rstrip('/')}/v1/text-to-speech/{voice_id}"
@@ -164,14 +171,20 @@ class ElevenLabsProvider(BaseProvider):
                 detail=f"Failed to call ElevenLabs: {e}",
             ) from e
 
-        if resp.status_code >= 400:
-            # Remap provider auth/payment errors to 502 to avoid collision
-            # with x402's 402 Payment Required
-            status = 502 if resp.status_code in (401, 402, 403) else resp.status_code
+        # Auth/payment errors become a 502 with a fixed text: a 402 would read
+        # as x402's Payment Required, and the body shows our account state.
+        if rejected_credentials(resp.status_code):
+            logger.error("ElevenLabs rejected our key (%d): %s", resp.status_code, resp.text[:300])
+            raise ProviderError(provider=self.name, detail=UPSTREAM_CREDENTIALS_DETAIL)
+
+        raise_for_gateway_timeout(resp.status_code, self.name, "ElevenLabs")
+
+        # httpx does not follow redirects, so a 3xx never reached the API.
+        if not 200 <= resp.status_code < 300:
             raise ProviderError(
                 provider=self.name,
                 detail=f"ElevenLabs error ({resp.status_code}): {resp.text[:500]}",
-                status_code=status,
+                status_code=resp.status_code if resp.status_code >= 400 else 502,
             )
 
         audio_b64 = base64.b64encode(resp.content).decode("ascii")

@@ -18,7 +18,18 @@ import httpx
 from x402gate.core import http
 from x402gate.core.config import ProviderConfig
 from x402gate.core.http import shared_client
-from x402gate.providers.base import BaseProvider, ProviderError, require_text
+from x402gate.core.proxy import (
+    UPSTREAM_CREDENTIALS_DETAIL,
+    UpstreamMayHaveRun,
+    rejected_credentials,
+)
+from x402gate.providers.base import (
+    BaseProvider,
+    ProviderError,
+    optional_str,
+    raise_for_gateway_timeout,
+    require_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +39,47 @@ _DEFAULT_PRICE_PER_1K_TURBO = Decimal("0.06")
 _DEFAULT_PRICE_PER_1K_HD = Decimal("0.10")
 
 _ONE_THOUSAND = Decimal("1000")
+
+# base_resp codes for our own key or balance, sent with HTTP 200:
+# 1004 authentication failed, 1008 insufficient balance, 2049 invalid API key.
+_CREDENTIALS_CODES = frozenset({1004, 1008, 2049})
+
+_MIME_BY_FORMAT = {
+    "mp3": "audio/mpeg",
+    "wav": "audio/wav",
+    "flac": "audio/flac",
+    "pcm": "audio/pcm",
+    "ogg": "audio/ogg",
+}
+
+
+def _check_audio_setting(inputs: dict[str, Any], provider_name: str) -> None:
+    """Reject an ``audio_setting`` the response could not be built from.
+
+    Checked in get_price(), before payment: submit() reads
+    ``audio_setting.format`` only after MiniMax made and billed the audio.
+    A null ``audio_setting`` or ``format`` is dropped like a missing one.
+
+    Raises:
+        ProviderError: 400 for a non-object ``audio_setting`` or a
+            non-string ``format``.
+    """
+    audio_setting = inputs.get("audio_setting")
+    if audio_setting is None:
+        return
+    if not isinstance(audio_setting, dict):
+        raise ProviderError(
+            provider=provider_name,
+            detail="'audio_setting' must be an object",
+            status_code=400,
+        )
+    fmt = audio_setting.get("format")
+    if fmt is not None and not isinstance(fmt, str):
+        raise ProviderError(
+            provider=provider_name,
+            detail="'audio_setting.format' must be a string",
+            status_code=400,
+        )
 
 
 def _rate_for_model(
@@ -71,10 +123,11 @@ class MinimaxProvider(BaseProvider):
             Base price in USD.
         """
         text = require_text(inputs, self.name)
+        _check_audio_setting(inputs, self.name)
         char_count = len(text)
 
         # model from body, or from URL path (e.g. "speech-2.8-hd") — never empty
-        model = inputs.get("model", model_path)
+        model = optional_str(inputs, "model", self.name) or model_path
         rate = _rate_for_model(model, self._price_turbo, self._price_hd)
         price = Decimal(char_count) / _ONE_THOUSAND * rate
 
@@ -109,7 +162,9 @@ class MinimaxProvider(BaseProvider):
         """
         text = require_text(body, self.name)
 
-        model = body.get("model", path)
+        model = optional_str(body, "model", self.name) or path
+        _check_audio_setting(body, self.name)
+        audio_setting = body.get("audio_setting")
         voice_setting = body.get("voice_setting", {})
         timber_weights = body.get("timber_weights", [])
 
@@ -129,8 +184,14 @@ class MinimaxProvider(BaseProvider):
         if timber_weights:
             payload["timber_weights"] = timber_weights
 
+        if audio_setting is not None:
+            # A null format is left out so MiniMax applies its own mp3
+            # default, which the audio/mpeg content_type below assumes.
+            payload["audio_setting"] = {
+                k: v for k, v in audio_setting.items() if not (k == "format" and v is None)
+            }
         # Forward any extra params the client sends
-        for key in ("audio_setting", "language_boost", "pronunciation_dict"):
+        for key in ("language_boost", "pronunciation_dict"):
             if key in body:
                 payload[key] = body[key]
 
@@ -153,38 +214,74 @@ class MinimaxProvider(BaseProvider):
                 detail=f"Failed to call MiniMax: {e}",
             ) from e
 
-        if resp.status_code >= 400:
-            status = 502 if resp.status_code in (401, 402, 403) else resp.status_code
+        if rejected_credentials(resp.status_code):
+            logger.error("MiniMax rejected our key (%d): %s", resp.status_code, resp.text[:300])
+            raise ProviderError(provider=self.name, detail=UPSTREAM_CREDENTIALS_DETAIL)
+
+        raise_for_gateway_timeout(resp.status_code, self.name, "MiniMax")
+
+        # httpx does not follow redirects, so a 3xx never reached the API.
+        if not 200 <= resp.status_code < 300:
             raise ProviderError(
                 provider=self.name,
                 detail=f"MiniMax error ({resp.status_code}): {resp.text[:500]}",
-                status_code=status,
+                status_code=resp.status_code if resp.status_code >= 400 else 502,
             )
 
-        result = resp.json()
+        try:
+            result = resp.json()
+        except ValueError:
+            result = None
+        if not isinstance(result, dict):
+            # A 2xx may have made and billed the audio: the payment is kept.
+            raise ProviderError(
+                provider=self.name,
+                detail=f"MiniMax returned an unreadable response: {resp.text[:300]}",
+            ) from UpstreamMayHaveRun("MiniMax answered 2xx")
 
         # MiniMax T2A V2 returns {"data": {"audio": "<hex-encoded audio>"}}
-        # or {"base_resp": {"status_code": 0}, "data": {"audio": "..."}}
-        base_resp = result.get("base_resp", {})
-        if base_resp.get("status_code", 0) != 0:
+        # or {"base_resp": {"status_code": 0}, "data": {"audio": "..."}}.
+        # A null or non-object part counts as missing rather than crashing.
+        base_resp = result.get("base_resp")
+        if not isinstance(base_resp, dict):
+            base_resp = {}
+        status_code = base_resp.get("status_code", 0)
+        if status_code in _CREDENTIALS_CODES:
+            # No audio was made, so this is refunded; the message stays private.
+            logger.error(
+                "MiniMax rejected our key (base_resp %s): %s",
+                status_code,
+                base_resp.get("status_msg"),
+            )
+            raise ProviderError(provider=self.name, detail=UPSTREAM_CREDENTIALS_DETAIL)
+        if status_code != 0:
             raise ProviderError(
                 provider=self.name,
                 detail=f"MiniMax API error: {base_resp.get('status_msg', 'unknown')}",
             )
 
-        audio_hex = result.get("data", {}).get("audio", "")
-        if not audio_hex:
+        data = result.get("data")
+        audio_hex = data.get("audio") if isinstance(data, dict) else None
+        if not isinstance(audio_hex, str) or not audio_hex:
+            # MiniMax answered 2xx without reporting an error: the audio may be billed.
             raise ProviderError(
                 provider=self.name,
                 detail="MiniMax returned no audio data",
-            )
+            ) from UpstreamMayHaveRun("MiniMax answered 2xx")
 
         # MiniMax returns hex-encoded audio; convert to base64 for consistency
         try:
             audio_bytes = bytes.fromhex(audio_hex)
         except ValueError:
-            # Might already be base64 in newer API versions
-            audio_bytes = base64.b64decode(audio_hex)
+            # Might already be base64 in newer API versions. validate=True stops
+            # b64decode from dropping junk characters and serving the rest.
+            try:
+                audio_bytes = base64.b64decode(audio_hex, validate=True)
+            except ValueError:  # binascii.Error subclasses ValueError
+                raise ProviderError(
+                    provider=self.name,
+                    detail="MiniMax returned audio that could not be decoded",
+                ) from UpstreamMayHaveRun("MiniMax answered 2xx")
 
         audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
 
@@ -196,15 +293,8 @@ class MinimaxProvider(BaseProvider):
         )
 
         # Derive content_type from audio_setting.format (default: mp3)
-        audio_fmt = body.get("audio_setting", {}).get("format", "mp3")
-        mime_map = {
-            "mp3": "audio/mpeg",
-            "wav": "audio/wav",
-            "flac": "audio/flac",
-            "pcm": "audio/pcm",
-            "ogg": "audio/ogg",
-        }
-        content_type = mime_map.get(audio_fmt, "audio/mpeg")
+        audio_fmt = (audio_setting or {}).get("format") or "mp3"
+        content_type = _MIME_BY_FORMAT.get(audio_fmt, "audio/mpeg")
 
         output: dict[str, Any] = {
             "audio_base64": audio_b64,

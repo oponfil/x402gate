@@ -124,7 +124,7 @@ curl -X POST https://x402gate.io/v1/socialdownload/download \
 
 - This is a **synchronous** provider — the response is returned immediately (no polling).
 - A request without a non-empty string `url` gets HTTP 400 before any payment.
-- RapidAPI bills every call it answers with 2xx. A 200 that carries an error (an unsupported or private URL) or an unreadable body is charged, and the error comes back with `"outcome_unknown": true`. RapidAPI 3xx/4xx/5xx answers and connections that never opened are refunded. A 3xx, or a 401/402/403 (the gateway's RapidAPI key rejected or out of credit), reaches the client as 502.
+- RapidAPI bills every call it answers with 2xx. A 200 that carries an error (an unsupported or private URL) or an unreadable body is charged, and the error comes back with `"outcome_unknown": true`. RapidAPI 3xx/4xx/5xx answers and connections that never opened are refunded, except a 504, 520 or 524 (a gateway timeout in front of RapidAPI): that outcome is unknown, so the payment is kept and the client gets 504. A 3xx, or a 401/402/403 (the gateway's RapidAPI key rejected or out of credit), reaches the client as 502.
 - The gateway returns **direct download URLs** — the client downloads the media file itself.
 - Download URLs are temporary and may expire. Download promptly after receiving the response.
 - The provider does not validate URL domains — any URL is forwarded to RapidAPI, which decides whether it's supported.

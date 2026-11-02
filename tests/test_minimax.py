@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -11,6 +12,7 @@ import respx
 
 from x402gate.core import http
 from x402gate.core.config import ProviderConfig
+from x402gate.core.proxy import UPSTREAM_CREDENTIALS_DETAIL
 from x402gate.providers.base import ProviderError, outcome_unknown
 from x402gate.providers.minimax import MinimaxProvider, _rate_for_model
 
@@ -331,3 +333,261 @@ class TestPooledClient:
         with pytest.raises(ProviderError) as caught:
             await provider.submit("speech-02-hd", {"text": "Hello"})
         assert outcome_unknown(caught.value) is False
+
+
+class TestUpstreamStatus:
+    """How MiniMax's error statuses are billed and shown to the client."""
+
+    @respx.mock
+    @pytest.mark.parametrize("status", [401, 402, 403])
+    async def test_rejected_key_hides_the_body(self, pooled, status):
+        """Our account state stays private, and a 402 is not an x402 request."""
+        respx.post(_TTS_URL).mock(
+            return_value=httpx.Response(status, text="insufficient balance: 0.40")
+        )
+        with pytest.raises(ProviderError) as caught:
+            await _make_provider().submit("speech-02-hd", {"text": "Hello"})
+        assert caught.value.status_code == 502
+        assert caught.value.detail == UPSTREAM_CREDENTIALS_DETAIL
+        assert outcome_unknown(caught.value) is False
+
+    @respx.mock
+    @pytest.mark.parametrize("status", [504, 520, 524])
+    async def test_gateway_timeout_keeps_the_payment(self, pooled, status):
+        """A proxy gave up after forwarding: the audio may be made and billed."""
+        respx.post(_TTS_URL).mock(return_value=httpx.Response(status, text="timeout"))
+        with pytest.raises(ProviderError) as caught:
+            await _make_provider().submit("speech-02-hd", {"text": "Hello"})
+        assert caught.value.status_code == 504
+        assert outcome_unknown(caught.value) is True
+
+    @respx.mock
+    @pytest.mark.parametrize("status", [400, 500, 503])
+    async def test_reported_error_is_refunded(self, pooled, status):
+        respx.post(_TTS_URL).mock(return_value=httpx.Response(status, text="bad"))
+        with pytest.raises(ProviderError) as caught:
+            await _make_provider().submit("speech-02-hd", {"text": "Hello"})
+        assert caught.value.status_code == status
+        assert outcome_unknown(caught.value) is False
+
+    @respx.mock
+    @pytest.mark.parametrize("content", [b"not json", b"[1, 2]", b"null"])
+    async def test_unreadable_200_keeps_the_payment(self, pooled, content):
+        respx.post(_TTS_URL).mock(return_value=httpx.Response(200, content=content))
+        with pytest.raises(ProviderError) as caught:
+            await _make_provider().submit("speech-02-hd", {"text": "Hello"})
+        assert "unreadable response" in caught.value.detail
+        assert outcome_unknown(caught.value) is True
+
+    @respx.mock
+    @pytest.mark.parametrize(
+        ("code", "msg"),
+        [
+            (1004, "login fail: Please carry the API secret key"),
+            (1008, "insufficient balance"),
+            (2049, "invalid api key"),
+        ],
+    )
+    async def test_rejected_key_in_base_resp_hides_the_message(self, pooled, code, msg):
+        """MiniMax reports a bad key or low balance as HTTP 200 with base_resp."""
+        respx.post(_TTS_URL).mock(
+            return_value=httpx.Response(
+                200, json={"base_resp": {"status_code": code, "status_msg": msg}}
+            )
+        )
+        with pytest.raises(ProviderError) as caught:
+            await _make_provider().submit("speech-02-hd", {"text": "Hello"})
+        assert caught.value.status_code == 502
+        assert caught.value.detail == UPSTREAM_CREDENTIALS_DETAIL
+        assert msg not in caught.value.detail
+        assert outcome_unknown(caught.value) is False
+
+    @respx.mock
+    async def test_content_error_in_base_resp_keeps_the_message(self, pooled):
+        """An error the client caused still tells the client what was wrong."""
+        respx.post(_TTS_URL).mock(
+            return_value=httpx.Response(
+                200, json={"base_resp": {"status_code": 1026, "status_msg": "sensitive input"}}
+            )
+        )
+        with pytest.raises(ProviderError) as caught:
+            await _make_provider().submit("speech-02-hd", {"text": "Hello"})
+        assert caught.value.detail == "MiniMax API error: sensitive input"
+        assert outcome_unknown(caught.value) is False
+
+    @respx.mock
+    async def test_null_parts_do_not_crash(self, pooled):
+        """A null base_resp or data is read as missing, not an AttributeError."""
+        respx.post(_TTS_URL).mock(
+            return_value=httpx.Response(200, json={"base_resp": None, "data": None})
+        )
+        with pytest.raises(ProviderError, match="no audio data") as caught:
+            await _make_provider().submit("speech-02-hd", {"text": "Hello"})
+        # No error was reported on a 2xx, so the audio may be billed.
+        assert outcome_unknown(caught.value) is True
+
+    @respx.mock
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {"base_resp": {"status_code": 0}, "data": None, "extra_info": {"usage_characters": 5}},
+            {"base_resp": {"status_code": 0}, "data": {"audio": ""}},
+            {"base_resp": {"status_code": 0}, "data": {}},
+            {"data": {}},
+            {},
+        ],
+    )
+    async def test_success_without_audio_keeps_the_payment(self, pooled, body):
+        """A 2xx that reports success but sends no audio may still be billed."""
+        respx.post(_TTS_URL).mock(return_value=httpx.Response(200, json=body))
+        with pytest.raises(ProviderError) as caught:
+            await _make_provider().submit("speech-02-hd", {"text": "Hello"})
+        assert caught.value.detail == "MiniMax returned no audio data"
+        assert outcome_unknown(caught.value) is True
+
+    @respx.mock
+    @pytest.mark.parametrize("audio", [5, {"x": 1}, ["ff"], True, None])
+    async def test_non_string_audio_keeps_the_payment(self, pooled, audio):
+        """A non-string audio field is a ProviderError, not a TypeError crash."""
+        respx.post(_TTS_URL).mock(
+            return_value=httpx.Response(
+                200, json={"base_resp": {"status_code": 0}, "data": {"audio": audio}}
+            )
+        )
+        with pytest.raises(ProviderError) as caught:
+            await _make_provider().submit("speech-02-hd", {"text": "Hello"})
+        assert caught.value.detail == "MiniMax returned no audio data"
+        assert outcome_unknown(caught.value) is True
+
+    @respx.mock
+    @pytest.mark.parametrize("audio", ["zz!!", "not base64 at all", "QUJD@@"])
+    async def test_undecodable_audio_keeps_the_payment(self, pooled, audio):
+        """Junk is neither hex nor strict base64, so it is not served as audio."""
+        respx.post(_TTS_URL).mock(
+            return_value=httpx.Response(
+                200, json={"base_resp": {"status_code": 0}, "data": {"audio": audio}}
+            )
+        )
+        with pytest.raises(ProviderError) as caught:
+            await _make_provider().submit("speech-02-hd", {"text": "Hello"})
+        assert caught.value.detail == "MiniMax returned audio that could not be decoded"
+        assert outcome_unknown(caught.value) is True
+
+    @respx.mock
+    async def test_base64_audio_is_still_accepted(self, pooled):
+        """Audio sent as valid base64 instead of hex is still decoded."""
+        respx.post(_TTS_URL).mock(
+            return_value=httpx.Response(
+                200, json={"base_resp": {"status_code": 0}, "data": {"audio": "SUQzBA=="}}
+            )
+        )
+        result = await _make_provider().submit("speech-02-hd", {"text": "Hello"})
+        assert result["audio_base64"] == "SUQzBA=="
+
+    @respx.mock
+    async def test_reported_error_without_audio_is_refunded(self, pooled):
+        """A nonzero base_resp code is a failure MiniMax reported, even with data null."""
+        respx.post(_TTS_URL).mock(
+            return_value=httpx.Response(
+                200,
+                json={"base_resp": {"status_code": 2013, "status_msg": "bad voice"}, "data": None},
+            )
+        )
+        with pytest.raises(ProviderError) as caught:
+            await _make_provider().submit("speech-02-hd", {"text": "Hello"})
+        assert caught.value.detail == "MiniMax API error: bad voice"
+        assert outcome_unknown(caught.value) is False
+
+    @respx.mock
+    async def test_redirect_is_refunded(self, pooled):
+        """httpx does not follow redirects, so a 3xx never reached the API."""
+        respx.post(_TTS_URL).mock(return_value=httpx.Response(307, text=""))
+        with pytest.raises(ProviderError) as caught:
+            await _make_provider().submit("speech-02-hd", {"text": "Hello"})
+        assert caught.value.status_code == 502
+        assert outcome_unknown(caught.value) is False
+
+
+class TestInputTypes:
+    """Wrong types are a 400 before payment, not a 500 or a crash after billing."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("text", [["hi"], 5, "   "])
+    async def test_bad_text_is_rejected(self, text):
+        with pytest.raises(ProviderError) as caught:
+            await _make_provider().get_price("speech-02-hd", {"text": text})
+        assert caught.value.status_code == 400
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("model", [5, ["speech-02-turbo"]])
+    async def test_non_string_model_is_rejected(self, model):
+        with pytest.raises(ProviderError) as caught:
+            await _make_provider().get_price("speech-02-hd", {"text": "hi", "model": model})
+        assert caught.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_null_model_uses_the_path(self):
+        provider = _make_provider()
+        price = await provider.get_price("speech-02-turbo", {"text": "a" * 1000, "model": None})
+        assert price == Decimal("0.06")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "audio_setting", ["mp3", 5, ["mp3"], {"format": ["mp3"]}, {"format": 123}, {"format": {}}]
+    )
+    async def test_bad_audio_setting_is_rejected(self, audio_setting):
+        with pytest.raises(ProviderError) as caught:
+            await _make_provider().get_price(
+                "speech-02-hd", {"text": "hi", "audio_setting": audio_setting}
+            )
+        assert caught.value.status_code == 400
+        assert "audio_setting" in caught.value.detail
+
+    @respx.mock
+    async def test_null_audio_setting_is_dropped(self, pooled):
+        """Priced, sent without audio_setting, and answered as mp3."""
+        route = respx.post(_TTS_URL).mock(
+            return_value=httpx.Response(
+                200, json={"base_resp": {"status_code": 0}, "data": {"audio": "ff00"}}
+            )
+        )
+        body = {"text": "hi", "audio_setting": None}
+        await _make_provider().get_price("speech-02-hd", body)
+        result = await _make_provider().submit("speech-02-hd", body)
+        assert result["content_type"] == "audio/mpeg"
+        assert b"audio_setting" not in route.calls.last.request.content
+
+    @respx.mock
+    async def test_audio_setting_format_sets_the_content_type(self, pooled):
+        route = respx.post(_TTS_URL).mock(
+            return_value=httpx.Response(
+                200, json={"base_resp": {"status_code": 0}, "data": {"audio": "ff00"}}
+            )
+        )
+        body = {"text": "hi", "audio_setting": {"format": "wav"}}
+        result = await _make_provider().submit("speech-02-hd", body)
+        assert result["content_type"] == "audio/wav"
+        assert b'"format":"wav"' in route.calls.last.request.content.replace(b" ", b"")
+
+    @pytest.mark.asyncio
+    async def test_null_format_is_priced_normally(self):
+        """A null format counts as missing, like a null audio_setting."""
+        price = await _make_provider().get_price(
+            "speech-02-hd", {"text": "a" * 1000, "audio_setting": {"format": None}}
+        )
+        assert price == Decimal("0.10")
+
+    @respx.mock
+    async def test_null_format_is_left_out_and_answered_as_mp3(self, pooled):
+        """MiniMax applies its own mp3 default, so audio/mpeg is right."""
+        route = respx.post(_TTS_URL).mock(
+            return_value=httpx.Response(
+                200, json={"base_resp": {"status_code": 0}, "data": {"audio": "ff00"}}
+            )
+        )
+        body = {"text": "hi", "audio_setting": {"format": None, "sample_rate": 32000}}
+        result = await _make_provider().submit("speech-02-hd", body)
+        assert result["content_type"] == "audio/mpeg"
+        sent = json.loads(route.calls.last.request.content)
+        assert sent["audio_setting"] == {"sample_rate": 32000}
+        assert body["audio_setting"] == {"format": None, "sample_rate": 32000}

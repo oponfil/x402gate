@@ -26,7 +26,7 @@ One card per registered provider + a `topup` system card. Each card shows:
 | **Revenue** | Total revenue (USD) |
 | **Profit** | Revenue − Cost − Gas |
 
-If a provider's last request was an error, the card shows the error message in a red banner.
+If a provider's last request was an error, the card shows the error message in a red banner. Pricing errors before payment count only when they are 500 or above, shown as `Pricing failed: HTTP <code>`; a client error such as a 400 from validation does not turn the card red.
 
 ### Summary Bar
 
@@ -71,6 +71,8 @@ Each card shows metrics scoped to that provider:
 | **Gas** | Blockchain settlement gas | 0 (no settlement) |
 | **Profit** | Revenue − Cost − Gas ≈ commission − gas | 0 |
 
+A Base payment whose settlement outcome was unknown is counted when the reconciler sees the transfer land: its real gas in USD and the network stats at once, plus Revenue and Cost on the provider card if the job succeeded or its outcome was unknown. A known failure is credited to prepaid instead.
+
 #### Topup Card
 
 | Metric | Value |
@@ -86,7 +88,7 @@ The summary bar shows **de-duplicated** financial totals to avoid double-countin
 
 | Metric | Formula | What it means |
 |---|---|---|
-| **Revenue** | Sum of card revenues **minus** prepaid usage | Real money received (topup payments + x402 direct payments) |
+| **Revenue** | Sum of card revenues **minus** prepaid usage, **plus** settled x402 payments refunded to prepaid | Real money received (topup payments + x402 direct payments, including those later credited back) |
 | **Cost** | Sum of card costs **minus** topup net_credit | Real money paid to providers |
 | **Gas** | Sum of gas across all providers | Blockchain fees |
 | **Profit** | Revenue − Cost − Gas | Current actual profit |

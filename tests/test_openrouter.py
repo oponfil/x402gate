@@ -1,6 +1,7 @@
 """Unit tests for OpenRouter provider."""
 
 import asyncio
+import base64
 import json
 import threading
 from decimal import Decimal
@@ -1533,12 +1534,19 @@ class TestInputTokenEstimate:
         body = {"model": "m", "messages": [{"role": "user", "content": "Hi"}], "tools": tools}
         assert estimate_chat_input_tokens(body, "openrouter") >= 1500
 
-    def test_inline_audio_keeps_the_plain_size_rule(self):
-        """Base64 audio is not tokenized text; its digits are not weighed as digits."""
+    def test_inline_audio_data_is_not_weighed_as_text(self):
+        """Base64 audio is priced by its duration; the rest of the part is text."""
         part = {"type": "input_audio", "input_audio": {"data": "QUJD0123" * 100, "format": "wav"}}
         body = {"model": "m", "messages": [{"role": "user", "content": [part]}]}
-        serialized = json.dumps(part, separators=(",", ":"))
-        assert estimate_chat_input_tokens(body, "openrouter") == _chat_tokens(len(serialized))
+        text = '{"type":"input_audio"}' + '{"format":"wav"}'
+        assert estimate_chat_input_tokens(body, "openrouter") == _ascii_tokens(text)
+
+    def test_text_beside_inline_audio_is_weighed(self):
+        """Extra keys in an audio part cannot carry an unpriced prompt."""
+        audio = {"data": "QUJD", "format": "wav", "note": "y" * 2700}
+        part = {"type": "input_audio", "input_audio": audio, "extra": "z" * 2700}
+        body = {"model": "m", "messages": [{"role": "user", "content": [part]}]}
+        assert estimate_chat_input_tokens(body, "openrouter") >= 2000
 
     def test_lone_surrogate_does_not_raise(self):
         assert self._tokens("a\ud800b") >= 1
@@ -1921,3 +1929,1247 @@ class TestRequestWeighing:
         assert price == Decimal(2) * Decimal("0.0003")
         assert len(threads) == 1
         assert threads[0] is not threading.main_thread()
+
+
+_STT_BODY = {"model": "openai/whisper-1", "input_audio": {"data": "", "format": "wav"}}
+
+
+class TestSttPricingSlots:
+    """Unpaid STT pricing decodes and parses audio in at most two threads at once."""
+
+    @pytest.fixture
+    def stt_body(self):
+        return {**_STT_BODY, "input_audio": {"data": make_wav_b64(1.0), "format": "wav"}}
+
+    async def _price(self, provider, body, catalog):
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = catalog
+            return await provider.get_price("audio/transcriptions", body)
+
+    async def test_base64_decode_runs_in_a_worker_thread_holding_a_slot(
+        self, provider, stt_body, transcription_model_info_response
+    ):
+        seen = []
+        real_extract = openrouter._extract_stt_audio
+
+        def recording_extract(*args, **kwargs):
+            free = openrouter._stt_slots._value
+            seen.append((threading.current_thread(), free))
+            return real_extract(*args, **kwargs)
+
+        with patch.object(openrouter, "_extract_stt_audio", recording_extract):
+            price = await self._price(provider, stt_body, transcription_model_info_response)
+
+        assert price == Decimal("0.0001")
+        [(thread, free)] = seen
+        assert thread is not threading.main_thread()
+        assert free == openrouter._STT_PRICING_SLOTS - 1
+        assert openrouter._stt_slots._value == openrouter._STT_PRICING_SLOTS
+
+    async def test_busy_slots_refuse_with_429(
+        self, provider, stt_body, transcription_model_info_response
+    ):
+        slots = openrouter._stt_pricing_slots()
+        for _ in range(openrouter._STT_PRICING_SLOTS):
+            await slots.acquire()
+        try:
+            with (
+                patch.object(openrouter, "_STT_PRICING_WAIT_S", 0.01),
+                patch.object(provider, "_stt_billing_seconds") as measure,
+                pytest.raises(ProviderError, match="retry shortly") as exc,
+            ):
+                await self._price(provider, stt_body, transcription_model_info_response)
+        finally:
+            for _ in range(openrouter._STT_PRICING_SLOTS):
+                slots.release()
+        # Unpaid clients can fill the slots: not a provider failure (5xx).
+        assert exc.value.status_code == 429
+        measure.assert_not_called()
+
+    async def test_waiter_gets_a_slot_when_one_frees(
+        self, provider, stt_body, transcription_model_info_response
+    ):
+        slots = openrouter._stt_pricing_slots()
+        for _ in range(openrouter._STT_PRICING_SLOTS):
+            await slots.acquire()
+        pricing = asyncio.create_task(
+            self._price(provider, stt_body, transcription_model_info_response)
+        )
+        await asyncio.sleep(0.05)
+        assert not pricing.done()
+        slots.release()
+        assert await pricing == Decimal("0.0001")
+        slots.release()
+        assert slots._value == openrouter._STT_PRICING_SLOTS
+
+    async def test_slot_held_until_the_thread_ends_after_cancel(
+        self, provider, stt_body, transcription_model_info_response
+    ):
+        entered, release = threading.Event(), threading.Event()
+
+        def slow_measure(inputs):
+            entered.set()
+            release.wait(5)
+            return 1
+
+        with patch.object(provider, "_stt_billing_seconds", slow_measure):
+            pricing = asyncio.create_task(
+                self._price(provider, stt_body, transcription_model_info_response)
+            )
+            await asyncio.to_thread(entered.wait, 5)
+            pricing.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pricing
+            slots = openrouter._stt_pricing_slots()
+            # The thread still runs, so its slot is still taken.
+            assert slots._value == openrouter._STT_PRICING_SLOTS - 1
+            release.set()
+            for _ in range(100):
+                if slots._value == openrouter._STT_PRICING_SLOTS:
+                    break
+                await asyncio.sleep(0.01)
+        assert slots._value == openrouter._STT_PRICING_SLOTS
+
+    async def test_failed_measure_releases_its_slot(
+        self, provider, transcription_model_info_response
+    ):
+        body = {**_STT_BODY, "input_audio": {"data": "not base64!", "format": "wav"}}
+        for _ in range(openrouter._STT_PRICING_SLOTS + 1):
+            with pytest.raises(ProviderError, match="Invalid base64") as exc:
+                await self._price(provider, body, transcription_model_info_response)
+            assert exc.value.status_code == 400
+        assert openrouter._stt_pricing_slots()._value == openrouter._STT_PRICING_SLOTS
+
+    async def test_one_semaphore_per_event_loop(self):
+        slots = openrouter._stt_pricing_slots()
+        assert openrouter._stt_pricing_slots() is slots
+        # A semaphore from another loop is never reused: it binds to the
+        # loop that first waited on it.
+        with patch.multiple(openrouter, _stt_slots=slots, _stt_slots_loop=object()):
+            assert openrouter._stt_pricing_slots() is not slots
+
+
+def _claude_catalog(**pricing: str) -> httpx.Response:
+    base = {"prompt": "0.000003", "completion": "0.000015", "input_cache_write": "0.00000375"}
+    return _catalog({"id": "anthropic/claude", "pricing": {**base, **pricing}})
+
+
+def _cached_body(ttl: str | None) -> dict:
+    control = {"type": "ephemeral"} if ttl is None else {"type": "ephemeral", "ttl": ttl}
+    content = [{"type": "text", "text": "x" * 2700, "cache_control": control}]
+    return {"model": "anthropic/claude", "messages": [{"role": "user", "content": content}]}
+
+
+class TestNativeSearchAndReasoning:
+    """Per-search and reasoning rates of the catalog are part of the quote."""
+
+    SEARCH_MODEL = {
+        "id": "perplexity/sonar-pro",
+        "pricing": {
+            "prompt": "0.000002",
+            "completion": "0.000008",
+            "web_search": "0.005",
+            "internal_reasoning": "0.00001",
+        },
+    }
+
+    @pytest.mark.asyncio
+    async def test_searches_and_reasoning_rate_are_priced(self, provider):
+        body = _chat_body(model="perplexity/sonar-pro")
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = _catalog(self.SEARCH_MODEL)
+            price = await provider.get_price("chat/completions", body)
+        searches = openrouter._NATIVE_SEARCHES * Decimal("0.005")
+        assert price == Decimal("0.000002") + Decimal(1024) * Decimal("0.00001") + searches
+
+    @pytest.mark.asyncio
+    async def test_each_completion_gets_its_searches(self, provider):
+        body = _chat_body(model="perplexity/sonar-pro", n=2)
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = _catalog(self.SEARCH_MODEL)
+            price = await provider.get_price("chat/completions", body)
+        searches = 2 * openrouter._NATIVE_SEARCHES * Decimal("0.005")
+        assert price == Decimal("0.000002") + 2 * 1024 * Decimal("0.00001") + searches
+
+    @pytest.mark.asyncio
+    async def test_lower_reasoning_rate_keeps_the_completion_rate(self, provider):
+        model = {"id": "x/thinker", "pricing": {**self.SEARCH_MODEL["pricing"]}}
+        model["pricing"].update(web_search="0", internal_reasoning="0.000001")
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = _catalog(model)
+            price = await provider.get_price("chat/completions", _chat_body(model="x/thinker"))
+        assert price == Decimal("0.000002") + Decimal(1024) * Decimal("0.000008")
+
+    @pytest.mark.asyncio
+    async def test_deep_research_is_refused(self, provider):
+        model = {"id": "perplexity/sonar-deep-research", "pricing": self.SEARCH_MODEL["pricing"]}
+        body = _chat_body(model="perplexity/sonar-deep-research")
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = _catalog(model)
+            with pytest.raises(ProviderError, match="deep research") as caught:
+                await provider.get_price("chat/completions", body)
+        assert caught.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_fallback_cost_bills_reasoning_tokens_at_their_rate(self, provider):
+        body = _chat_body(model="perplexity/sonar-pro")
+        usage = {
+            "prompt_tokens": 10,
+            "completion_tokens": 100,
+            "completion_tokens_details": {"reasoning_tokens": 60},
+            "is_byok": True,
+        }
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = _catalog(self.SEARCH_MODEL)
+            cost = await provider.calculate_actual_cost(body, {"usage": usage})
+        # The native searches get_price reserved are billed with the tokens.
+        assert cost == (
+            Decimal(10) * Decimal("0.000002")
+            + Decimal(40) * Decimal("0.000008")
+            + Decimal(60) * Decimal("0.00001")
+            + openrouter._NATIVE_SEARCHES * Decimal("0.005")
+        )
+
+
+class TestLongCacheTtl:
+    """A 1-hour cache write bills 2x input, above the 5-minute write rate."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("ttl", "rate"),
+        [(None, "0.00000375"), ("5m", "0.00000375"), ("1h", "0.000006"), ("2h", "0.000006")],
+    )
+    async def test_quote_uses_the_ttl_write_rate(self, provider, ttl, rate):
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = _claude_catalog()
+            price = await provider.get_price("chat/completions", _cached_body(ttl))
+        assert price == Decimal(1000) * Decimal(rate) + Decimal(1024) * Decimal("0.000015")
+
+    @pytest.mark.asyncio
+    async def test_fallback_cost_uses_the_ttl_write_rate(self, provider):
+        result = {"usage": {"prompt_tokens": 1000, "completion_tokens": 10, "is_byok": True}}
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = _claude_catalog()
+            cost = await provider.calculate_actual_cost(_cached_body("1h"), result)
+        assert cost == Decimal(1000) * Decimal("0.000006") + Decimal(10) * Decimal("0.000015")
+
+
+class TestLongContextTier:
+    """The catalog's pricing.overrides set the rates of a long prompt."""
+
+    LONG_TEXT = "x" * 810_000  # 300_000 tokens at 2.7 characters per token
+    TIERED = {
+        "id": "openai/gpt-5.5",
+        "pricing": {
+            "prompt": "0.000005",
+            "completion": "0.00003",
+            "web_search": "0.01",
+            "overrides": [
+                {"min_prompt_tokens": 272_000, "prompt": "0.00001", "completion": "0.000045"}
+            ],
+        },
+    }
+
+    @staticmethod
+    def _body(model: str, text: str, **extra) -> dict:
+        return {"model": model, "messages": [{"role": "user", "content": text}], **extra}
+
+    async def _price(self, provider, body: dict, *models: dict) -> Decimal:
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = _catalog(*models)
+            return await provider.get_price("chat/completions", body)
+
+    async def _fallback_cost(self, provider, body: dict, usage: dict, *models: dict):
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = _catalog(*models)
+            return await provider.calculate_actual_cost(body, {"usage": {**usage, "is_byok": True}})
+
+    @pytest.mark.asyncio
+    async def test_long_prompt_uses_the_override_rates(self, provider):
+        body = self._body("openai/gpt-5.5", self.LONG_TEXT)
+        price = await self._price(provider, body, self.TIERED)
+        assert price == Decimal(300_000) * Decimal("0.00001") + Decimal(1024) * Decimal("0.000045")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("text", "tiered"),
+        [
+            ("x" * 734_400, True),  # exactly 272k tokens: min_prompt_tokens is inclusive
+            ("x" * 734_397, False),  # 271_998 tokens
+        ],
+    )
+    async def test_threshold_is_the_minimum_prompt(self, provider, text, tiered):
+        tokens = len(text) * 10 // 27
+        price = await self._price(provider, self._body("openai/gpt-5.5", text), self.TIERED)
+        prompt, completion = ("0.00001", "0.000045") if tiered else ("0.000005", "0.00003")
+        assert price == Decimal(tokens) * Decimal(prompt) + Decimal(1024) * Decimal(completion)
+
+    @pytest.mark.asyncio
+    async def test_tier_below_200k_and_above_2x(self, provider):
+        haiku = {
+            "id": "anthropic/claude-haiku-5.5",
+            "pricing": {
+                "prompt": "0.0000001",
+                "completion": "0.0000005",
+                "overrides": [
+                    {
+                        "min_prompt_tokens": 100_000,
+                        "prompt": "0.0000005",
+                        "completion": "0.0000025",
+                    }
+                ],
+            },
+        }
+        body = self._body("anthropic/claude-haiku-5.5", "x" * 405_000)  # 150k tokens
+        price = await self._price(provider, body, haiku)
+        assert price == Decimal(150_000) * Decimal("0.0000005") + Decimal(1024) * Decimal(
+            "0.0000025"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("text", "prompt", "completion"),
+        [
+            ("x" * 81_000, "0.00000003", "0.00000013"),  # 30k tokens: base
+            ("x" * 120_000, "0.0000001", "0.0000004"),  # 44_444 tokens: 32k tier
+            ("x" * 810_000, "0.0000002", "0.0000008"),  # 300k tokens: 256k tier
+        ],
+    )
+    async def test_highest_tier_reached_applies(self, provider, text, prompt, completion):
+        qwen = {
+            "id": "qwen/qwen3.7-flash",
+            "pricing": {
+                "prompt": "0.00000003",
+                "completion": "0.00000013",
+                # Listed out of order: the highest threshold reached wins.
+                "overrides": [
+                    {
+                        "min_prompt_tokens": 256_000,
+                        "prompt": "0.0000002",
+                        "completion": "0.0000008",
+                    },
+                    {"min_prompt_tokens": 32_000, "prompt": "0.0000001", "completion": "0.0000004"},
+                ],
+            },
+        }
+        tokens = len(text) * 10 // 27
+        price = await self._price(provider, self._body("qwen/qwen3.7-flash", text), qwen)
+        assert price == Decimal(tokens) * Decimal(prompt) + Decimal(1024) * Decimal(completion)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "anthropic/claude-opus-4.6",
+            "anthropic/claude-opus-4.8",
+            "anthropic/claude-sonnet-4.6",
+            "anthropic/claude-sonnet-5.5",
+            "anthropic/claude-opus-5.5",
+            "anthropic/claude-fable-5",
+            "google/gemini-3-flash",
+        ],
+    )
+    async def test_model_without_overrides_is_flat(self, provider, model):
+        entry = {
+            "id": model,
+            "context_length": 1_000_000,
+            "pricing": {"prompt": "0.000005", "completion": "0.000025", "web_search": "0.01"},
+        }
+        price = await self._price(provider, self._body(model, self.LONG_TEXT), entry)
+        assert price == Decimal(300_000) * Decimal("0.000005") + Decimal(1024) * Decimal("0.000025")
+
+    @pytest.mark.asyncio
+    async def test_missing_cache_write_and_reasoning_rates_scale(self, provider):
+        gemini = {
+            "id": "google/gemini-2.5-pro",
+            "pricing": {
+                "prompt": "0.000002",
+                "completion": "0.00001",
+                "input_cache_write": "0.000003",
+                "internal_reasoning": "0.00002",
+                "overrides": [
+                    {"min_prompt_tokens": 200_000, "prompt": "0.000004", "completion": "0.000015"}
+                ],
+            },
+        }
+        content = [{"type": "text", "text": self.LONG_TEXT, "cache_control": {"type": "ephemeral"}}]
+        body = {
+            "model": "google/gemini-2.5-pro",
+            "messages": [{"role": "user", "content": content}],
+        }
+        price = await self._price(provider, body, gemini)
+        tokens = estimate_chat_input_tokens(body, "openrouter")
+        # Cache write 3e-6 x (4e-6 / 2e-6); reasoning 2e-5 x (1.5e-5 / 1e-5).
+        assert price == Decimal(tokens) * Decimal("0.000006") + Decimal(1024) * Decimal("0.00003")
+
+    @pytest.mark.asyncio
+    async def test_listed_cache_write_of_the_tier_is_used(self, provider):
+        sonnet = {
+            "id": "anthropic/claude-sonnet-4.5",
+            "pricing": {
+                "prompt": "0.000003",
+                "completion": "0.000015",
+                "input_cache_write": "0.00000375",
+                "overrides": [
+                    {
+                        "min_prompt_tokens": 200_000,
+                        "prompt": "0.000006",
+                        "completion": "0.0000225",
+                        "input_cache_write": "0.0000075",
+                    }
+                ],
+            },
+        }
+        content = [{"type": "text", "text": self.LONG_TEXT, "cache_control": {"type": "ephemeral"}}]
+        body = {
+            "model": "anthropic/claude-sonnet-4.5",
+            "messages": [{"role": "user", "content": content}],
+        }
+        price = await self._price(provider, body, sonnet)
+        tokens = estimate_chat_input_tokens(body, "openrouter")
+        assert price == Decimal(tokens) * Decimal("0.0000075") + Decimal(1024) * Decimal(
+            "0.0000225"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "condition",
+        [
+            {"utc_days": ["monday"], "utc_start": 100, "utc_end": 400},
+            {"utc_start": 0, "utc_end": 1600},
+            {"region": "eu"},  # a condition this code does not know
+            {"min_prompt_tokens": "1000"},  # a threshold it cannot read
+        ],
+    )
+    async def test_other_overrides_may_apply_so_the_higher_rate_counts(self, provider, condition):
+        entry = {
+            "id": "deepseek/deepseek-v4.1-flash",
+            "pricing": {
+                "prompt": "0.0000003",
+                "completion": "0.0000012",
+                "overrides": [
+                    {**condition, "prompt": "0.0000006", "completion": "0.0000024"},
+                    {"utc_days": ["sunday"], "prompt": "0.0000001", "completion": "0.0000004"},
+                ],
+            },
+        }
+        body = self._body("deepseek/deepseek-v4.1-flash", "x" * 2700)
+        price = await self._price(provider, body, entry)
+        assert price == Decimal(1000) * Decimal("0.0000006") + Decimal(1024) * Decimal("0.0000024")
+
+    @pytest.mark.asyncio
+    async def test_lower_time_window_keeps_the_base_rate(self, provider):
+        entry = {
+            "id": "tencent/hy3",
+            "pricing": {
+                "prompt": "0.000000132",
+                "completion": "0.000000528",
+                "overrides": [
+                    {"utc_start": 1600, "utc_end": 0, "prompt": "0.00000008", "completion": "3e-7"}
+                ],
+            },
+        }
+        price = await self._price(provider, self._body("tencent/hy3", "x" * 2700), entry)
+        assert price == Decimal(1000) * Decimal("0.000000132") + Decimal(1024) * Decimal(
+            "0.000000528"
+        )
+
+    @pytest.mark.asyncio
+    async def test_tier_is_applied_per_candidate_before_the_max(self, provider):
+        flat = {"id": "openai/gpt-4.1", "pricing": {"prompt": "0.000002", "completion": "0.000008"}}
+        gemini = {
+            "id": "google/gemini-2.5-pro",
+            "pricing": {
+                "prompt": "0.0000015",
+                "completion": "1e-6",
+                "overrides": [
+                    {"min_prompt_tokens": 200_000, "prompt": "0.000003", "completion": "1.5e-6"}
+                ],
+            },
+        }
+        body = self._body("openai/gpt-4.1", self.LONG_TEXT, models=["google/gemini-2.5-pro"])
+        price = await self._price(provider, body, flat, gemini)
+        tokens = estimate_chat_input_tokens(body, "openrouter")
+        # Gemini's tier input (3e-6) tops GPT-4.1's flat 2e-6; GPT-4.1's flat
+        # output 8e-6 tops Gemini's tier 1.5e-6.
+        assert price == Decimal(tokens) * Decimal("0.000003") + Decimal(1024) * Decimal("0.000008")
+
+    @pytest.mark.asyncio
+    async def test_cap_keeps_the_listed_rates_of_a_tiered_prompt(self, provider):
+        body = self._body("openai/gpt-5.5", self.LONG_TEXT)
+        await self._price(provider, body, self.TIERED)
+        assert dict(body["_priced_rates"]) == {
+            "prompt": Decimal("0.000005"),
+            "completion": Decimal("0.00003"),
+            "request": Decimal(0),
+        }
+
+    @pytest.mark.asyncio
+    async def test_fallback_cost_uses_the_tier_of_the_real_prompt(self, provider):
+        usage = {"prompt_tokens": 280_000, "completion_tokens": 100}
+        cost = await self._fallback_cost(
+            provider, self._body("openai/gpt-5.5", "x"), usage, self.TIERED
+        )
+        assert cost == Decimal(280_000) * Decimal("0.00001") + Decimal(100) * Decimal("0.000045")
+
+    @pytest.mark.asyncio
+    async def test_fallback_cost_tiers_only_the_model_that_reaches_the_tier(self, provider):
+        flat = {"id": "openai/gpt-4.1", "pricing": {"prompt": "0.000002", "completion": "0.000008"}}
+        gemini = {
+            "id": "google/gemini-2.5-pro",
+            "pricing": {
+                "prompt": "0.000001",
+                "completion": "0.000001",
+                "overrides": [
+                    {"min_prompt_tokens": 200_000, "prompt": "0.000002", "completion": "0.0000015"}
+                ],
+            },
+        }
+        body = self._body("openai/gpt-4.1", "x", models=["google/gemini-2.5-pro"])
+        usage = {"prompt_tokens": 250_000, "completion_tokens": 100}
+        cost = await self._fallback_cost(provider, body, usage, flat, gemini)
+        assert cost == Decimal(250_000) * Decimal("0.000002") + Decimal(100) * Decimal("0.000008")
+
+    @pytest.mark.asyncio
+    async def test_embeddings_use_the_override_rates(self, provider):
+        entry = {
+            "id": "qwen/qwen3-embedding",
+            "pricing": {
+                "prompt": "0.00000001",
+                "completion": "0",
+                "overrides": [{"utc_start": 0, "utc_end": 800, "prompt": "0.00000002"}],
+            },
+        }
+        body = {"model": "qwen/qwen3-embedding", "input": "x" * 27_000}
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = _catalog(entry)
+            price = await provider.get_price("embeddings", body)
+        assert price == Decimal(10_000) * Decimal("0.00000002")
+
+
+class TestNativeSearchOnlyForSearchModels:
+    """Only models that search on every request are priced with native searches."""
+
+    MAINSTREAM = {
+        "id": "openai/gpt-5.4-nano",
+        "pricing": {"prompt": "0.0000002", "completion": "0.00000125", "web_search": "0.01"},
+    }
+    SONAR = {
+        "id": "perplexity/sonar",
+        "pricing": {"prompt": "0.000001", "completion": "0.000001", "web_search": "0.005"},
+    }
+
+    async def _price(self, provider, body: dict, *models: dict) -> Decimal:
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = _catalog(*models)
+            return await provider.get_price("chat/completions", body)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "model",
+        ["openai/gpt-5.4-nano", "anthropic/claude-haiku-5.5", "~anthropic/claude-opus-latest"],
+    )
+    async def test_per_search_rate_of_a_chat_model_is_not_charged(self, provider, model):
+        entry = {**self.MAINSTREAM, "id": model}
+        price = await self._price(provider, _chat_body(model=model), entry)
+        assert price == Decimal(1) * Decimal("0.0000002") + Decimal(1024) * Decimal("0.00000125")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "model", ["perplexity/sonar", "~perplexity/sonar-latest", "openai/gpt-4o-search-preview"]
+    )
+    async def test_models_that_always_search_are_charged(self, provider, model):
+        entry = {**self.SONAR, "id": model}
+        price = await self._price(provider, _chat_body(model=model), entry)
+        searches = openrouter._NATIVE_SEARCHES * Decimal("0.005")
+        assert price == Decimal("0.000001") + Decimal(1024) * Decimal("0.000001") + searches
+
+    @pytest.mark.asyncio
+    async def test_fallback_to_a_search_model_keeps_its_searches(self, provider):
+        body = _chat_body(model="openai/gpt-5.4-nano", models=["perplexity/sonar"])
+        price = await self._price(provider, body, self.MAINSTREAM, self.SONAR)
+        tokens = estimate_chat_input_tokens(body, "openrouter")
+        searches = openrouter._NATIVE_SEARCHES * Decimal("0.005")
+        # Sonar's input and searches, GPT's output.
+        assert price == (
+            Decimal(tokens) * Decimal("0.000001") + Decimal(1024) * Decimal("0.00000125") + searches
+        )
+
+    @pytest.mark.asyncio
+    async def test_fallback_cost_leaves_out_searches_of_a_chat_model(self, provider):
+        usage = {"prompt_tokens": 10, "completion_tokens": 100, "is_byok": True}
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = _catalog(self.MAINSTREAM)
+            cost = await provider.calculate_actual_cost(
+                _chat_body(model="openai/gpt-5.4-nano"), {"usage": usage}
+            )
+        assert cost == Decimal(10) * Decimal("0.0000002") + Decimal(100) * Decimal("0.00000125")
+
+    @pytest.mark.asyncio
+    async def test_fallback_cost_counts_the_searches_of_each_completion(self, provider):
+        usage = {"prompt_tokens": 10, "completion_tokens": 100, "is_byok": True}
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = _catalog(self.SONAR)
+            cost = await provider.calculate_actual_cost(
+                _chat_body(model="perplexity/sonar", n=2), {"usage": usage}
+            )
+        searches = 2 * openrouter._NATIVE_SEARCHES * Decimal("0.005")
+        assert cost == Decimal(110) * Decimal("0.000001") + searches
+
+
+class TestEmbeddingEstimate:
+    """Embeddings input is weighed like chat text, so dense text is not under-quoted."""
+
+    RATE = Decimal("0.00000002")
+
+    async def _price(self, provider, embedding_model_info_response, text_input) -> Decimal:
+        body = {"model": "openai/text-embedding-3-small", "input": text_input}
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = embedding_model_info_response
+            return await provider.get_price("embeddings", body)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("text_input", "tokens"),
+        [
+            ("汉" * 4000, 6000),  # common CJK: 1.5 tokens each
+            ("\U00020000" * 4000, 12_000),  # CJK Extension B: 3 tokens each
+            (["\U0001f600" * 1000, "汉" * 1000], 4500),  # emoji 3, CJK 1.5
+            ("7" * 5000, 5000),  # one token per digit
+            ("x" * 27_000, 10_000),  # ASCII at 2.7 characters per token
+            ([[1, 2, 3], [4, 5]], 5),  # token arrays
+            ([101, 102, 103, 104], 4),  # one token array as ints
+        ],
+    )
+    async def test_dense_input_is_not_under_quoted(
+        self, provider, embedding_model_info_response, text_input, tokens
+    ):
+        price = await self._price(provider, embedding_model_info_response, text_input)
+        assert price == max(Decimal(tokens) * self.RATE, Decimal("0.000001"))
+
+
+def _nested(depth: int, leaf=None) -> list:
+    value = [] if leaf is None else leaf
+    for _ in range(depth):
+        value = [value]
+    return value
+
+
+class TestMalformedBodies:
+    """Bodies json.loads accepts but that cannot be priced or sent get a 400, not a 500."""
+
+    async def test_deep_nesting_is_priced_without_recursion(self, provider, model_info_response):
+        # Deeper than the default recursion limit allows a recursive walk.
+        body = _chat_body(foo=_nested(5000))
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = model_info_response
+            price = await provider.get_price("chat/completions", body)
+        assert price > 0
+
+    def test_nested_key_walks_are_iterative(self):
+        deep = _nested(10_000, {"cache_control": {"type": "ephemeral", "ttl": "1h"}})
+        assert openrouter.has_nested_key(deep, "cache_control")
+        assert openrouter.long_cache_ttl(deep)
+        assert not openrouter.has_nested_key(_nested(10_000), "cache_control")
+
+    async def test_nesting_too_deep_to_serialize_is_a_400(self, provider, model_info_response):
+        body = _chat_body(foo=_nested(100_000))
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = model_info_response
+            with pytest.raises(ProviderError) as exc_info:
+                await provider.get_price("chat/completions", body)
+        assert exc_info.value.status_code == 400
+        assert "nested too deeply" in exc_info.value.detail
+
+    async def test_deep_embedding_input_is_a_400(self, provider, embedding_model_info_response):
+        body = {"model": "openai/text-embedding-3-small", "input": [_nested(100_000, {})]}
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = embedding_model_info_response
+            with pytest.raises(ProviderError) as exc_info:
+                await provider.get_price("embeddings", body)
+        assert exc_info.value.status_code == 400
+
+    @pytest.mark.parametrize("part_type", [["text"], {}, {"a": 1}, 7])
+    async def test_non_string_part_type_is_a_400(self, provider, part_type):
+        body = _chat_body(
+            messages=[{"role": "user", "content": [{"type": part_type, "text": "hi"}]}]
+        )
+        for call in (provider.get_price, provider.submit):
+            with pytest.raises(ProviderError) as exc_info:
+                await call("chat/completions", body)
+            assert exc_info.value.status_code == 400
+            assert "must be a string" in exc_info.value.detail
+
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            {"temperature": float("nan")},
+            {"top_p": float("inf")},
+            {"tools": [{"type": "function", "x": float("-inf")}]},
+            {"messages": [{"role": "user", "content": "a\ud800b"}]},
+            {"messages": [{"role": "user", "content": "hi", "name\udfff": "x"}]},
+        ],
+    )
+    async def test_unsendable_json_is_refused_before_payment(self, provider, extra):
+        """httpx would refuse to encode these on every send, after the client paid."""
+        with (
+            patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get,
+            pytest.raises(ProviderError) as exc_info,
+        ):
+            await provider.get_price("chat/completions", _chat_body(**extra))
+        assert exc_info.value.status_code == 400
+        mock_get.assert_not_called()
+
+    async def test_unsendable_embedding_input_is_refused(self, provider):
+        body = {"model": "openai/text-embedding-3-small", "input": "x\udc00"}
+        with pytest.raises(ProviderError) as exc_info:
+            await provider.get_price("embeddings", body)
+        assert exc_info.value.status_code == 400
+
+    async def test_surrogate_pairs_and_internal_keys_are_fine(self, provider, model_info_response):
+        body = _chat_body(
+            messages=[{"role": "user", "content": "smile \U0001f600 привет"}],
+            _file_bytes=b"\xff",
+        )
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = model_info_response
+            assert await provider.get_price("chat/completions", body) > 0
+
+
+class TestErrorInSuccessBody:
+    """A 2xx body with only an error object is a failure, not a billed success."""
+
+    @pytest.fixture(autouse=True)
+    def warm_catalog(self, provider, model_info_response):
+        provider._catalogs.put(
+            "", {model["id"]: model for model in model_info_response.json()["data"]}
+        )
+
+    async def _submit(self, provider, payload: dict):
+        with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = httpx.Response(status_code=200, json=payload)
+            return await provider.submit("chat/completions", _chat_body())
+
+    @pytest.mark.parametrize(
+        ("error", "status"),
+        [
+            ({"code": 502, "message": "upstream failed"}, 502),
+            ({"code": 429, "message": "rate limited"}, 429),
+            ({"code": 400, "message": "context too long"}, 400),
+            ({"code": 402, "message": "insufficient credits"}, 502),
+            ({"code": "server_error", "message": "boom"}, 502),
+            ({"message": "boom"}, 502),
+            ("model failed", 502),
+        ],
+    )
+    async def test_reported_error_is_a_known_failure(self, provider, error, status):
+        with pytest.raises(ProviderError) as exc_info:
+            await self._submit(provider, {"error": error})
+        assert exc_info.value.status_code == status
+        assert not outcome_unknown(exc_info.value)
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            {"code": 524, "message": "provider timeout"},
+            {"code": 504, "message": "gateway"},
+            {"code": 502, "message": "Upstream timed out"},
+            {"message": "request timed out"},
+        ],
+    )
+    async def test_reported_timeout_is_an_unknown_outcome(self, provider, error):
+        with pytest.raises(ProviderError) as exc_info:
+            await self._submit(provider, {"error": error})
+        assert outcome_unknown(exc_info.value)
+
+    @pytest.mark.parametrize(
+        "usage",
+        [
+            {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cost": 0},
+            {"cost": 0.0},
+            {"cost": "0", "total_tokens": "0"},
+            {"cost": "abc", "prompt_tokens": True, "completion_tokens": [5], "total_tokens": None},
+            {"cost": "NaN", "prompt_tokens": "Infinity", "completion_tokens": -3},
+        ],
+    )
+    async def test_error_with_zeroed_usage_is_a_known_failure(self, provider, usage):
+        with pytest.raises(ProviderError) as exc_info:
+            await self._submit(provider, {"error": {"code": 502, "message": "x"}, "usage": usage})
+        assert exc_info.value.status_code == 502
+        assert not outcome_unknown(exc_info.value)
+
+    async def test_timeout_with_zeroed_usage_is_an_unknown_outcome(self, provider):
+        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cost": 0}
+        with pytest.raises(ProviderError) as exc_info:
+            await self._submit(provider, {"error": {"code": 524}, "usage": usage})
+        assert outcome_unknown(exc_info.value)
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"error": {"code": 502}, "usage": {"cost": 0.0001}},
+            {"error": {"code": 502}, "usage": {"cost": "0.0001"}},
+            {"error": {"code": 502}, "usage": {"prompt_tokens": 10}},
+            {"error": {"code": 502}, "usage": {"cost": 0, "prompt_tokens": 10, "is_byok": True}},
+            {"error": {"code": 502}, "usage": {"total_tokens": 12}},
+            {"error": {"code": 502}, "choices": [{"message": {"content": "partial"}}]},
+            {"error": None, "choices": []},
+            {"error": {}, "id": "gen-1"},
+        ],
+    )
+    async def test_billed_or_answered_bodies_are_returned(self, provider, payload):
+        assert await self._submit(provider, payload) == payload
+
+
+class TestCapAtPricedRates:
+    """submit caps steered endpoints at the rates get_price priced the request at."""
+
+    _ROUTING = {"order": ["pricey-host"]}
+
+    @staticmethod
+    def _mini(prompt: str, completion: str) -> dict:
+        return {
+            "openai/gpt-4o-mini": {
+                "id": "openai/gpt-4o-mini",
+                "pricing": {"prompt": prompt, "completion": completion},
+            }
+        }
+
+    async def _cap(self, provider, chat_completion_response, body) -> dict:
+        with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = chat_completion_response
+            await provider.submit("chat/completions", body)
+        sent = mock_post.call_args.kwargs["json"]
+        assert openrouter._PRICED_RATES not in sent
+        return sent["provider"]["max_price"]
+
+    async def test_request_priced_after_a_raise_is_capped_at_the_new_rates(
+        self, provider, chat_completion_response
+    ):
+        provider._catalogs.put("", self._mini("0.000001", "0.000002"))
+        provider._catalogs.put("", self._mini("0.000002", "0.000004"))
+        body = _chat_body(provider=self._ROUTING)
+        await provider.get_price("chat/completions", body)
+        cap = await self._cap(provider, chat_completion_response, body)
+        assert cap == {"prompt": 2.0, "completion": 4.0, "request": 0.0}
+
+    async def test_request_priced_before_a_raise_keeps_its_rates(
+        self, provider, chat_completion_response
+    ):
+        provider._catalogs.put("", self._mini("0.000001", "0.000002"))
+        body = _chat_body(provider=self._ROUTING)
+        await provider.get_price("chat/completions", body)
+        provider._catalogs.put("", self._mini("0.000002", "0.000004"))
+        # Even once the grace window for unpriced bodies is over.
+        old, replaced_at = provider._catalogs._previous[""]
+        provider._catalogs._previous[""] = (old, replaced_at - openrouter._CAP_GRACE_S - 1)
+        cap = await self._cap(provider, chat_completion_response, body)
+        assert cap == {"prompt": 1.0, "completion": 2.0, "request": 0.0}
+
+    async def test_client_cannot_forge_the_priced_rates(self, provider, chat_completion_response):
+        provider._catalogs.put("", self._mini("0.000001", "0.000002"))
+        forged = {"prompt": Decimal(1), "completion": Decimal(1), "request": Decimal(1)}
+        body = _chat_body(provider=self._ROUTING, **{openrouter._PRICED_RATES: forged})
+        cap = await self._cap(provider, chat_completion_response, body)
+        assert cap == {"prompt": 1.0, "completion": 2.0, "request": 0.0}
+
+
+def _audio_part(data: str, fmt: str = "wav") -> dict:
+    return {"type": "input_audio", "input_audio": {"data": data, "format": fmt}}
+
+
+def _audio_body(*parts: dict, model: str = "google/gemini-audio", **extra) -> dict:
+    content = [{"type": "text", "text": "Hi"}, *parts]
+    return {"model": model, "messages": [{"role": "user", "content": content}], **extra}
+
+
+# Text weight of the "Hi" part plus one audio part's type and format.
+_AUDIO_TEXT_UNITS = len("Hi") * 100
+_AUDIO_PART_UNITS = (len('{"type":"input_audio"}') + len('{"format":"wav"}')) * 100
+
+
+def _audio_text_tokens(parts: int = 1) -> int:
+    return (_AUDIO_TEXT_UNITS + parts * _AUDIO_PART_UNITS) // 270
+
+
+class TestChatAudioInput:
+    """Audio parts are timed and billed at the catalog audio rate."""
+
+    PROMPT = Decimal("0.0000003")
+    COMPLETION = Decimal("0.0000025")
+    AUDIO = Decimal("0.000001")
+
+    def _model(self, **pricing: str) -> dict:
+        rates = {"prompt": str(self.PROMPT), "completion": str(self.COMPLETION)}
+        rates.update(pricing)
+        return {"id": "google/gemini-audio", "pricing": rates}
+
+    async def _price(self, provider, body: dict, model: dict) -> Decimal:
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = _catalog(model)
+            return await provider.get_price("chat/completions", body)
+
+    def _expected(self, audio_tokens: int, audio_rate: Decimal, parts: int = 1) -> Decimal:
+        return (
+            Decimal(_audio_text_tokens(parts)) * self.PROMPT
+            + Decimal(audio_tokens) * audio_rate
+            + Decimal(1024) * self.COMPLETION
+        )
+
+    @pytest.mark.asyncio
+    async def test_audio_is_priced_by_duration_at_the_audio_rate(self, provider):
+        threads = []
+        real_duration = openrouter.get_audio_duration_seconds
+
+        def recording_duration(*args, **kwargs):
+            threads.append(threading.current_thread())
+            return real_duration(*args, **kwargs)
+
+        body = _audio_body(_audio_part(make_wav_b64(2.0)))
+        with patch.object(openrouter, "get_audio_duration_seconds", recording_duration):
+            price = await self._price(provider, body, self._model(audio=str(self.AUDIO)))
+
+        assert price == self._expected(2 * 50, self.AUDIO)
+        assert len(threads) == 1
+        assert threads[0] is not threading.main_thread()
+
+    @pytest.mark.asyncio
+    async def test_audio_rate_below_the_input_rate_uses_the_input_rate(self, provider):
+        body = _audio_body(_audio_part(make_wav_b64(2.0)))
+        price = await self._price(provider, body, self._model(audio="0.0000001"))
+        assert price == self._expected(100, self.PROMPT)
+
+    @pytest.mark.asyncio
+    async def test_no_audio_rate_bills_audio_as_input_tokens(self, provider):
+        body = _audio_body(_audio_part(make_wav_b64(2.0)))
+        price = await self._price(provider, body, self._model())
+        assert price == self._expected(100, self.PROMPT)
+
+    @pytest.mark.asyncio
+    async def test_partial_seconds_round_up_per_part_and_parts_add_up(self, provider):
+        body = _audio_body(_audio_part(make_wav_b64(1.2)), _audio_part(make_wav_b64(0.5)))
+        price = await self._price(provider, body, self._model(audio=str(self.AUDIO)))
+        assert price == self._expected((2 + 1) * 50, self.AUDIO, parts=2)
+
+    @pytest.mark.asyncio
+    async def test_a_large_wav_is_not_priced_as_text(self, provider):
+        """A minute of WAV is ~1.3M base64 characters, ~470k text tokens; it bills 3k."""
+        body = _audio_body(_audio_part(make_wav_b64(60.0, rate=16000)))
+        price = await self._price(provider, body, self._model(audio=str(self.AUDIO)))
+        assert price == self._expected(60 * 50, self.AUDIO)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("fmt", "per_second"), [("pcm16", 16_000), ("PCM24", 24_000)])
+    async def test_raw_pcm_is_timed_from_its_length_at_8khz(self, provider, fmt, per_second):
+        data = base64.b64encode(b"\x00" * (3 * per_second)).decode()
+        body = _audio_body(
+            {"type": "input_audio", "input_audio": {"data": data, "format": fmt}},
+        )
+        price = await self._price(provider, body, self._model(audio=str(self.AUDIO)))
+        # The data is not weighed, so the text estimate stays tiny.
+        text_tokens = estimate_chat_input_tokens(body, "openrouter")
+        assert text_tokens < 20
+        assert price == (
+            Decimal(text_tokens) * self.PROMPT
+            + Decimal(3 * 50) * self.AUDIO
+            + Decimal(1024) * self.COMPLETION
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("audio", "status"),
+        [
+            ({"data": "QUJD0123" * 100, "format": "wav"}, 400),  # not audio
+            ({"data": "not base64!", "format": "wav"}, 400),
+            ({"data": make_wav_b64(1.0)}, 400),  # no format
+            ({"format": "wav"}, 400),  # no data
+            ("AAAA", 400),  # not an object
+        ],
+    )
+    async def test_audio_that_cannot_be_timed_is_refused(self, provider, audio, status):
+        body = _audio_body({"type": "input_audio", "input_audio": audio})
+        with pytest.raises(ProviderError) as caught:
+            await self._price(provider, body, self._model(audio=str(self.AUDIO)))
+        assert caught.value.status_code == status
+
+    @pytest.mark.asyncio
+    async def test_oversized_audio_part_is_refused(self):
+        config = ProviderConfig(
+            enabled=True,
+            base_url="https://openrouter.ai/api/v1",
+            api_key="k",
+            max_stt_audio_mb=1,
+        )
+        small = OpenRouterProvider(config=config)
+        body = _audio_body(_audio_part(make_wav_b64(70.0)))  # ~1.1 MB
+        with pytest.raises(ProviderError) as caught:
+            await self._price(small, body, self._model(audio=str(self.AUDIO)))
+        assert caught.value.status_code == 413
+
+    @pytest.mark.asyncio
+    async def test_audio_tokens_count_toward_the_long_context_tier(self, provider):
+        """100 audio tokens lift a 14-token prompt over a 50-token tier."""
+        model = self._model(
+            audio=str(self.AUDIO),
+            overrides=[{"min_prompt_tokens": 50, "prompt": "0.0000006"}],
+        )
+        body = _audio_body(_audio_part(make_wav_b64(2.0)))
+        price = await self._price(provider, body, model)
+        # The tier doubles the prompt rate and lists no audio rate, so audio
+        # doubles with it.
+        assert price == (
+            Decimal(_audio_text_tokens()) * Decimal("0.0000006")
+            + Decimal(100) * self.AUDIO * 2
+            + Decimal(1024) * self.COMPLETION
+        )
+
+    @pytest.mark.asyncio
+    async def test_tier_audio_rate_is_used_when_listed(self, provider):
+        model = self._model(
+            audio=str(self.AUDIO),
+            overrides=[{"min_prompt_tokens": 50, "prompt": "0.0000006", "audio": "0.000005"}],
+        )
+        body = _audio_body(_audio_part(make_wav_b64(2.0)))
+        price = await self._price(provider, body, model)
+        assert price == (
+            Decimal(_audio_text_tokens()) * Decimal("0.0000006")
+            + Decimal(100) * Decimal("0.000005")
+            + Decimal(1024) * self.COMPLETION
+        )
+
+    @pytest.mark.asyncio
+    async def test_fallback_candidate_audio_rate_counts(self, provider):
+        cheap = self._model()
+        dear = {
+            "id": "openai/gpt-audio",
+            "pricing": {"prompt": "0.0000003", "completion": "0.0000025", "audio": "0.00004"},
+        }
+        body = _audio_body(_audio_part(make_wav_b64(2.0)), models=["openai/gpt-audio"])
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = _catalog(cheap, dear)
+            price = await provider.get_price("chat/completions", body)
+        models_units = len('["openai/gpt-audio"]') * 100
+        text_tokens = (_AUDIO_TEXT_UNITS + _AUDIO_PART_UNITS + models_units) // 270
+        assert price == (
+            Decimal(text_tokens) * self.PROMPT
+            + Decimal(100) * Decimal("0.00004")
+            + Decimal(1024) * self.COMPLETION
+        )
+
+    async def _fallback_cost(self, provider, body: dict, usage: dict, model: dict):
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = _catalog(model)
+            return await provider.calculate_actual_cost(body, {"usage": {**usage, "is_byok": True}})
+
+    @pytest.mark.asyncio
+    async def test_fallback_cost_bills_reported_audio_tokens_at_the_audio_rate(self, provider):
+        body = _audio_body(_audio_part(make_wav_b64(2.0)))
+        usage = {
+            "prompt_tokens": 120,
+            "completion_tokens": 10,
+            "prompt_tokens_details": {"audio_tokens": 64},
+        }
+        cost = await self._fallback_cost(provider, body, usage, self._model(audio=str(self.AUDIO)))
+        assert cost == (
+            Decimal(56) * self.PROMPT + Decimal(64) * self.AUDIO + Decimal(10) * self.COMPLETION
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("details", [None, {}, {"audio_tokens": 0}, {"audio_tokens": "64"}])
+    async def test_fallback_cost_without_an_audio_count_bills_the_held_audio_tokens_as_audio(
+        self, provider, details
+    ):
+        """Two timed seconds held 100 audio tokens; the rest bills at the prompt rate."""
+        body = _audio_body(_audio_part(make_wav_b64(2.0)))
+        usage = {"prompt_tokens": 120, "completion_tokens": 10}
+        if details is not None:
+            usage["prompt_tokens_details"] = details
+        cost = await self._fallback_cost(provider, body, usage, self._model(audio=str(self.AUDIO)))
+        assert cost == (
+            Decimal(100) * self.AUDIO + Decimal(20) * self.PROMPT + Decimal(10) * self.COMPLETION
+        )
+
+    @pytest.mark.asyncio
+    async def test_fallback_cost_without_an_audio_count_bills_a_short_prompt_as_audio(
+        self, provider
+    ):
+        body = _audio_body(_audio_part(make_wav_b64(2.0)))
+        usage = {"prompt_tokens": 80, "completion_tokens": 10}
+        cost = await self._fallback_cost(provider, body, usage, self._model(audio=str(self.AUDIO)))
+        assert cost == Decimal(80) * self.AUDIO + Decimal(10) * self.COMPLETION
+
+    @pytest.mark.asyncio
+    async def test_fallback_cost_bills_the_prompt_as_audio_when_the_audio_cannot_be_timed(
+        self, provider
+    ):
+        body = _audio_body(_audio_part(make_wav_b64(2.0)))
+        usage = {"prompt_tokens": 120, "completion_tokens": 10}
+        failing = AsyncMock(
+            side_effect=ProviderError(provider="openrouter", detail="busy", status_code=429)
+        )
+        with patch.object(provider, "_measure_chat_audio", failing):
+            cost = await self._fallback_cost(
+                provider, body, usage, self._model(audio=str(self.AUDIO))
+            )
+        assert cost == Decimal(120) * self.AUDIO + Decimal(10) * self.COMPLETION
+
+    @pytest.mark.asyncio
+    async def test_fallback_cost_does_not_time_audio_the_usage_reports(self, provider):
+        body = _audio_body(_audio_part(make_wav_b64(2.0)))
+        usage = {"prompt_tokens": 120, "prompt_tokens_details": {"audio_tokens": 64}}
+        measure = AsyncMock(return_value=2)
+        with patch.object(provider, "_measure_chat_audio", measure):
+            await self._fallback_cost(provider, body, usage, self._model(audio=str(self.AUDIO)))
+        measure.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_fallback_cost_caps_audio_tokens_at_the_prompt(self, provider):
+        body = _audio_body(_audio_part(make_wav_b64(2.0)))
+        usage = {"prompt_tokens": 50, "prompt_tokens_details": {"audio_tokens": 500}}
+        cost = await self._fallback_cost(provider, body, usage, self._model(audio=str(self.AUDIO)))
+        assert cost == Decimal(50) * self.AUDIO
+
+    @pytest.mark.asyncio
+    async def test_fallback_cost_of_text_ignores_the_audio_rate(self, provider):
+        body = _chat_body(model="google/gemini-audio")
+        usage = {"prompt_tokens": 120, "prompt_tokens_details": {"audio_tokens": 0}}
+        cost = await self._fallback_cost(provider, body, usage, self._model(audio=str(self.AUDIO)))
+        assert cost == Decimal(120) * self.PROMPT
+
+
+class TestWebSearchRoutes:
+    """Every way to ask for a billed web search is priced or refused."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "tools",
+        [
+            [{"type": "web_search"}],
+            [{"type": "web_search_preview", "search_context_size": "high"}],
+            [{"type": "openrouter:web_search", "parameters": {"max_results": 5}}],
+            [{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
+            [{"type": "function", "function": {"name": "f"}}, {"type": "code_interpreter"}],
+            [{"type": ["function"]}],
+            [{"type": None}],
+            [{"google_search": {}}],
+            [{"googleSearchRetrieval": {}}],
+            ["web_search"],
+            {"type": "web_search"},
+        ],
+    )
+    async def test_server_tools_are_refused_before_payment(self, provider, tools):
+        with (
+            patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get,
+            pytest.raises(ProviderError) as caught,
+        ):
+            await provider.get_price("chat/completions", _chat_body(tools=tools))
+        assert caught.value.status_code == 400
+        mock_get.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "tools",
+        [
+            [{"type": "function", "function": {"name": "f", "parameters": {}}}],
+            [{"function": {"name": "f"}}],  # no type: a function tool
+            [{"type": "custom", "custom": {"name": "grammar"}}],
+            [],
+            None,
+        ],
+    )
+    async def test_function_tools_are_priced_as_text(self, provider, model_info_response, tools):
+        body = _chat_body(tools=tools)
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = model_info_response
+            price = await provider.get_price("chat/completions", body)
+        assert price == _mini_price(estimate_chat_input_tokens(body, "openrouter"))
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "search",
+        [
+            {},
+            {"mode": "auto"},
+            {"mode": "on", "max_search_results": 30},
+            {"mode": "OFF "},
+            "off",
+            [],
+        ],
+    )
+    async def test_xai_live_search_is_refused(self, provider, search):
+        with (
+            patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get,
+            pytest.raises(ProviderError, match="search_parameters") as caught,
+        ):
+            await provider.get_price("chat/completions", _chat_body(search_parameters=search))
+        assert caught.value.status_code == 400
+        mock_get.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_xai_live_search_off_is_allowed(self, provider, model_info_response):
+        body = _chat_body(search_parameters={"mode": "off"})
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = model_info_response
+            price = await provider.get_price("chat/completions", body)
+        assert price == _mini_price(estimate_chat_input_tokens(body, "openrouter"))
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            {"model": "openai/gpt-4o-mini:online"},
+            {"model": "openai/gpt-4o-mini:Online"},
+            {"model": "openai/gpt-4o-mini:online:nitro"},
+            {"models": ["openai/gpt-4o:online"]},
+        ],
+    )
+    async def test_online_variant_is_refused_before_payment(self, provider, extra):
+        with (
+            patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get,
+            pytest.raises(ProviderError, match=":online") as caught,
+        ):
+            await provider.get_price("chat/completions", _chat_body(**extra))
+        assert caught.value.status_code == 400
+        mock_get.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_online_variant_in_the_catalog_is_still_refused(self, provider):
+        """Even a listed :online row would price no searches."""
+        catalog = _catalog(
+            {"id": "openai/gpt-4o-mini:online", "pricing": {"prompt": "0", "completion": "0"}}
+        )
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = catalog
+            with pytest.raises(ProviderError, match=":online"):
+                await provider.get_price(
+                    "chat/completions", _chat_body(model="openai/gpt-4o-mini:online")
+                )
+
+    @pytest.mark.asyncio
+    async def test_online_in_a_model_name_is_not_a_variant(self, provider):
+        catalog = _catalog(
+            {"id": "acme/online-chat", "pricing": {"prompt": "0.000001", "completion": "0"}}
+        )
+        body = _chat_body(model="acme/online-chat")
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = catalog
+            price = await provider.get_price("chat/completions", body)
+        assert price == Decimal(_ascii_tokens("Hi")) * Decimal("0.000001")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            {"tools": [{"type": "web_search_preview"}]},
+            {"search_parameters": {"mode": "auto"}},
+            {"model": "openai/gpt-4o-mini:online"},
+        ],
+    )
+    async def test_submit_refuses_them_too(self, provider, extra):
+        with (
+            patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post,
+            pytest.raises(ProviderError) as caught,
+        ):
+            await provider.submit("chat/completions", _chat_body(**extra))
+        assert caught.value.status_code == 400
+        mock_post.assert_not_called()

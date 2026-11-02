@@ -68,6 +68,14 @@ _COST_LOOKUP_DELAYS = (0.25, 0.5, 1.0, 2.0)
 # entry cap, so a price served from that cache still finds its record here.
 _PRICED_TTL_SECONDS = 3600
 _CACHE_MAX_ENTRIES = 10_000
+# Same as the gateway's default price_cache_ttl. The gateway caches prices by
+# raw body, so a price it showed may still be charged that long after a newer
+# quote for an equivalent body. The grace covers the time from that cache
+# read to submit: payment checks and, on Solana, settlement, whose confirm
+# wait alone may run svm_signer._CONFIRM_RUN_TIMEOUT_S (150 s). Only used when
+# submit is not told the price the client was charged.
+_PRICE_CACHE_TTL_S = 60
+_PRICE_GRACE_SECONDS = 180
 _POLL_BACKOFF_MIN = 1.0
 _POLL_BACKOFF_MAX = 30.0
 
@@ -111,12 +119,21 @@ class SpicyApiProvider(BaseProvider):
     quote so SpicyAPI cannot accept a higher price than the one shown.
     """
 
-    def __init__(self, config: ProviderConfig, *, default_max_tokens: int = 2048) -> None:
+    def __init__(
+        self,
+        config: ProviderConfig,
+        *,
+        default_max_tokens: int = 2048,
+        price_cache_ttl: int = _PRICE_CACHE_TTL_S,
+    ) -> None:
         super().__init__(name="spicyapi", config=config)
         self._default_max_tokens = default_max_tokens
+        # How long a price shown for a request key may still be charged.
+        self._price_window = max(price_cache_ttl, 0) + _PRICE_GRACE_SECONDS
         self._quotes: dict[str, _Quote] = {}
-        # Price shown to the client per request key, with its monotonic time.
-        self._priced: dict[str, tuple[Decimal, float]] = {}
+        # Prices shown per request key as (cost, monotonic time), oldest and
+        # cheapest first; the last one is the latest. See _remember_price.
+        self._priced: dict[str, list[tuple[Decimal, float]]] = {}
         self._actual_costs: dict[str, Decimal] = {}
 
     async def get_price(self, model_path: str, inputs: dict[str, Any]) -> Decimal:
@@ -138,17 +155,20 @@ class SpicyApiProvider(BaseProvider):
         body: dict[str, Any],
         *,
         prepaid: bool = False,
+        paid_price: Decimal | None = None,
     ) -> dict[str, Any]:
         """Run a quoted image, video, or chat request.
 
         Image jobs pass ``wait`` so a finished image comes back on this
         call. Video jobs return immediately and are polled by ``get_result``.
         Chat is streamed at the quoted price and returned as one completion.
+        ``paid_price`` is the base price the request was charged at; without
+        it the quote is checked against the prices recently shown.
         """
         payload = self._payload(path, body)
         if path.strip("/") == _CHAT_PATH:
-            return await self._submit_chat(payload)
-        quote = await self._quote_for_submit(payload)
+            return await self._submit_chat(payload, paid_price)
+        quote = await self._quote_for_submit(payload, paid_price)
         wait = _IMAGE_WAIT_SECONDS if quote.unit == "per_image" else None
         try:
             record = await self._create_task(payload, quote, wait=wait)
@@ -161,7 +181,7 @@ class SpicyApiProvider(BaseProvider):
                 raise
             logger.info("SpicyAPI quote rejected, quoting %s again", payload["model"])
             self._quotes.pop(self._cache_key(payload), None)
-            quote = await self._quote_for_submit(payload)
+            quote = await self._quote_for_submit(payload, paid_price)
             record = await self._create_task(payload, quote, wait=wait)
         return self._outcome(record)
 
@@ -363,9 +383,11 @@ class SpicyApiProvider(BaseProvider):
                 task_input[field] = body[field]
         return {"model": model, "input": task_input}
 
-    async def _submit_chat(self, payload: dict[str, Any]) -> dict[str, Any]:
+    async def _submit_chat(
+        self, payload: dict[str, Any], paid_price: Decimal | None
+    ) -> dict[str, Any]:
         """Stream a quoted chat and return one OpenAI completion."""
-        quote = await self._quote_for_submit(payload)
+        quote = await self._quote_for_submit(payload, paid_price)
         try:
             completion, task_id = await self._stream_chat(payload, quote)
         except ProviderError as exc:
@@ -376,7 +398,7 @@ class SpicyApiProvider(BaseProvider):
                 raise
             logger.info("SpicyAPI chat quote rejected, quoting %s again", payload["model"])
             self._quotes.pop(self._cache_key(payload), None)
-            quote = await self._quote_for_submit(payload)
+            quote = await self._quote_for_submit(payload, paid_price)
             completion, task_id = await self._stream_chat(payload, quote)
         cost = await self._lookup_settled_cost(task_id)
         if cost is None:
@@ -411,20 +433,37 @@ class SpicyApiProvider(BaseProvider):
         )
         client = self._get_client()
         try:
-            async with client.stream(
-                "POST",
-                url,
-                json=request_body,
-                headers=headers,
-                timeout=timeout,
-            ) as response:
-                if response.status_code >= 400:
-                    await response.aread()
-                    raise self._error_from_response(response)
-                task_id = response.headers.get("x-spicy-task-id") or ""
-                chunks = await _read_sse_chunks(response)
+            # The read timeout is per read, and keepalive comments reset it,
+            # so the whole stream gets the same limit as a polled job.
+            async with asyncio.timeout(float(self._config.poll_timeout)):
+                async with client.stream(
+                    "POST",
+                    url,
+                    json=request_body,
+                    headers=headers,
+                    timeout=timeout,
+                ) as response:
+                    if response.status_code >= 400:
+                        await response.aread()
+                        error = self._error_from_response(response)
+                        if response.status_code in _GATEWAY_TIMEOUT_STATUSES:
+                            # A proxy gave up waiting; SpicyAPI may still run the chat.
+                            raise error from UpstreamMayHaveRun(
+                                f"jobs/stream gateway timeout {response.status_code}"
+                            )
+                        raise error
+                    task_id = response.headers.get("x-spicy-task-id") or ""
+                    chunks = await _read_sse_chunks(response)
         except ProviderError:
             raise
+        except TimeoutError as exc:
+            # The request was sent, so the chat may run and bill, as with a
+            # polled job that times out.
+            raise ProviderError(
+                provider=self.name,
+                detail=f"SpicyAPI chat did not finish within {self._config.poll_timeout}s",
+                status_code=504,
+            ) from UpstreamMayHaveRun(f"jobs/stream exceeded poll_timeout: {exc!r}")
         except httpx.TimeoutException as exc:
             raise ProviderError(
                 provider=self.name,
@@ -550,16 +589,19 @@ class SpicyApiProvider(BaseProvider):
             payload["callBackUrl"] = callback
         return payload
 
-    async def _quote_for_submit(self, payload: dict[str, Any]) -> _Quote:
+    async def _quote_for_submit(
+        self, payload: dict[str, Any], paid_price: Decimal | None = None
+    ) -> _Quote:
         """Reuse the price shown to the client, or quote again if it is stale.
 
-        A fresh quote that costs more than the price already offered is
-        rejected, so a paid retry cannot be accepted above that amount. A
-        request with no price on record is refused before anything runs: the
-        amount the client paid is unknown, so no quote can be checked against it.
+        A fresh quote that costs more than the price the client paid is
+        rejected, so a paid retry cannot be accepted above that amount. When
+        that amount is not passed in, the lowest price recently shown stands
+        in for it. A request with neither is refused before anything runs:
+        the amount the client paid is unknown, so no quote can be checked.
         """
         key = self._cache_key(payload)
-        priced = self._price_for(key)
+        priced = paid_price if paid_price is not None else self._price_for(key)
         if priced is None:
             raise ProviderError(
                 provider=self.name,
@@ -586,12 +628,26 @@ class SpicyApiProvider(BaseProvider):
 
     async def _quote(self, payload: dict[str, Any]) -> _Quote:
         """Ask SpicyAPI for a five-minute quote and remember it."""
-        response = await self._send(
-            "POST",
-            "/api/v1/jobs/quote",
-            json_body=payload,
-            request_timeout=_DEFAULT_TIMEOUT,
-        )
+        try:
+            response = await self._send(
+                "POST",
+                "/api/v1/jobs/quote",
+                json_body=payload,
+                request_timeout=_DEFAULT_TIMEOUT,
+            )
+        except ProviderError as exc:
+            failure = exc
+        else:
+            failure = None
+        if failure is not None:
+            # A quote starts no job, so even one that timed out after it was
+            # sent is a known failure. Raised outside the except block, the
+            # transport error is in neither __cause__ nor __context__.
+            raise ProviderError(
+                provider=self.name,
+                detail=failure.detail,
+                status_code=failure.status_code,
+            )
         data = _envelope_data(response)
         cost_text = data.get("estimatedCost")
         cost = _parse_cost(cost_text)
@@ -618,24 +674,43 @@ class SpicyApiProvider(BaseProvider):
         return quote
 
     def _remember_price(self, key: str, cost: Decimal) -> None:
-        """Record the price shown for a request. Old and excess entries go first."""
+        """Record the price shown for a request. Old and excess entries go first.
+
+        Equivalent bodies share a key here but not in the gateway's price
+        cache, so a lower price shown a moment ago may still be what a client
+        pays. A newer, higher quote must not raise the guard for it: lower
+        prices inside the window are kept. A price that is not lower than a
+        newer one can never be the minimum, so it is dropped.
+        """
         now = time.monotonic()
         # Re-inserting moves the key to the end, so dict order stays oldest first.
-        self._priced.pop(key, None)
+        shown = self._priced.pop(key, [])
+        shown = [entry for entry in shown if now - entry[1] <= self._price_window]
+        while shown and shown[-1][0] >= cost:
+            shown.pop()
+        shown.append((cost, now))
         while self._priced:
             oldest = next(iter(self._priced))
-            stored_at = self._priced[oldest][1]
+            stored_at = self._priced[oldest][-1][1]
             if now - stored_at <= _PRICED_TTL_SECONDS and len(self._priced) < _CACHE_MAX_ENTRIES:
                 break
             del self._priced[oldest]
-        self._priced[key] = (cost, now)
+        self._priced[key] = shown
 
     def _price_for(self, key: str) -> Decimal | None:
-        """Return the price shown for a request, or None if it is gone or stale."""
-        entry = self._priced.get(key)
-        if entry is None or time.monotonic() - entry[1] > _PRICED_TTL_SECONDS:
+        """Return the lowest price a client may have paid for a request.
+
+        That is the lowest price shown inside the window, else the latest
+        one. None if it is gone or stale.
+        """
+        shown = self._priced.get(key)
+        now = time.monotonic()
+        if not shown or now - shown[-1][1] > _PRICED_TTL_SECONDS:
             return None
-        return entry[0]
+        for cost, shown_at in shown:
+            if now - shown_at <= self._price_window:
+                return cost
+        return shown[-1][0]
 
     async def _create_task(
         self,

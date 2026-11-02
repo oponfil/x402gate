@@ -186,3 +186,70 @@ class TestPriceCacheKey:
         key = PriceCache._make_key("p/a", {}, b'{"image": "' + b"A" * 100_000 + b'"}')
         assert "AAAA" not in key
         assert len(key) < 80
+
+    def test_keys_carry_the_full_digest(self):
+        """A truncated hash of client bytes would let two bodies share a price."""
+        raw = b'{"model": "cheap", "max_tokens": 1}'
+        raw_key = PriceCache._make_key("p/a", {}, raw)
+        assert raw_key == f"p/a:raw:{hashlib.sha256(raw).hexdigest()}"
+        parsed_key = PriceCache._make_key("p/a", {"_file_bytes": b"x", "model": "m"})
+        digest = parsed_key.rsplit(":", 1)[1]
+        assert len(digest) == 64
+        assert all(c in "0123456789abcdef" for c in digest)
+
+
+class TestPriceCacheExtra:
+    """An entry keeps what pricing left in the body, for a cache hit to restore."""
+
+    def test_extra_round_trip(self):
+        cache = PriceCache(ttl=60)
+        key = cache.key("p/a", {"prompt": "cat"})
+        rates = {"prompt": Decimal("1")}
+        cache.set_by_key(key, Decimal("0.5"), {"_priced_rates": rates})
+        price, extra = cache.entry_by_key(key)
+        assert price == Decimal("0.5")
+        assert extra == {"_priced_rates": rates}
+        # The stored object itself comes back, so its type survives.
+        assert extra["_priced_rates"] is rates
+        assert cache.get_by_key(key) == Decimal("0.5")
+
+    def test_no_extra_is_an_empty_dict(self):
+        cache = PriceCache(ttl=60)
+        key = cache.key("p/a", {"prompt": "cat"})
+        cache.set_by_key(key, Decimal("0.5"))
+        assert cache.entry_by_key(key) == (Decimal("0.5"), {})
+
+    def test_caller_cannot_change_a_stored_extra(self):
+        cache = PriceCache(ttl=60)
+        key = cache.key("p/a", {"prompt": "cat"})
+        given = {"k": 1}
+        cache.set_by_key(key, Decimal("0.5"), given)
+        given["k"] = 2
+        _, extra = cache.entry_by_key(key)
+        extra["k"] = 3
+        assert cache.entry_by_key(key)[1] == {"k": 1}
+
+    def test_expired_entry_drops_its_extra(self):
+        cache = PriceCache(ttl=60)
+        key = cache.key("p/a", {"prompt": "cat"})
+        with patch("x402gate.core.pricing.time.monotonic", return_value=1000.0):
+            cache.set_by_key(key, Decimal("0.5"), {"k": 1})
+        with patch("x402gate.core.pricing.time.monotonic", return_value=1061.0):
+            assert cache.entry_by_key(key) is None
+        assert cache.entry_by_key(key) is None
+
+    def test_disabled_cache_has_no_entry(self):
+        cache = PriceCache(ttl=0)
+        cache.set_by_key("p/a:x", Decimal("0.5"), {"k": 1})
+        assert cache.entry_by_key("p/a:x") is None
+
+    def test_eviction_still_works_with_extra(self):
+        cache = PriceCache(ttl=60, max_entries=2)
+        with patch("x402gate.core.pricing.time.monotonic", return_value=1000.0):
+            cache.set("p/a", {"x": 1}, Decimal("1"))
+        with patch("x402gate.core.pricing.time.monotonic", return_value=1061.0):
+            cache.set("p/a", {"x": 2}, Decimal("2"))
+            cache.set_by_key(cache.key("p/a", {"x": 3}), Decimal("3"), {"k": 1})
+            assert cache.get("p/a", {"x": 1}) is None
+            assert cache.get("p/a", {"x": 2}) == Decimal("2")
+            assert cache.entry_by_key(cache.key("p/a", {"x": 3})) == (Decimal("3"), {"k": 1})

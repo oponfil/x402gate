@@ -1,9 +1,11 @@
 """Solana signer fee guard, rebroadcast and blockhash expiry."""
 
 import base64
+import threading
 from types import SimpleNamespace
 
 import pytest
+from solana.rpc.commitment import Confirmed
 from solders.commitment_config import CommitmentLevel
 from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
 from solders.hash import Hash
@@ -31,6 +33,7 @@ from x402gate.core.svm_signer import (
     _SIMULATION_REUSE_S,
     _SLOW_POLL_INTERVAL_S,
     _STATUS_RETRY_DELAY_S,
+    _TERMINAL_TTL_S,
     SolanaSigner,
 )
 
@@ -238,6 +241,8 @@ def _signer(rpc: _Rpc) -> SolanaSigner:
     signer = SolanaSigner.__new__(SolanaSigner)
     signer._inflight = {}
     signer._simulated = {}
+    signer._terminal = {}
+    signer._terminal_lock = threading.Lock()
     signer._client = rpc
     return signer
 
@@ -369,7 +374,7 @@ class TestSolanaConfirm:
 
     async def test_transaction_error_does_not_rebroadcast(self, clock: dict[str, float]) -> None:
         _raw, encoded, signature = _signed_transfer()
-        rpc = _Rpc([_status(err="InstructionError")])
+        rpc = _Rpc([_status(confirmation_status="confirmed", err="InstructionError")])
         signer = _signer(rpc)
         await signer._send_async(encoded)
 
@@ -519,7 +524,12 @@ class TestTransientStatusErrors:
         self, clock: dict[str, float]
     ) -> None:
         _raw, encoded, signature = _signed_transfer()
-        rpc = _Rpc([ConnectionError("rpc down"), _status(err="InstructionError")])
+        rpc = _Rpc(
+            [
+                ConnectionError("rpc down"),
+                _status(confirmation_status="confirmed", err="InstructionError"),
+            ]
+        )
         signer = _signer(rpc)
         await signer._send_async(encoded)
 
@@ -747,6 +757,114 @@ class TestSimulationReuse:
 
         first_opts = next(event[1] for event in rpc.events if event[0] == "first")
         assert first_opts.skip_preflight is False
+        # Finalized lags ~13 s and still shows a balance a confirmed payment spent.
+        assert first_opts.preflight_commitment == Confirmed
+
+
+class TestTerminalOutcomes:
+    """A known failure is recorded so a later confirm and settle see it at once."""
+
+    async def test_landed_error_is_recorded(self, clock: dict[str, float]) -> None:
+        _ = clock
+        _raw, encoded, signature = _signed_transfer()
+        rpc = _Rpc([_status(confirmation_status="confirmed", err="InsufficientFunds")])
+        signer = _signer(rpc)
+        await signer._send_async(encoded)
+
+        with pytest.raises(RuntimeError, match="Transaction failed: InsufficientFunds"):
+            await signer._confirm_async(signature)
+
+        assert signer.terminal_failure(signature) == "Transaction failed: InsufficientFunds"
+        # The SDK's pending-store retry confirms again: no RPC, same failure.
+        rpc.events.clear()
+        with pytest.raises(RuntimeError, match="Transaction failed: InsufficientFunds"):
+            await signer._confirm_async(signature)
+        assert rpc.events == []
+
+    async def test_error_at_processed_keeps_polling(self, clock: dict[str, float]) -> None:
+        """An error on a fork that is dropped is not a known failure yet."""
+        _raw, encoded, signature = _signed_transfer()
+        rpc = _Rpc(
+            [
+                _status(confirmation_status="processed", err="InstructionError"),
+                _status(confirmation_status="confirmed"),
+            ]
+        )
+        signer = _signer(rpc)
+        await signer._send_async(encoded)
+
+        await signer._confirm_async(signature)
+
+        assert signer.terminal_failure(signature) is None
+        assert clock["t"] < 60
+
+    async def test_error_only_at_processed_until_timeout_is_unknown(
+        self, clock: dict[str, float]
+    ) -> None:
+        _raw, encoded, signature = _signed_transfer()
+        rpc = _Rpc([_status(confirmation_status="processed", err="InstructionError")] * 200)
+        signer = _signer(rpc)
+        await signer._send_async(encoded)
+
+        with pytest.raises(RuntimeError, match="not confirmed within 120s"):
+            await signer._confirm_async(signature)
+
+        assert signer.terminal_failure(signature) is None
+        assert clock["t"] >= _CONFIRM_TIMEOUT_S
+
+    async def test_expiry_is_recorded_and_answered_at_once(self, clock: dict[str, float]) -> None:
+        _raw, encoded, signature = _signed_transfer()
+        rpc = _Rpc([], blockhash_result=False)
+        signer = _signer(rpc)
+        await signer._send_async(encoded)
+
+        with pytest.raises(RuntimeError, match="blockhash no longer valid"):
+            await signer._confirm_async(signature)
+
+        assert "payment was not taken" in signer.terminal_failure(signature)
+        rpc.events.clear()
+        started = clock["t"]
+        with pytest.raises(RuntimeError, match="blockhash no longer valid"):
+            await signer._confirm_async(signature)
+        assert rpc.events == []
+        assert clock["t"] == started
+
+    async def test_timeout_is_not_a_known_failure(self, clock: dict[str, float]) -> None:
+        _ = clock
+        _raw, encoded, signature = _signed_transfer()
+        signer = _signer(_Rpc([], blockhash_result=True))
+        await signer._send_async(encoded)
+
+        with pytest.raises(RuntimeError, match="not confirmed within 120s"):
+            await signer._confirm_async(signature)
+
+        assert signer.terminal_failure(signature) is None
+
+    def test_old_records_are_dropped(self, clock: dict[str, float]) -> None:
+        signer = _signer(_Rpc([]))
+        signer._record_terminal("old", "Transaction failed: x")
+        clock["t"] += _TERMINAL_TTL_S
+        signer._record_terminal("new", "Transaction failed: y")
+
+        assert signer.terminal_failure("old") is None
+        assert signer.terminal_failure("new") == "Transaction failed: y"
+
+    async def test_replayed_expiry_outlives_the_ttl(self, clock: dict[str, float]) -> None:
+        """A client replaying an expired payload keeps the record alive with each retry."""
+        _raw, encoded, signature = _signed_transfer()
+        rpc = _Rpc([], blockhash_result=False)
+        signer = _signer(rpc)
+        await signer._send_async(encoded)
+        with pytest.raises(RuntimeError, match="blockhash no longer valid"):
+            await signer._confirm_async(signature)
+
+        for _ in range(3):
+            clock["t"] += _TERMINAL_TTL_S - 1
+            with pytest.raises(RuntimeError, match="blockhash no longer valid"):
+                await signer._confirm_async(signature)
+        signer._record_terminal("other", "Transaction failed: x")
+
+        assert "payment was not taken" in signer.terminal_failure(signature)
 
 
 class TestFeeLamports:
@@ -778,5 +896,14 @@ def test_rpc_connections_stay_open_between_payments() -> None:
     try:
         pool = signer._client._provider.session._transport._pool
         assert pool._keepalive_expiry == KEEPALIVE_EXPIRY_S
+    finally:
+        signer.close()
+
+
+def test_simulations_run_at_confirmed_commitment() -> None:
+    """Finalized would still show a balance spent in the last ~13 s."""
+    signer = SolanaSigner(str(Keypair()), "http://127.0.0.1:9")
+    try:
+        assert signer._client.commitment == Confirmed
     finally:
         signer.close()

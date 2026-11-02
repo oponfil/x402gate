@@ -9,20 +9,31 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import functools
 import hashlib
 import json
 import logging
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from typing import Any
 
+import requests
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from web3 import Web3
+from web3.exceptions import RequestTimedOut, TransactionNotFound, Web3RPCError
+from web3.providers.rpc.utils import ExceptionRetryConfiguration
 from x402 import PaymentPayload, PaymentRequirements
+from x402.mechanisms.evm.constants import TX_STATUS_SUCCESS
+from x402.mechanisms.evm.data_suffix import append_data_suffix
 from x402.mechanisms.evm.exact.facilitator import ExactEvmScheme
-from x402.mechanisms.evm.signers import FacilitatorWeb3Signer
+from x402.mechanisms.evm.signers import FacilitatorWeb3Signer, _hex_with_0x_prefix
+from x402.mechanisms.evm.types import TransactionReceipt
 from x402.mechanisms.svm.exact.facilitator import ExactSvmScheme
+from x402.mechanisms.svm.types import ExactSvmPayload
+from x402.mechanisms.svm.utils import decode_transaction_from_payload, transaction_message_hash
 
 from x402gate.core import http
 from x402gate.core.config import NetworkConfig
@@ -40,6 +51,76 @@ _PRICE_TIMEOUT_S = 5.0
 _COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
 # Two signatures, the fee of a payment without a priority fee.
 _SVM_FALLBACK_FEE_LAMPORTS = 10_000
+# The SDK waits this long for a Base receipt (its default is 120 s), and the
+# pending retry waits once more. Base makes a block every 2 s.
+_EVM_CONFIRMATION_TIMEOUT_S = 30
+# Base sends are serial, so one hung RPC call must not hold back every other
+# settlement for web3's default 30 s. Calls made under the send lock are tried
+# once, so each holds the lock for at most this long; web3 otherwise tries a
+# timed-out call 5 times. Reads and receipt polls run outside the lock.
+_EVM_RPC_TIMEOUT_S = 10
+# Attempts per Base read: one retry rides out a dropped connection or a 5xx.
+# A read timeout is not retried.
+_EVM_READ_ATTEMPTS = 2
+# Calls under the send lock stop starting lookups and resends once one send
+# has held it this long: a slow but answering RPC must not hold it for every
+# call's timeout in turn. The reservation's count read and the send itself
+# still run, so the lock is held for at most this, the call in progress at
+# the deadline, a count read and a send.
+_EVM_SEND_LOCK_BUDGET_S = 10
+# A send error with one of these means the node already has this very
+# transaction (same hash).
+_TX_KNOWN_ERRORS = (
+    "already known",
+    "alreadyknown",
+    "known transaction",
+    "already imported",
+)
+# A send error with one of these means some transaction holds the nonce: our
+# own earlier copy when this is a resend. On a first send it may also be ours:
+# web3 never retries the send here, but a load balancer in front of the node
+# may, after the sequencer took the first try.
+_NONCE_TAKEN_ERRORS = (
+    "nonce too low",
+    "replacement transaction underpriced",
+)
+# The only send errors that mean the node checked the transaction and turned
+# it away before taking it. Any other error, including a node that could not
+# forward it to the sequencer ('Post "...": context deadline exceeded', EOF,
+# "internal error"), may come after the sequencer took it, so it is unknown.
+_SEND_REFUSED_ERRORS = (
+    "insufficient funds",
+    "transaction underpriced",
+    "intrinsic gas too low",
+    "exceeds block gas limit",
+    "gas limit reached",
+    "max fee per gas less than block base fee",
+    "fee cap less than block base fee",
+    "invalid sender",
+    "invalid chain id",
+    "only replay-protected",
+    "oversized data",
+    "transaction type not supported",
+    "tx type not supported",
+    "exceeds the configured cap",
+)
+# Gas for the 0-value transfer to itself that fills a given-back nonce.
+_GAP_FILL_GAS = 21_000
+# Receipts the signer's own wait fetched, kept by hash for settle's gas cost
+# so it needs no second fetch. Each settle takes its own, so few are kept.
+_RECEIPT_CACHE_SIZE = 256
+# keccak("Transfer(address,address,uint256)"), the ERC-20 Transfer event.
+_TRANSFER_TOPIC = bytes.fromhex("ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef")
+
+# Verify, settle and receipt waits block a thread for up to a confirmation
+# timeout, so each chain has its own pool: a slow chain must not fill asyncio's
+# default pool, which also serves request hashing and other short work, nor
+# starve the other chain. The threads mostly wait on RPC replies.
+_CHAIN_WORKERS = 64
+_EXECUTORS = {
+    "evm": ThreadPoolExecutor(max_workers=_CHAIN_WORKERS, thread_name_prefix="x402-base"),
+    "svm": ThreadPoolExecutor(max_workers=_CHAIN_WORKERS, thread_name_prefix="x402-solana"),
+}
 
 # The price only converts gas to USD for the dashboard, so settlement never
 # waits for it: a stale price is refreshed in the background, and a running
@@ -124,6 +205,18 @@ def _cached_price(coin: str) -> float:
     return _price_cache[coin]
 
 
+def _evm_gas_cost(receipt: Any) -> tuple[float, float]:
+    """Gas a Base receipt paid, in ETH and in USD at the cached ETH price (0 if none)."""
+    gas_cost_native = receipt["gasUsed"] * receipt["effectiveGasPrice"] / 1e18
+    eth_price = _cached_price("ethereum")
+    return gas_cost_native, gas_cost_native * eth_price if eth_price else 0.0
+
+
+def _topic_address(topic: Any) -> str:
+    """The address in an indexed event topic, as lowercase hex without 0x."""
+    return bytes(topic)[-20:].hex()
+
+
 def _settlement_failure_reason(result: Any) -> str:
     """Build a readable reason from a failed settle result.
 
@@ -149,6 +242,19 @@ def _canonical_nonce(nonce: str) -> str:
         return bytes.fromhex(nonce.strip().removeprefix("0x").removeprefix("0X")).hex()
     except ValueError:
         return nonce.lower()
+
+
+_PERMIT2_REFUSED = "unsupported_payload: Permit2 is not accepted"
+
+
+def _is_permit2(payload_dict: Any) -> bool:
+    """True for a Permit2 payload, which the gateway never advertises.
+
+    The SDK routes any payload carrying ``permit2Authorization`` to its Permit2
+    path, and payment_key cannot identify such a payment by payer and nonce.
+    """
+    inner = payload_dict.get("payload") if isinstance(payload_dict, dict) else None
+    return isinstance(inner, dict) and "permit2Authorization" in inner
 
 
 def payment_key(payment_signature: str) -> str:
@@ -262,12 +368,411 @@ class _NetworkScheme:
     """Holds a network's scheme, signer, and config for verify/settle."""
 
     def __init__(
-        self, net_cfg: NetworkConfig, scheme: Any, w3: Any = None, svm_signer: Any = None
+        self,
+        net_cfg: NetworkConfig,
+        scheme: Any,
+        w3: Any = None,
+        svm_signer: Any = None,
+        evm_signer: Any = None,
     ) -> None:
         self.config = net_cfg
         self.scheme = scheme
         self.w3 = w3  # Web3 instance (EVM only, for gas queries)
         self.svm_signer = svm_signer  # SolanaSigner instance (SVM only, for tx fee queries)
+        self.evm_signer = evm_signer  # _ResyncingWeb3Signer (EVM only, for resends)
+
+    async def run(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
+        """Run a blocking call on this chain's thread pool."""
+        loop = asyncio.get_running_loop()
+        executor = _EXECUTORS.get(self.config.type)
+        return await loop.run_in_executor(executor, functools.partial(fn, *args, **kwargs))
+
+    def resend_unconfirmed(self) -> None:
+        """Send again the Base transactions whose send had no clear answer. Never raises.
+
+        Blocking: run it on the chain's pool.
+        """
+        if self.evm_signer is None:
+            return
+        try:
+            self.evm_signer.resend_unconfirmed()
+        except Exception as e:
+            logger.warning("Resend of unconfirmed Base sends failed: %s", e)
+
+    def receipt_for_gas(self, tx_hash: str) -> Any:
+        """The receipt of a confirmed Base transaction, for its gas cost.
+
+        The SDK's confirmation wait already fetched it, so it comes from the
+        signer; only a receipt it does not hold costs one RPC call. Blocking.
+        """
+        if self.evm_signer is not None:
+            receipt = self.evm_signer.take_receipt(tx_hash)
+            if receipt is not None:
+                return receipt
+        return self.w3.eth.get_transaction_receipt(tx_hash)
+
+    def terminal_failure(self, result: Any) -> str | None:
+        """Return why a pending Solana settle failed for certain, if it did.
+
+        The SDK reports every confirm error as settlement_pending, including
+        a transaction that landed with an error or expired unlanded. The
+        signer records those, so they are a known failure, not an unknown one.
+        """
+        if self.svm_signer is None or getattr(result, "error_reason", "") != "settlement_pending":
+            return None
+        signature = getattr(result, "transaction", "") or ""
+        return self.svm_signer.terminal_failure(signature) if signature else None
+
+    def forget_pending(self, payload: PaymentPayload) -> None:
+        """Drop the SDK's pending entry for a Solana payment known to have failed.
+
+        Otherwise a replay of the same payload skips verify and only waits on
+        the old signature again, and once the signer's record of the failure
+        is gone that wait times out as unknown. Without the entry, the replay
+        is verified again and refused (expired blockhash, or already processed).
+        """
+        store = getattr(self.scheme, "_pending_store", None)
+        if store is None:
+            return
+        try:
+            tx = decode_transaction_from_payload(ExactSvmPayload.from_dict(payload.payload))
+            store.delete(transaction_message_hash(tx))
+        except Exception as e:
+            logger.warning("Could not drop the pending Solana settlement: %s", e)
+
+
+def _send_outcome(error: Exception) -> str:
+    """Sort a failed Base send: "known", "taken", "refused" or "unknown".
+
+    "known": the node already has this transaction. "taken": some transaction
+    holds the nonce. "refused": the node checked the transaction and turned it
+    away (only the errors in _SEND_REFUSED_ERRORS). "unknown": anything else,
+    such as a timeout, a dropped connection, a 5xx from a load balancer, or a
+    JSON-RPC error from a replica whose forward to the sequencer failed; the
+    transaction may have arrived.
+    """
+    if not isinstance(error, Web3RPCError) or isinstance(error, RequestTimedOut):
+        return "unknown"
+    message = str(error).lower()
+    if any(s in message for s in _TX_KNOWN_ERRORS):
+        return "known"
+    # Before the refusals: "replacement transaction underpriced" contains
+    # "transaction underpriced".
+    if any(s in message for s in _NONCE_TAKEN_ERRORS):
+        return "taken"
+    if any(s in message for s in _SEND_REFUSED_ERRORS):
+        return "refused"
+    return "unknown"
+
+
+def _evm_chain_id(network: str) -> int | None:
+    """The chain id in a CAIP-2 "eip155:<id>" network, or None for any other form."""
+    namespace, _, reference = network.partition(":")
+    if namespace != "eip155" or not reference.isdigit():
+        return None
+    return int(reference)
+
+
+class _ResyncingWeb3Signer(FacilitatorWeb3Signer):
+    """FacilitatorWeb3Signer that leaves no nonce gap and reports no sent transfer as failed.
+
+    The SDK reserves a nonce before it reads the gas price and sends, and
+    resyncs only when the chain's pending count is above its own, so one failed
+    send left a gap that every later settlement queued behind. Here the gas
+    price and chain id are read first, and sends are serial from the
+    reservation to the node's reply, so a nonce the node refused is given back
+    while no later one is out: the cursor steps back and nothing queues behind
+    it. Only a refusal the node gives before taking a transaction (insufficient
+    funds, underpriced and the like), with the node also not having it, gives
+    the nonce back and fails the send. Any other error, such as a timeout, a
+    dropped connection, a 5xx or a replica's failed forward to the sequencer,
+    keeps the nonce and returns the hash, and the receipt wait decides: a
+    transfer that may land is not reported as failed. Such a transaction is
+    sent again before the next nonce, before a pending settle's second wait,
+    and on each reconcile poll that finds no receipt, which fills its nonce if
+    it never arrived. If such a resend is refused, its nonce is given back;
+    when a later nonce is already out, the resend outside a send fills it with
+    a 0-value transfer to the facilitator's own address, so the later ones do
+    not queue behind it until the next settlement. A send told that another
+    transaction holds its nonce is never signed again at a new one: the holder
+    may be this very transfer, and a second copy of the authorization would
+    revert and read as a failed payment. Calls under the send lock are tried
+    once, and lookups and resends stop after _EVM_SEND_LOCK_BUDGET_S, so one
+    send holds the lock for a few RPC timeouts at most.
+
+    Every transaction is signed with a chain id (EIP-155), so it cannot be
+    replayed on another chain: the SDK's send_transaction signs a bare legacy
+    transaction without one. The id comes from the configured network, or is
+    read from the node once and cached when none is given.
+    """
+
+    def __init__(self, *args: Any, chain_id: int | None = None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # The SDK's get_chain_id cache: seeded from the network, it needs no RPC.
+        if chain_id is not None:
+            self._chain_id = chain_id
+        endpoint = self._w3.provider.endpoint_uri
+        self._w3.provider = Web3.HTTPProvider(
+            endpoint,
+            request_kwargs={"timeout": _EVM_RPC_TIMEOUT_S},
+            exception_retry_configuration=ExceptionRetryConfiguration(
+                errors=(ConnectionError, requests.ConnectionError, requests.HTTPError),
+                retries=_EVM_READ_ATTEMPTS,
+            ),
+        )
+        # Every call made under the send lock goes here and is tried once.
+        self._send_w3 = Web3(
+            Web3.HTTPProvider(
+                endpoint,
+                request_kwargs={"timeout": _EVM_RPC_TIMEOUT_S},
+                exception_retry_configuration=None,
+            )
+        )
+        # Held from the nonce reservation to the node's reply.
+        self._send_lock = threading.Lock()
+        # Nonces handed out and given back while a later one was in use.
+        self._free_nonces: set[int] = set()
+        # Signed transactions the node could not confirm it took, by nonce.
+        self._unconfirmed: dict[int, bytes] = {}
+        # Raw receipts of confirmed transactions, by hash, for settle's gas cost.
+        self._receipts: dict[str, Any] = {}
+        self._receipts_lock = threading.Lock()
+
+    def _reserve_nonce(self, gap_only: bool = False) -> int | None:
+        """The next nonce to send at; with ``gap_only``, only a given-back one, else None."""
+        with self._nonce_lock:
+            pending = self._send_w3.eth.get_transaction_count(self._account.address, "pending")
+            # A returned nonce the chain has used since is not reused.
+            self._free_nonces = {n for n in self._free_nonces if n >= pending}
+            if self._free_nonces:
+                nonce = min(self._free_nonces)
+                self._free_nonces.discard(nonce)
+                return nonce
+            if gap_only:
+                return None
+            if self._next_nonce is None or pending > self._next_nonce:
+                self._next_nonce = pending
+            nonce = self._next_nonce
+            self._next_nonce = nonce + 1
+            return nonce
+
+    def _release_nonce(self, nonce: int) -> None:
+        with self._nonce_lock:
+            self._free_nonces.add(nonce)
+            # Step the cursor back over returned nonces at the top.
+            while self._next_nonce is not None and self._next_nonce - 1 in self._free_nonces:
+                self._next_nonce -= 1
+                self._free_nonces.discard(self._next_nonce)
+
+    def write_contract(
+        self,
+        address: str,
+        abi: list[dict[str, Any]],
+        function_name: str,
+        *args: Any,
+        data_suffix: str | None = None,
+    ) -> str:
+        contract = self._w3.eth.contract(address=Web3.to_checksum_address(address), abi=abi)
+        func = getattr(contract.functions, function_name)
+        # Read (and cached) here, so building under the send lock calls no RPC.
+        chain_id = self.get_chain_id()
+
+        def build(fields: dict[str, Any]) -> dict[str, Any]:
+            tx = func(*args).build_transaction({**fields, "chainId": chain_id})
+            if data_suffix:
+                calldata = tx["data"]
+                if isinstance(calldata, (bytes, bytearray)):
+                    calldata = "0x" + bytes(calldata).hex()
+                tx["data"] = append_data_suffix(calldata, data_suffix)
+            return tx
+
+        return self._sign_and_send(build)
+
+    def send_transaction(self, to: str, data: bytes) -> str:
+        # Read (and cached) here, so building under the send lock calls no RPC.
+        chain_id = self.get_chain_id()
+        to = Web3.to_checksum_address(to)
+        return self._sign_and_send(
+            lambda fields: {**fields, "to": to, "data": data, "chainId": chain_id}
+        )
+
+    def _sign_and_send(self, build: Any) -> str:
+        """Build, sign and send one transaction; give its nonce back if it was not sent."""
+        gas_price = self._w3.eth.gas_price
+        with self._send_lock:
+            deadline = time.monotonic() + _EVM_SEND_LOCK_BUDGET_S
+            self._resend_unconfirmed(deadline)
+            return self._send_at(self._reserve_nonce(), build, gas_price, deadline)
+
+    def _send_at(self, nonce: int, build: Any, gas_price: int, deadline: float) -> str:
+        """Sign and send at a reserved nonce; give it back if the node refused the send.
+
+        Called under the send lock. Returns the transaction hash whenever the
+        transaction may land, and the receipt wait decides.
+        """
+        fields = {
+            "from": self._account.address,
+            "nonce": nonce,
+            "gas": self._gas_limit,
+            "gasPrice": gas_price,
+        }
+        try:
+            signed_tx = self._account.sign_transaction(build(fields))
+        except Exception:
+            self._release_nonce(nonce)
+            raise
+        try:
+            tx_hash = self._send_w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+        except Exception as e:
+            outcome = _send_outcome(e)
+            if outcome in ("refused", "taken"):
+                found = self._node_has(signed_tx.hash, deadline)
+                if found is False and outcome == "refused":
+                    # The node turned it away and does not have it.
+                    self._release_nonce(nonce)
+                    raise
+                if found is None:
+                    outcome = "unknown"
+                # found is False with the nonce taken: the holder may be this
+                # very transaction, delivered by an upstream retry of the send
+                # and missed by a lagging replica's lookup. It is not signed
+                # again at a new nonce, since a second copy of the same
+                # authorization would revert and read as a failed payment. The
+                # nonce stays used, and resending cannot help.
+            if outcome == "unknown":
+                # It may have arrived: keep the nonce and send it again
+                # before the next nonce, which fills it if it never did.
+                self._unconfirmed[nonce] = bytes(signed_tx.raw_transaction)
+            # Only the reply may be lost: the receipt wait decides.
+            logger.warning("Base send of nonce %d got no clear answer (%s), awaiting it", nonce, e)
+            return _hex_with_0x_prefix(signed_tx.hash)
+        return _hex_with_0x_prefix(tx_hash)
+
+    def resend_unconfirmed(self) -> None:
+        """Send again each transaction whose send had no clear answer, then fill any gap.
+
+        Without this, such a transaction went out again only before the next
+        settlement's send, so on a quiet gateway it was never sent. It reuses
+        the signed bytes and nonce, so it cannot pay twice. A resend the node
+        refuses gives its nonce back, and with a later nonce already out
+        nothing but a new send would fill it: the later transfers would queue
+        behind it until their authorizations expire. So the lowest given-back
+        nonce gets a 0-value transfer to the facilitator's own address.
+        """
+        # A given-back nonce below the cursor means a later one was reserved:
+        # _release_nonce steps the cursor back over given-back nonces at the top.
+        if not self._unconfirmed and not self._free_nonces:
+            return
+        try:
+            # Read before the lock, as for a send.
+            gas_price = self._w3.eth.gas_price
+            chain_id = self.get_chain_id()
+        except Exception as e:
+            logger.warning("Base gas price read failed, gap fill skipped: %s", e)
+            gas_price = None
+        with self._send_lock:
+            deadline = time.monotonic() + _EVM_SEND_LOCK_BUDGET_S
+            self._resend_unconfirmed(deadline)
+            if gas_price is None or not self._free_nonces or time.monotonic() >= deadline:
+                return
+            nonce = self._reserve_nonce(gap_only=True)
+            if nonce is None:
+                return
+            to = self._account.address
+            try:
+                tx_hash = self._send_at(
+                    nonce,
+                    lambda fields: {
+                        **fields,
+                        "gas": _GAP_FILL_GAS,
+                        "to": to,
+                        "value": 0,
+                        "chainId": chain_id,
+                    },
+                    gas_price,
+                    deadline,
+                )
+            except Exception as e:
+                # Given back: the next call or send tries again.
+                logger.warning("Base nonce %d gap fill failed: %s", nonce, e)
+                return
+            logger.warning("Base nonce %d gap filled by transaction %s", nonce, tx_hash)
+
+    def _resend_unconfirmed(self, deadline: float) -> None:
+        """Send again each unconfirmed transaction the chain has not counted yet.
+
+        Called under the send lock. After ``deadline`` no resend or lookup
+        starts: the rest are kept for the next call.
+        """
+        if not self._unconfirmed:
+            return
+        try:
+            pending = self._send_w3.eth.get_transaction_count(self._account.address, "pending")
+        except Exception as e:
+            # Keep them for the next send; this one still reserves a nonce.
+            logger.warning("Base nonce read failed, resend of unconfirmed sends skipped: %s", e)
+            return
+        for nonce, raw in sorted(self._unconfirmed.items()):
+            if nonce >= pending:
+                if time.monotonic() >= deadline:
+                    break
+                try:
+                    self._send_w3.eth.send_raw_transaction(raw)
+                except Exception as e:
+                    outcome = _send_outcome(e)
+                    if outcome == "refused":
+                        found = self._node_has(Web3.keccak(raw), deadline)
+                        if found is False:
+                            # Refused: the nonce is free, and the next send or
+                            # resend_unconfirmed's gap fill takes it.
+                            self._release_nonce(nonce)
+                        elif found is None:
+                            break
+                    elif outcome == "unknown":
+                        # Still no answer: keep this and the later ones for the
+                        # next send rather than wait on each under the lock.
+                        break
+                    # "known" or "taken": the node or the chain holds the nonce.
+            del self._unconfirmed[nonce]
+
+    def wait_for_transaction_receipt(self, tx_hash: str) -> TransactionReceipt:
+        """The SDK's receipt wait, keeping the raw receipt for settle's gas cost."""
+        if not tx_hash.startswith("0x"):
+            tx_hash = "0x" + tx_hash
+        receipt = self._w3.eth.wait_for_transaction_receipt(
+            tx_hash, timeout=self._confirmation_timeout_seconds
+        )
+        with self._receipts_lock:
+            self._receipts[tx_hash.lower()] = receipt
+            while len(self._receipts) > _RECEIPT_CACHE_SIZE:
+                del self._receipts[next(iter(self._receipts))]
+        return TransactionReceipt(
+            status=TX_STATUS_SUCCESS if receipt["status"] == 1 else 0,
+            block_number=receipt["blockNumber"],
+            tx_hash=tx_hash,
+            logs=list(receipt.get("logs") or []),
+        )
+
+    def take_receipt(self, tx_hash: str) -> Any:
+        """The raw receipt the receipt wait fetched for ``tx_hash`` (removed), or None."""
+        key = tx_hash.lower() if tx_hash.startswith("0x") else "0x" + tx_hash.lower()
+        with self._receipts_lock:
+            return self._receipts.pop(key, None)
+
+    def _node_has(self, tx_hash: Any, deadline: float | None = None) -> bool | None:
+        """Whether the node has the transaction, or None when it did not answer.
+
+        Also None, with no call, once ``deadline`` (a monotonic time) has passed.
+        """
+        if deadline is not None and time.monotonic() >= deadline:
+            return None
+        try:
+            self._send_w3.eth.get_transaction(tx_hash)
+        except TransactionNotFound:
+            return False
+        except Exception:
+            return None
+        return True
 
 
 class PaymentHandler:
@@ -306,14 +811,18 @@ class PaymentHandler:
     def _init_evm(self, name: str, cfg: NetworkConfig) -> None:
         """Initialize an EVM network (Base, Ethereum, etc.)."""
 
-        signer = FacilitatorWeb3Signer(
+        signer = _ResyncingWeb3Signer(
             private_key=cfg.facilitator_key,
             rpc_url=cfg.rpc_url,
+            confirmation_timeout_seconds=_EVM_CONFIRMATION_TIMEOUT_S,
+            chain_id=_evm_chain_id(cfg.network),
         )
-        w3 = Web3(Web3.HTTPProvider(cfg.rpc_url))
         scheme = ExactEvmScheme(signer)
 
-        self._schemes[cfg.network] = _NetworkScheme(cfg, scheme, w3=w3)
+        # Reads share the signer's bounded provider: web3's default tries a
+        # timed-out call 5 times at 30 s each, which held a Base pool thread
+        # about 150 s per receipt poll or balance check on a hung RPC.
+        self._schemes[cfg.network] = _NetworkScheme(cfg, scheme, w3=signer._w3, evm_signer=signer)
         logger.info(
             "EVM network '%s' initialized (address=%s, network=%s)",
             name,
@@ -449,11 +958,15 @@ class PaymentHandler:
                 logger.warning("Payment on unsupported network: %s", network)
                 return False, network, "", "unsupported_network"
 
+            if _is_permit2(payload_dict):
+                logger.warning("Payment rejected on %s: Permit2 is not accepted", network)
+                return False, network, "", _PERMIT2_REFUSED
+
             payload = PaymentPayload.model_validate(payload_dict)
             requirements_dict = self._build_requirements(price, ns)
             requirements = PaymentRequirements.model_validate(requirements_dict)
 
-            result = await asyncio.to_thread(ns.scheme.verify, payload, requirements)
+            result = await ns.run(ns.scheme.verify, payload, requirements)
             amount_usdc = int(requirements.amount) / 1_000_000
             payer = getattr(result, "payer", "") or ""
             invalid_reason = getattr(result, "invalid_reason", "") or ""
@@ -507,9 +1020,7 @@ class PaymentHandler:
             try:
                 bal_sig = ns.w3.keccak(text="balanceOf(address)")[:4]
                 data = bal_sig + bytes(12) + bytes.fromhex(payer[2:])
-                raw = await asyncio.to_thread(
-                    ns.w3.eth.call, {"to": ns.config.token_address, "data": data}
-                )
+                raw = await ns.run(ns.w3.eth.call, {"to": ns.config.token_address, "data": data})
                 balance = int.from_bytes(raw, "big")
                 required = int(amount * 1_000_000)
                 if balance < required:
@@ -559,17 +1070,33 @@ class PaymentHandler:
                 logger.error("Cannot settle — unknown network: %s", network)
                 return None
 
+            if _is_permit2(payload_dict):
+                # verify refuses these first; a None here would read as unknown.
+                logger.error("Cannot settle — Permit2 payload on %s", network)
+                return {"success": False, "error_reason": _PERMIT2_REFUSED, "pending": False}
+
             payload = PaymentPayload.model_validate(payload_dict)
             requirements_dict = self._build_requirements(price, ns)
             requirements = PaymentRequirements.model_validate(requirements_dict)
 
-            result = await asyncio.to_thread(ns.scheme.settle, payload, requirements)
-            if not result.success and getattr(result, "error_reason", "") == "settlement_pending":
+            result = await ns.run(ns.scheme.settle, payload, requirements)
+            known_failure = ns.terminal_failure(result)
+            if (
+                known_failure is None
+                and not result.success
+                and getattr(result, "error_reason", "") == "settlement_pending"
+            ):
                 # Broadcast, but the confirmation wait failed. The SDK keeps the
                 # transaction, and settling the same payload again waits for it
                 # instead of sending a new one.
                 logger.warning("Settlement pending on %s; waiting for it once more", network)
-                result = await asyncio.to_thread(ns.scheme.settle, payload, requirements)
+                # A send that may never have reached the node goes out again
+                # first, so it can still land within this wait.
+                await ns.run(ns.resend_unconfirmed)
+                result = await ns.run(ns.scheme.settle, payload, requirements)
+                known_failure = ns.terminal_failure(result)
+            if known_failure is not None:
+                ns.forget_pending(payload)
             amount_usdc = int(requirements.amount) / 1_000_000
             settle_data = result.__dict__.copy()
 
@@ -581,15 +1108,8 @@ class PaymentHandler:
 
                 if ns.config.type == "evm" and ns.w3:
                     try:
-                        receipt = await asyncio.to_thread(
-                            ns.w3.eth.wait_for_transaction_receipt,
-                            result.transaction,
-                            timeout=30,
-                        )
-                        gas_cost_wei = receipt.gasUsed * receipt.effectiveGasPrice
-                        gas_cost_native = gas_cost_wei / 1e18
-                        eth_price = _cached_price("ethereum")
-                        gas_cost_usd = gas_cost_native * eth_price if eth_price else 0
+                        receipt = await ns.run(ns.receipt_for_gas, result.transaction)
+                        gas_cost_native, gas_cost_usd = _evm_gas_cost(receipt)
                         gas_label = "ETH"
                     except Exception as e:
                         logger.warning("EVM gas cost lookup failed: %s", e)
@@ -644,6 +1164,10 @@ class PaymentHandler:
                 )
             else:
                 reason = _settlement_failure_reason(result)
+                if known_failure is not None:
+                    # Landed with an error or expired: no payment was taken,
+                    # and a later confirm of it fails at once.
+                    reason = f"transaction_failed: {known_failure}"
                 logger.warning(
                     "Settlement failed: $%.6f USDC from %s on %s -- %s",
                     amount_usdc,
@@ -652,9 +1176,64 @@ class PaymentHandler:
                     reason,
                 )
                 settle_data["error_reason"] = reason
-                settle_data["pending"] = getattr(result, "error_reason", "") == "settlement_pending"
+                settle_data["pending"] = (
+                    known_failure is None
+                    and getattr(result, "error_reason", "") == "settlement_pending"
+                )
             return settle_data
 
         except Exception:
             logger.exception("Payment settlement failed")
             return None
+
+    async def settlement_receipt(
+        self, network: str, tx_hash: str, payer: str, amount: Decimal
+    ) -> dict[str, Any] | None:
+        """Look up a broadcast Base settlement by its transaction hash.
+
+        Returns a settlement dict shaped like :meth:`settle`'s. It is a
+        success only when the receipt shows ``amount`` of USDC moving from
+        ``payer`` to the gateway, and a failure when the transaction reverted
+        or moved anything else. None while no receipt is found: not mined
+        yet, or the RPC failed. The RPC calls run on the Base pool.
+
+        With no receipt found, the signer's transactions whose send had no
+        clear answer are sent again, so a reconcile keeps sending a transfer
+        that may never have reached the node until it lands or expires.
+        """
+        ns = self._schemes.get(network)
+        if ns is None or ns.w3 is None:
+            return None
+        try:
+            receipt = await ns.run(ns.w3.eth.get_transaction_receipt, tx_hash)
+        except Exception as e:  # TransactionNotFound, or an RPC error
+            logger.debug("No receipt yet for Base tx %s: %s", tx_hash, e)
+            receipt = None
+        if receipt is None:
+            await ns.run(ns.resend_unconfirmed)
+            return None
+        payer_hex = payer.lower().removeprefix("0x")
+        pay_to_hex = ns.config.pay_to.lower().removeprefix("0x")
+        token = ns.config.token_address.lower()
+        atomic = int(amount * 1_000_000)
+        landed = receipt["status"] == 1 and any(
+            str(log["address"]).lower() == token
+            and len(log["topics"]) == 3
+            and bytes(log["topics"][0]) == _TRANSFER_TOPIC
+            and _topic_address(log["topics"][1]) == payer_hex
+            and _topic_address(log["topics"][2]) == pay_to_hex
+            and int.from_bytes(bytes(log["data"]), "big") == atomic
+            for log in receipt["logs"]
+        )
+        gas_cost_native, gas_cost_usd = _evm_gas_cost(receipt)
+        return {
+            "success": landed,
+            "transaction": tx_hash,
+            "error_reason": None if landed else "transaction_failed: no matching transfer",
+            "pending": False,
+            "amount_usdc": float(amount),
+            "gas_cost_native": gas_cost_native,
+            "gas_cost_usd": gas_cost_usd,
+            "gas_label": "ETH",
+            "network_type": ns.config.type,
+        }

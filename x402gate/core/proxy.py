@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from typing import Any
 
 import httpx
@@ -242,7 +243,9 @@ async def poll_result(
 
     The first poll comes shortly after submit and the gaps grow from
     ``_EARLY_POLL_INTERVAL_S`` to poll_interval, so a short job is seen
-    finished soon after it is.
+    finished soon after it is. The time counted against poll_timeout takes
+    in the poll requests as well as the sleeps, and the last poll comes at
+    the deadline, so a task that finished during the last sleep is returned.
 
     Args:
         base_url: Provider API base URL.
@@ -274,9 +277,10 @@ async def poll_result(
 
     # The pooled client keeps the connection open between polls; never close it.
     client = http.shared_client()
-    while elapsed < poll_timeout:
+    while True:
         poll_count += 1
         failed_transiently = False
+        requested_at = time.monotonic()
         try:
             response = await client.get(
                 url,
@@ -436,20 +440,22 @@ async def poll_result(
             failed_transiently = True
             # Fall through to sleep and retry
 
+        # A slow poll (up to the 30s timeout) counts too, so polling ends
+        # near poll_timeout of real time. Sleeps are counted as asked for.
+        elapsed += time.monotonic() - requested_at
+        if elapsed >= poll_timeout:
+            break
         transient = transient + 1 if failed_transiently else 0
         delay = interval
         interval = min(interval * _POLL_INTERVAL_GROWTH, poll_interval)
         if transient:
             # Rate limits and outages back off from the full interval.
             delay = min(poll_interval * 2**transient, max(poll_interval, _MAX_POLL_BACKOFF))
-        # Do not sleep past the deadline.
+        # Do not sleep past the deadline; the loop polls once more there.
         delay = min(delay, poll_timeout - elapsed)
         await asyncio.sleep(delay)
-        # NOTE: elapsed counts sleep time only, not HTTP request duration.
-        # Real wall-clock time may be higher if requests are slow (up to
-        # 30s httpx timeout each).  Actual user-facing latency is tracked
-        # via time.monotonic() in app.py, not here. Rounded so the float sum
-        # lands on poll_timeout exactly instead of a hair below it.
+        # Rounded so the float sum lands on poll_timeout exactly instead of
+        # a hair below it.
         elapsed = round(elapsed + delay, 6)
 
     logger.error(

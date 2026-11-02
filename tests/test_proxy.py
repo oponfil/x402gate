@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import pytest
@@ -31,15 +31,25 @@ async def _send(post: AsyncMock, *, idempotent: bool = False) -> dict:
         )
 
 
-async def _poll(get: AsyncMock, *, poll_interval: int = 2, poll_timeout: int = 60):
+async def _poll(
+    get: AsyncMock, *, poll_interval: int = 2, poll_timeout: int = 60, request_s: float = 0.0
+):
     """Run poll_result against mocked responses; return (result or error, sleeps).
 
-    The sleeps leave out the short pause before the first poll.
+    Each poll request takes ``request_s`` on a fake clock. The sleeps leave
+    out the short pause before the first poll.
     """
     sleep = AsyncMock()
+    clock = [0.0]
+
+    async def timed_get(*args, **kwargs):
+        clock[0] += request_s
+        return await get(*args, **kwargs)
+
     with (
-        patch("httpx.AsyncClient.get", get),
+        patch("httpx.AsyncClient.get", AsyncMock(side_effect=timed_get)),
         patch("x402gate.core.proxy.asyncio.sleep", sleep),
+        patch("x402gate.core.proxy.time", Mock(monotonic=lambda: clock[0])),
     ):
         try:
             outcome = await poll_result(
@@ -174,8 +184,25 @@ class TestPollResult:
         outcome, sleeps = await _poll(get, poll_timeout=20)
         assert isinstance(outcome, TaskTimeoutError)
         assert outcome_unknown(outcome) is True
-        # The last wait is cut short at the deadline (0.3 s went before the first poll).
+        # The last wait is cut short at the deadline (0.3 s went before the
+        # first poll), and one more poll comes there.
         assert sum(sleeps) == pytest.approx(20 - 0.3)
+        assert get.call_count == 4
+
+    async def test_task_finished_in_the_last_wait_is_returned(self):
+        """The deadline gets a poll of its own, so a finished task is not lost."""
+        get = AsyncMock(side_effect=[httpx.Response(500, text="down")] * 3 + [_status("completed")])
+        result, sleeps = await _poll(get, poll_timeout=20)
+        assert result["status"] == "completed"
+        assert sleeps[-1] == pytest.approx(20 - 0.3 - 4 - 8)
+
+    async def test_slow_polls_count_against_the_timeout(self):
+        """Polling ends near poll_timeout of real time, not of sleep time alone."""
+        get = AsyncMock(return_value=_status("processing"))
+        outcome, sleeps = await _poll(get, poll_timeout=30, request_s=10)
+        assert isinstance(outcome, TaskTimeoutError)
+        # 0.3 + 10 + 0.4 + 10 + 0.6 + 10: the third poll ends past 30 s
+        assert sleeps == pytest.approx([0.4, 0.6])
         assert get.call_count == 3
 
     async def test_not_found_right_after_creation_is_tolerated(self):

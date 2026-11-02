@@ -11,7 +11,12 @@ gateway:
   default_web_search_max_results: 3   # default max_results when client omits it
   web_search_cost_per_result: 0.004   # $0.004 per result (OpenRouter Exa: $4/1000)
   price_cache_ttl: 60        # seconds, price cache TTL (0 = disabled)
-  max_upload_mb: 300         # max file upload size in MB (all in RAM, no disk on Railway)
+  # Max file upload size in MB (CloudConvert multipart; other providers get 400
+  # unread). Enforced while the body is read (413), with or without
+  # Content-Length. The file is held in RAM until paid: unpaid uploads together
+  # may hold 2 slots x 2 x (max_upload_mb + 1 MB), about 1.2 GB at 300; past
+  # that the gateway answers 503 with Retry-After: 5.
+  max_upload_mb: 300
   max_json_mb: 40            # max JSON request body in MB (fits 25 MB of base64 STT audio)
   max_prepaid_topup: 10.0    # max single top-up amount in USD
   min_prepaid_topup: 0.10    # min single top-up amount in USD

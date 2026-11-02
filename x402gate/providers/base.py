@@ -14,7 +14,7 @@ from typing import Any
 import httpx
 
 from x402gate.core.config import ProviderConfig
-from x402gate.core.proxy import TaskTimeoutError
+from x402gate.core.proxy import _GATEWAY_TIMEOUT_STATUSES, TaskTimeoutError, UpstreamMayHaveRun
 
 # Transport failures that happen after the request was sent. The provider may
 # have accepted it and started (and billed) the job.
@@ -147,16 +147,54 @@ def require_text(inputs: dict[str, Any], provider_name: str) -> str:
         The non-empty text string.
 
     Raises:
-        ProviderError: If ``text`` is missing or empty.
+        ProviderError: If ``text`` is missing, blank or not a string.
     """
     text = inputs.get("text", "")
-    if not text:
+    # A list or number would be priced by len() of the wrong thing.
+    if not isinstance(text, str) or not text.strip():
         raise ProviderError(
             provider=provider_name,
             detail="Request body must contain non-empty 'text' field",
             status_code=400,
         )
     return text
+
+
+def optional_str(inputs: dict[str, Any], key: str, provider_name: str) -> str:
+    """Return an optional string field, ``""`` when missing or null.
+
+    Checked in get_price(), before payment: any other type would crash a
+    later ``.lower()`` or header with a 500, or reach the provider after
+    the client paid.
+
+    Raises:
+        ProviderError: 400 if the field is present but not a string.
+    """
+    value = inputs.get(key)
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ProviderError(
+            provider=provider_name,
+            detail=f"'{key}' must be a string",
+            status_code=400,
+        )
+    return value
+
+
+def raise_for_gateway_timeout(status_code: int, provider_name: str, label: str) -> None:
+    """Raise an unknown-outcome ProviderError for a 504/520/524 answer.
+
+    A proxy in front of the provider gave up after the request was
+    forwarded, so the job may still run and be billed, as after our own
+    read timeout. Chained to UpstreamMayHaveRun so the payment is kept.
+    """
+    if status_code in _GATEWAY_TIMEOUT_STATUSES:
+        raise ProviderError(
+            provider=provider_name,
+            detail=f"{label} gateway timeout ({status_code})",
+            status_code=504,
+        ) from UpstreamMayHaveRun(f"Gateway timeout {status_code}")
 
 
 def outcome_unknown(exc: BaseException) -> bool:

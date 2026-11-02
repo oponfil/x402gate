@@ -451,3 +451,26 @@ class TestPooledClient:
         with pytest.raises(ProviderError) as caught:
             await provider.submit("download", {"url": "https://youtu.be/x"})
         assert outcome_unknown(caught.value) is False
+
+
+class TestGatewayTimeout:
+    """A gateway timeout came after the call was forwarded: outcome unknown."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [504, 520, 524])
+    async def test_gateway_timeout_keeps_the_payment(self, status):
+        response = MagicMock(status_code=status, text="Gateway Timeout")
+        with _rapidapi_answers(response), pytest.raises(ProviderError) as caught:
+            await _make_provider().submit("download", {"url": "https://x.com/a/status/1"})
+        assert caught.value.status_code == 504
+        assert outcome_unknown(caught.value) is True
+        response.json.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [500, 502, 503, 521])
+    async def test_other_server_errors_are_refunded(self, status):
+        response = MagicMock(status_code=status, text="down")
+        with _rapidapi_answers(response), pytest.raises(ProviderError) as caught:
+            await _make_provider().submit("download", {"url": "https://x.com/a/status/1"})
+        assert caught.value.status_code == status
+        assert outcome_unknown(caught.value) is False

@@ -14,9 +14,10 @@ import asyncio
 import base64
 import json
 import logging
+import math
 import re
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -47,17 +48,15 @@ _CONNECT_RETRY_DELAY = 2.0
 # does not start a fetch on every request.
 _CATALOG_RETRY_S = 60.0
 
-# A request may be priced from the catalog a refresh then replaced (a cached
-# price lives 60 s by default, and verify and settle run in between), so for
-# this long the endpoint cap in submit is never above the replaced rates.
+# A price served from the app's price cache may come from the catalog a
+# refresh then replaced (a cached price lives 60 s by default, and verify and
+# settle run in between), so for this long the endpoint cap of a request
+# without the rates get_price stored is never above the replaced rates.
 _CAP_GRACE_S = 180.0
 
 # A 5xx body that reports a timeout ("Gateway Time-out", "upstream timed
 # out") means the request was forwarded and may have run.
 _TIMEOUT_BODY = re.compile(r"timed?[\s_-]?out", re.IGNORECASE)
-
-# Embeddings keep the loose 4-character rule.
-_CHARS_PER_TOKEN = 4
 
 # Chat text is weighed per character class, in units of 1/270 token, so every
 # rate below is an exact integer and sums never round. Chat prompts in ASCII,
@@ -115,6 +114,18 @@ _RARE_FOUR_BYTE = re.compile(r"[\U000e0000-\U000e01ef\U000f0000-\U0010ffff]")
 # except values at or above this, which are the hourly rate (MAI-Transcribe).
 _HOURLY_STT_PRICE = Decimal("0.01")
 
+# Pricing a transcription decodes up to 25 MB of base64 and parses the audio
+# in a worker thread, before any payment. At most this many run at once, and
+# a request that finds them busy for _STT_PRICING_WAIT_S gets a 429, so
+# unpaid price requests cannot fill the default executor or the memory.
+# audio_duration's own parse slots refuse at once as a backstop.
+_STT_PRICING_SLOTS = 2
+_STT_PRICING_WAIT_S = 10.0
+# One semaphore per event loop: it binds to the loop that first waits on it
+# (tests run each case in a new loop).
+_stt_slots: asyncio.Semaphore | None = None
+_stt_slots_loop: asyncio.AbstractEventLoop | None = None
+
 
 # The only paths x402gate prices. Anything else would be billed by the wrong
 # formula (or not at all), so it is refused before payment.
@@ -153,10 +164,61 @@ _INLINE_PARTS = frozenset({"input_audio"})  # base64 data, counted by size
 _MAX_WEB_RESULTS = 10
 _WEB_ENGINE = "exa"
 
+# Perplexity Sonar and OpenAI search-preview models search on their own on
+# every request, usually once, at the catalog's pricing.web_search. No
+# request field bounds the count, so each completion is priced at this many
+# searches. Other models list a web_search rate too, but it is the price of
+# native search when a request asks for it, which _check_request refuses, so
+# it is never charged. Deep research models run dozens of searches and long
+# reasoning, which nothing in the request bounds, so they are refused.
+_NATIVE_SEARCHES = 5
+_DEEP_RESEARCH = "deep-research"
+_SEARCH_PREVIEW = "-search-preview"
 
-def _estimate_input_tokens(total_chars: int) -> int:
-    """Turn an embeddings input character count into a token estimate."""
-    return max(total_chars // _CHARS_PER_TOKEN, 1)
+# Tool types the model only writes a call for, which the client then runs:
+# billed as tokens. Every other type (web_search, web_search_preview,
+# openrouter:web_search, Anthropic's web_search_20250305, code_interpreter,
+# file_search...) runs on the provider's side, as often as the model likes,
+# and bills per use, so it is refused before payment. A tool without a type
+# is a function tool only when it has a "function" object; Gemini's typeless
+# {"google_search": {}} is a search.
+_TOKEN_TOOL_TYPES = frozenset({"function", "custom"})
+
+# Audio input tokens per second of audio, billed at the catalog "audio" rate
+# (or the input rate, when higher). Gemini bills 32 per second, Qwen-Omni 25,
+# Voxtral and Phi-4 12.5 and OpenAI gpt-4o audio about 10; a model fed raw
+# Whisper encoder frames would bill 50, the most any of them reaches.
+_AUDIO_TOKENS_PER_SECOND = 50
+# Raw PCM has no header to time it from. Its length at 8 kHz mono, the
+# lowest common sample rate, bounds its duration from above.
+_PCM_BYTES_PER_SECOND = {"pcm16": 16_000, "pcm24": 24_000}
+
+# Anthropic bills a cache write with a 1-hour TTL at 2x the input rate, above
+# the 5-minute write rate (1.25x) the catalogs list as input_cache_write.
+_SHORT_CACHE_TTLS = (None, "5m")
+_LONG_CACHE_WRITE = Decimal(2)
+
+# pricing.overrides entries change the rates under a condition. An entry
+# whose only condition is min_prompt_tokens is a long-context tier: once the
+# prompt reaches it, the whole request bills at its rates. Any other key
+# outside these rate fields is a condition (utc_start, utc_end, utc_days, or
+# one this code does not know).
+_TIER_KEY = "min_prompt_tokens"
+_OVERRIDE_RATE_FIELDS = frozenset(
+    {
+        "prompt",
+        "completion",
+        "internal_reasoning",
+        "input_cache_read",
+        "input_cache_write",
+        "input_cache_write_1h",
+        "image",
+        "audio",
+        "input_audio_cache",
+        "web_search",
+        "request",
+    }
+)
 
 
 def _text_units(text: str) -> int:
@@ -194,6 +256,27 @@ def _text_units(text: str) -> int:
     )
 
 
+def _embedding_input_tokens(text_input: Any) -> int:
+    """Token estimate of an embeddings ``input``: a string, or a list of them.
+
+    Text is weighed like chat text, so CJK, emoji and digits cannot be
+    priced below their bill. An integer is one token id, and a list of
+    integers a pre-tokenized input of that many tokens.
+    """
+    items = text_input if isinstance(text_input, list) else [text_input]
+    units = 0
+    for item in items:
+        if isinstance(item, int) and not isinstance(item, bool):
+            units += _UNITS_PER_TOKEN
+        elif isinstance(item, list) and all(
+            isinstance(token, int) and not isinstance(token, bool) for token in item
+        ):
+            units += len(item) * _UNITS_PER_TOKEN
+        else:
+            units += _value_units(item)
+    return max(units // _UNITS_PER_TOKEN, 1)
+
+
 def _value_units(value: Any) -> int:
     """Token units the model reads for one request value.
 
@@ -208,9 +291,25 @@ def _value_units(value: Any) -> int:
     return _text_units(json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str))
 
 
+def _too_deep(provider_name: str) -> ProviderError:
+    """A 400 for a body json.loads accepted but json.dumps cannot recurse through."""
+    return ProviderError(
+        provider=provider_name,
+        detail="Request body is nested too deeply",
+        status_code=400,
+    )
+
+
 def _part_type(part: dict[str, Any], provider_name: str) -> Any:
     """A content part's type, refusing types the estimate cannot price."""
     part_type = part.get("type", "text" if "text" in part else None)
+    if not isinstance(part_type, (str, type(None))):
+        # A list or object type is unhashable, so it cannot be looked up below.
+        raise ProviderError(
+            provider=provider_name,
+            detail="Content part type must be a string",
+            status_code=400,
+        )
     if part_type in _TEXT_PARTS or part_type in _IMAGE_PARTS or part_type in _INLINE_PARTS:
         return part_type
     raise ProviderError(
@@ -249,11 +348,79 @@ def _content_size(content: Any, provider_name: str) -> tuple[int, int]:
         elif part_type in _IMAGE_PARTS:
             images += 1
         else:
-            # Base64 audio is not text the tokenizer reads; its size stands in
-            # for its length at the plain ASCII rate, as before.
-            serialized = json.dumps(part, ensure_ascii=False, separators=(",", ":"), default=str)
-            units += len(serialized) * _ASCII_UNITS
+            # The base64 audio is priced by its duration (see
+            # chat_audio_inputs), not as text. Anything else the part carries
+            # is weighed as text.
+            units += _value_units({k: v for k, v in part.items() if k != "input_audio"})
+            audio = part.get("input_audio")
+            if isinstance(audio, dict):
+                units += _value_units({k: v for k, v in audio.items() if k != "data"})
+            else:
+                units += _value_units(audio)
     return units, images
+
+
+def chat_audio_inputs(body: dict[str, Any]) -> list[Any]:
+    """The ``input_audio`` values of a chat body's content parts.
+
+    Their audio is not in the text estimate of ``chat_input_size``: a caller
+    that accepts audio prices it from its duration and the model's audio
+    rate, or refuses it. Shared with NanoGPT.
+    """
+    found: list[Any] = []
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return found
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        for part in _content_parts(message.get("content")) or ():
+            if isinstance(part, dict) and part.get("type") in _INLINE_PARTS:
+                found.append(part.get("input_audio"))
+    return found
+
+
+def reject_server_tools(body: dict[str, Any], provider_name: str) -> None:
+    """Refuse tools and options that make the provider search the web itself.
+
+    A web search tool in ``tools`` (or any other tool the provider runs) and
+    xAI Live Search (``search_parameters``) bill per search or per source,
+    as many as the model decides, which nothing in the request bounds.
+    Function tools are plain tokens and pass. Shared with NanoGPT.
+    """
+    tools = body.get("tools")
+    if tools is not None:
+        if not isinstance(tools, list):
+            raise ProviderError(
+                provider=provider_name, detail="tools must be a list", status_code=400
+            )
+        for tool in tools:
+            if not isinstance(tool, dict):
+                raise ProviderError(
+                    provider=provider_name, detail="Each tool must be an object", status_code=400
+                )
+            tool_type = tool.get("type", "function" if "function" in tool else None)
+            if not isinstance(tool_type, str) or tool_type not in _TOKEN_TOOL_TYPES:
+                raise ProviderError(
+                    provider=provider_name,
+                    detail=(
+                        f"Tool type '{tool_type}' is not supported: the provider runs it "
+                        "and bills each use, which x402gate cannot price before payment. "
+                        "Only function tools are accepted."
+                    ),
+                    status_code=400,
+                )
+    search = body.get("search_parameters")
+    if search is not None and not (isinstance(search, dict) and search.get("mode") == "off"):
+        raise ProviderError(
+            provider=provider_name,
+            detail=(
+                "search_parameters (xAI Live Search) is not supported: each source is "
+                "billed and the count is not known up front. Leave it out or set "
+                'mode to "off".'
+            ),
+            status_code=400,
+        )
 
 
 def check_content_parts(body: dict[str, Any], provider_name: str) -> None:
@@ -281,8 +448,17 @@ def chat_input_size(body: dict[str, Any], provider_name: str) -> tuple[int, int]
     functions, tool_choice, prompt, response_format, tool_calls, system...)
     are counted, so the reservation cannot be dodged by moving the prompt
     out of ``messages[].content``. Only ``model`` and gateway-internal keys
-    are skipped. Unknown content part types raise a 400 ProviderError.
+    are skipped, and the base64 data of audio parts, which is priced by its
+    duration (``chat_audio_inputs``). Unknown content part types and nesting
+    too deep to serialize raise a 400 ProviderError.
     """
+    try:
+        return _chat_input_size(body, provider_name)
+    except RecursionError as exc:
+        raise _too_deep(provider_name) from exc
+
+
+def _chat_input_size(body: dict[str, Any], provider_name: str) -> tuple[int, int]:
     units = 0
     images = 0
     messages = body.get("messages")
@@ -318,13 +494,243 @@ def estimate_chat_input_tokens(body: dict[str, Any], provider_name: str) -> int:
     return text_tokens + images * _IMAGE_INPUT_TOKENS
 
 
+def _nested_dicts(value: Any) -> Iterator[dict[str, Any]]:
+    """Every dict nested in ``value``, itself included.
+
+    Walked with a stack rather than recursion: json.loads accepts nesting
+    thousands deep, past what a recursive walk survives.
+    """
+    stack = [value]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            yield current
+            stack.extend(current.values())
+        elif isinstance(current, list):
+            stack.extend(current)
+
+
 def has_nested_key(value: Any, key: str) -> bool:
     """True when ``key`` appears in any nested dict of ``value``."""
-    if isinstance(value, dict):
-        return key in value or any(has_nested_key(v, key) for v in value.values())
-    if isinstance(value, list):
-        return any(has_nested_key(v, key) for v in value)
+    return any(key in current for current in _nested_dicts(value))
+
+
+def long_cache_ttl(value: Any) -> bool:
+    """True when a ``cache_control`` in ``value`` asks for a TTL above 5 minutes.
+
+    Any ttl other than missing or "5m" counts, so an unknown value is priced
+    as the dearer write. Shared with NanoGPT.
+    """
+    for current in _nested_dicts(value):
+        control = current.get("cache_control")
+        if isinstance(control, dict) and control.get("ttl") not in _SHORT_CACHE_TTLS:
+            return True
     return False
+
+
+def check_json_encodable(body: dict[str, Any], provider_name: str) -> None:
+    """Refuse a body that parses but cannot be sent on as JSON.
+
+    json.loads accepts NaN, Infinity and lone surrogate escapes (\\ud800),
+    while httpx encodes the upstream body with allow_nan=False as UTF-8, so
+    such a request would be paid for and then fail on every send. Checked
+    before payment with a walk, not json.dumps, which on a 25 MB body takes
+    tens of milliseconds of event loop time. Shared with NanoGPT.
+    """
+    stack: list[Any] = [v for k, v in body.items() if not k.startswith("_")]
+    stack.extend(k for k in body if not k.startswith("_"))
+    while stack:
+        value = stack.pop()
+        if isinstance(value, dict):
+            stack.extend(value)
+            stack.extend(value.values())
+        elif isinstance(value, list):
+            stack.extend(value)
+        elif isinstance(value, float):
+            if not math.isfinite(value):
+                raise ProviderError(
+                    provider=provider_name,
+                    detail="NaN and Infinity are not valid JSON numbers",
+                    status_code=400,
+                )
+        elif isinstance(value, str) and not value.isascii():
+            try:
+                value.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise ProviderError(
+                    provider=provider_name,
+                    detail="Request body has a lone surrogate (\\ud800-\\udfff) in a string",
+                    status_code=400,
+                ) from exc
+
+
+def _named_models(body: dict[str, Any]) -> list[str]:
+    """The string model ids in ``model`` and ``models``, unvalidated."""
+    fallbacks = body.get("models")
+    named = [body.get("model"), *(fallbacks if isinstance(fallbacks, list) else ())]
+    return [model_id for model_id in named if isinstance(model_id, str)]
+
+
+def _online_variant(model_id: str) -> bool:
+    """True for an ``:online`` model id, which turns on OpenRouter web search.
+
+    OpenRouter runs it with the model's native search engine where there is
+    one, at that provider's per-search rates, so it is refused.
+    """
+    return "online" in model_id.lower().split(":")[1:]
+
+
+def _searches_every_request(model_id: str) -> bool:
+    """True for a model that runs billed web searches on every request."""
+    lowered = model_id.lower().lstrip("~")
+    return lowered.startswith("perplexity/") or _SEARCH_PREVIEW in lowered
+
+
+def _override_rate(override: dict[str, Any], field: str) -> Decimal | None:
+    """One rate of a pricing.overrides entry, or None when it has no usable one."""
+    raw = override.get(field)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
+        return None
+    try:
+        rate = Decimal(str(raw))
+    except InvalidOperation:
+        return None
+    return rate if rate.is_finite() and rate >= 0 else None
+
+
+def _with_override(rates: dict[str, Decimal], override: dict[str, Any]) -> dict[str, Decimal]:
+    """``rates`` with the rates of one pricing.overrides entry in their place.
+
+    A rate the entry leaves out keeps the base rate, except the cache write,
+    audio and reasoning rates, which scale with its prompt and completion
+    rates (Gemini's tier lists no cache write).
+    """
+    changed = dict(rates)
+    for key in ("prompt", "completion", "image", "request"):
+        rate = _override_rate(override, key)
+        if rate is not None:
+            changed[key] = rate
+    for key, field, basis in (
+        ("cache_write", "input_cache_write", "prompt"),
+        ("audio", "audio", "prompt"),
+        ("reasoning", "internal_reasoning", "completion"),
+    ):
+        rate = _override_rate(override, field)
+        if rate is None and rates[basis] > 0:
+            rate = rates[key] * changed[basis] / rates[basis]
+        elif rate is None:
+            rate = max(rates[key], changed[basis])
+        changed[key] = rate
+    changed["cache_write"] = max(changed["prompt"], changed["cache_write"])
+    return changed
+
+
+def _tiered_rates(
+    rates: dict[str, Decimal], pricing: dict[str, Any], input_tokens: int | Decimal
+) -> dict[str, Decimal]:
+    """Rates of one model for a prompt of ``input_tokens``, from pricing.overrides.
+
+    Of the long-context tiers the prompt reaches, the one with the highest
+    min_prompt_tokens replaces the base rates. Any other entry (a UTC time
+    window, or a condition this code does not know) may apply at some moment
+    of the call, so each rate is the higher of the two. Callers apply this
+    per model, before taking the max over ``models`` fallbacks, so one
+    tiered candidate never raises another's rate.
+    """
+    overrides = pricing.get("overrides")
+    if not isinstance(overrides, list):
+        return rates
+    tier: dict[str, Any] | None = None
+    tier_floor: int | float = -1
+    others = []
+    for override in overrides:
+        if not isinstance(override, dict):
+            continue
+        floor = override.get(_TIER_KEY)
+        if isinstance(floor, bool) or not isinstance(floor, (int, float)):
+            floor = None
+        if floor is not None and floor > input_tokens:
+            continue  # this prompt is below the entry's threshold
+        if floor is not None and set(override) - _OVERRIDE_RATE_FIELDS == {_TIER_KEY}:
+            if floor > tier_floor:
+                tier, tier_floor = override, floor
+        else:
+            others.append(override)
+    result = _with_override(rates, tier) if tier is not None else dict(rates)
+    for override in others:
+        window = _with_override(rates, override)
+        result = {key: max(rate, window[key]) for key, rate in result.items()}
+    return result
+
+
+def _reasoning_tokens(usage: dict[str, Any], completion_tokens: Decimal) -> Decimal:
+    """Reasoning tokens inside ``completion_tokens``, as the usage reports them."""
+    details = usage.get("completion_tokens_details")
+    raw = details.get("reasoning_tokens") if isinstance(details, dict) else None
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        return Decimal(0)
+    return min(Decimal(raw), completion_tokens)
+
+
+def _billed_audio_tokens(
+    usage: dict[str, Any],
+    prompt_tokens: Decimal,
+    body: dict[str, Any],
+    audio_ceiling: Decimal | None = None,
+) -> Decimal:
+    """Audio tokens inside ``prompt_tokens``, for the catalog cost fallback.
+
+    As ``prompt_tokens_details.audio_tokens`` reports them. A body with audio
+    parts whose usage reports none has ``audio_ceiling`` of the prompt priced
+    as audio: the audio tokens get_price held for the timed parts, so the
+    audio costs no less than the hold assumed and the text beside it bills
+    at the prompt rate. Without a ceiling (the audio could not be timed
+    again), the whole prompt is priced as audio, the dearer of the two
+    rates; the app never charges more than the hold.
+    """
+    reported = _reported_audio_tokens(usage)
+    if reported > 0:
+        return min(reported, prompt_tokens)
+    if not chat_audio_inputs(body):
+        return Decimal(0)
+    if audio_ceiling is None:
+        return prompt_tokens
+    return min(max(audio_ceiling, Decimal(0)), prompt_tokens)
+
+
+def _reported_audio_tokens(usage: dict[str, Any]) -> Decimal:
+    """``prompt_tokens_details.audio_tokens`` of a usage, or 0."""
+    details = usage.get("prompt_tokens_details")
+    raw = details.get("audio_tokens") if isinstance(details, dict) else None
+    return Decimal(raw) if not isinstance(raw, bool) and isinstance(raw, int) else Decimal(0)
+
+
+async def held_audio_tokens(
+    usage: dict[str, Any],
+    body: dict[str, Any],
+    measure: Callable[[list[Any]], Awaitable[int]],
+    provider_name: str,
+) -> Decimal | None:
+    """Audio tokens get_price held for a chat body's audio parts, timed again.
+
+    The ceiling ``_billed_audio_tokens`` needs when the usage reports no
+    audio tokens. None when it is not needed (no audio parts, or the usage
+    reports them) or the timing fails now; the whole prompt is then priced
+    as audio, as before.
+    """
+    audio_inputs = chat_audio_inputs(body)
+    if not audio_inputs or _reported_audio_tokens(usage) > 0:
+        return None
+    try:
+        seconds = await measure(audio_inputs)
+    except Exception as exc:
+        logger.warning(
+            "%s could not time the chat audio again for the actual cost: %s",
+            provider_name,
+            exc,
+        )
+        return None
+    return Decimal(seconds * _AUDIO_TOKENS_PER_SECOND)
 
 
 def _positive_int_or_none(value: Any) -> int | None:
@@ -446,6 +852,56 @@ def parse_billed_json(resp: httpx.Response, provider_name: str) -> dict[str, Any
         detail=f"Provider returned {resp.status_code} but the {reason}",
         status_code=502,
     ) from unreadable
+
+
+def _usage_amount(value: Any) -> Decimal:
+    """A usage count or cost as a Decimal; 0 when it is not a finite number."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return Decimal(0)
+    try:
+        amount = Decimal(str(value))
+    except InvalidOperation:
+        return Decimal(0)
+    return amount if amount.is_finite() else Decimal(0)
+
+
+def raise_for_error_body(result: dict[str, Any], provider_name: str, label: str) -> None:
+    """Refuse a 2xx body that carries only an error object.
+
+    OpenRouter commits a 200 (keep-alive whitespace) before the model
+    answers, so a model that fails after routing arrives as ``{"error":
+    {"code": 502, ...}}`` with no choices. A body whose usage reports a
+    positive cost or token count was billed and is returned so that usage
+    is charged; tokens count even at cost 0, which BYOK reports. Zeroed
+    usage bills nothing. Otherwise the provider reported the failure
+    itself: a known failure, refunded, with the status from ``error.code``,
+    unless that code or the message is a timeout, which may have run, as in
+    ``_may_have_run``. Shared with NanoGPT.
+    """
+    error = result.get("error")
+    if not error or any(key in result for key in ("choices", "data", "text")):
+        return
+    usage = result.get("usage")
+    if isinstance(usage, dict) and any(
+        _usage_amount(usage.get(key)) > 0
+        for key in ("cost", "prompt_tokens", "completion_tokens", "total_tokens")
+    ):
+        return
+    code = error.get("code") if isinstance(error, dict) else None
+    status = code if isinstance(code, int) and 400 <= code < 600 else 502
+    message = error.get("message") if isinstance(error, dict) else error
+    may_have_run = status in _GATEWAY_TIMEOUT_STATUSES or (
+        status >= 500 and _TIMEOUT_BODY.search(str(message)) is not None
+    )
+    exc = ProviderError(
+        provider=provider_name,
+        detail=f"{label} API error: {json.dumps(error, ensure_ascii=False, default=str)}",
+        # As in post_billed_request: a key or credit error is not the client's.
+        status_code=502 if rejected_credentials(status) else status,
+    )
+    if may_have_run:
+        raise exc from UpstreamMayHaveRun(f"{label} reported error {status} in a 2xx body")
+    raise exc
 
 
 def _may_have_run(resp: httpx.Response) -> bool:
@@ -570,6 +1026,46 @@ def _duration_stt_cost(seconds: int, prompt_price: Decimal) -> Decimal:
     return _apply_cost_floor(Decimal(seconds) * per_second)
 
 
+def _stt_pricing_slots() -> asyncio.Semaphore:
+    """Return the STT pricing semaphore for the running event loop."""
+    global _stt_slots, _stt_slots_loop
+    loop = asyncio.get_running_loop()
+    if _stt_slots is None or _stt_slots_loop is not loop:
+        _stt_slots = asyncio.Semaphore(_STT_PRICING_SLOTS)
+        _stt_slots_loop = loop
+    return _stt_slots
+
+
+async def in_audio_pricing_slot(measure: Callable[[], int], provider_name: str) -> int:
+    """Run an audio measurement in a worker thread, in an STT pricing slot.
+
+    The thread holds the slot until it ends, even when the request is
+    cancelled first: a thread cannot be stopped, so releasing its slot
+    early would let more decodes run than the limit allows. The slots are
+    shared by every provider that times audio before payment (NanoGPT).
+    """
+    slots = _stt_pricing_slots()
+    try:
+        await asyncio.wait_for(slots.acquire(), _STT_PRICING_WAIT_S)
+    except TimeoutError:
+        # Unpaid clients can fill the slots, so this is a 4xx: a 5xx would
+        # count against the provider's health on the public dashboard.
+        raise ProviderError(
+            provider=provider_name,
+            detail="Too many audio files are being priced; retry shortly",
+            status_code=429,
+        ) from None
+    work = asyncio.ensure_future(asyncio.to_thread(measure))
+
+    def finished(task: asyncio.Future[int]) -> None:
+        slots.release()
+        if not task.cancelled():
+            task.exception()  # retrieved, so an abandoned failure is not logged
+
+    work.add_done_callback(finished)
+    return await asyncio.shield(work)
+
+
 def _extract_stt_audio(
     inputs: dict[str, Any],
     provider_name: str,
@@ -614,12 +1110,36 @@ def _extract_stt_audio(
             provider=provider_name,
             detail=(
                 f"Audio file too large ({len(audio_bytes) / 1024 / 1024:.1f} MB). "
-                f"Maximum for OpenRouter STT: {max_mb} MB"
+                f"Maximum: {max_mb} MB"
             ),
             status_code=413,
         )
 
     return audio_bytes, str(fmt)
+
+
+def _chat_audio_seconds(
+    audio_inputs: list[Any], provider_name: str, *, max_audio_bytes: int
+) -> int:
+    """Billing seconds of all the audio parts of a chat request.
+
+    Each part is decoded and timed like a transcription upload, so a forged
+    header cannot price long audio as short. Raw PCM (``pcm16``, ``pcm24``)
+    is timed from its length at 8 kHz mono. Runs in a worker thread, as
+    ``_stt_billing_seconds`` does.
+    """
+    seconds = 0
+    for audio in audio_inputs:
+        data, fmt = _extract_stt_audio(
+            {"input_audio": audio}, provider_name, max_audio_bytes=max_audio_bytes
+        )
+        pcm_rate = _PCM_BYTES_PER_SECOND.get(fmt.strip().lower())
+        if pcm_rate is not None:
+            duration = len(data) / pcm_rate
+        else:
+            duration = get_audio_duration_seconds(data, fmt, provider=provider_name)
+        seconds += billing_seconds(duration)
+    return seconds
 
 
 def _reported_cost(usage: dict[str, Any]) -> Decimal | None:
@@ -692,6 +1212,17 @@ def _apply_cost_floor(cost: Decimal) -> Decimal:
 
 
 Catalog = dict[str, dict[str, Any]]
+
+# Body key get_price stores the rates it priced at under, for submit's cap.
+_PRICED_RATES = "_priced_rates"
+
+
+class _PricedRates(dict[str, Decimal]):
+    """Rates get_price priced a request at, kept in its body for submit.
+
+    Its own type, so a client's JSON (which only makes plain dicts) cannot
+    forge one under ``_PRICED_RATES`` and lift the endpoint cap.
+    """
 
 
 class CatalogCache:
@@ -957,7 +1488,8 @@ class OpenRouterProvider(BaseProvider):
         """Billing seconds of the request audio.
 
         Decoding up to 25 MB of base64 and reading the duration can take a
-        second on a crafted file, so get_price runs this in a thread.
+        second on a crafted file, so get_price runs this in a thread, holding
+        one of the STT pricing slots.
         """
         audio_bytes, fmt = _extract_stt_audio(
             inputs,
@@ -1037,6 +1569,13 @@ class OpenRouterProvider(BaseProvider):
                     "by the model provider at rates x402gate cannot price. Use the "
                     "'web' plugin instead."
                 )
+            if any(_online_variant(model_id) for model_id in _named_models(body)):
+                raise self._error(
+                    "The :online model variant is not supported: it searches with the "
+                    "model's native engine, billed at rates x402gate cannot price. Use "
+                    'the model without :online and the "web" plugin instead.'
+                )
+            reject_server_tools(body, self.name)
             plugins = body.get("plugins")
             if plugins is not None and not isinstance(plugins, list):
                 raise self._error("plugins must be a list")
@@ -1096,7 +1635,7 @@ class OpenRouterProvider(BaseProvider):
         ``models`` fallback list each rate is the highest among the
         candidates, since OpenRouter may route to any of them. When the
         client's routing picks endpoints, submit caps the endpoint price at
-        rates no higher than these, even if the catalog refreshed in between.
+        these rates, which are stored in ``inputs`` under ``_PRICED_RATES``.
 
         Args:
             model_path: API sub-path (e.g. 'chat/completions').
@@ -1112,20 +1651,24 @@ class OpenRouterProvider(BaseProvider):
         kind = self._check_request(model_path, inputs)
         candidates = self._candidate_models(inputs)
         label = ",".join(candidates)
+        check_json_encodable(inputs, self.name)
 
         if kind == _TRANSCRIPTION:
             return await self._estimate_stt(candidates, inputs)
 
         rates = await self._max_rates(kind, candidates)
+        # The app hands submit this same body; its endpoint cap uses these.
+        inputs[_PRICED_RATES] = _PricedRates(
+            {key: rates[key] for key in ("prompt", "completion", "request")}
+        )
 
         if kind == _EMBEDDINGS:
-            text_input = inputs.get("input", "")
-            if isinstance(text_input, list):
-                total_chars = sum(len(str(item)) for item in text_input)
-            else:
-                total_chars = len(str(text_input))
-            estimated_input_tokens = _estimate_input_tokens(total_chars)
+            try:
+                estimated_input_tokens = _embedding_input_tokens(inputs.get("input", ""))
+            except RecursionError as exc:
+                raise _too_deep(self.name) from exc
 
+            rates = await self._max_rates(kind, candidates, estimated_input_tokens)
             estimated_cost = Decimal(estimated_input_tokens) * rates["prompt"] + rates["request"]
             logger.info(
                 "OpenRouter price estimate for %s: $%s (~%d input tokens, embedding)",
@@ -1137,13 +1680,14 @@ class OpenRouterProvider(BaseProvider):
 
         # Weighed once here; _check_request only checked the part types.
         estimated_input_tokens, images = chat_input_size(inputs, self.name)
-
-        # A cache_control breakpoint can bill the whole prompt at the write
-        # rate (1.25x on Anthropic).
-        cached = has_nested_key(inputs, "cache_control")
-        input_price = rates["cache_write"] if cached else rates["prompt"]
-        # The catalog may also bill each input image at a flat rate.
-        image_cost = Decimal(images) * max(_IMAGE_INPUT_TOKENS * input_price, rates["image"])
+        # Audio parts are timed, not weighed as text: their base64 would
+        # otherwise price as text tokens at the input rate, which is far
+        # above the audio tokens they bill for most files but can be below
+        # them for a near-silent one, or at an audio rate above the input rate.
+        audio_inputs = chat_audio_inputs(inputs)
+        audio_tokens = 0
+        if audio_inputs:
+            audio_tokens = await self._measure_chat_audio(audio_inputs) * _AUDIO_TOKENS_PER_SECOND
 
         web_search_cost = Decimal(0)
         for plugin in inputs.get("plugins") or []:
@@ -1162,41 +1706,64 @@ class OpenRouterProvider(BaseProvider):
                 status_code=400,
             )
 
+        # The estimate is weighed to stay above the real prompt, so a prompt
+        # billed at the long-context tier is priced at it. The cap above
+        # keeps the listed rates, which are what OpenRouter compares.
+        rates = await self._max_rates(
+            kind, candidates, estimated_input_tokens + images * _IMAGE_INPUT_TOKENS + audio_tokens
+        )
+        web_search_cost += Decimal(_NATIVE_SEARCHES * raw_n) * rates["web_search"]
+        input_price = self._input_price(rates, inputs)
+        # Reasoning tokens bill inside max_tokens, at their own rate if higher.
+        output_price = max(rates["completion"], rates["reasoning"])
+        # The catalog may also bill each input image at a flat rate.
+        image_cost = Decimal(images) * max(_IMAGE_INPUT_TOKENS * input_price, rates["image"])
+        # Audio tokens bill at the catalog audio rate, or as input tokens.
+        audio_cost = Decimal(audio_tokens) * max(rates["audio"], input_price)
+
         estimated_cost = (
             Decimal(estimated_input_tokens) * input_price
             + image_cost
-            + Decimal(max_tokens) * rates["completion"] * Decimal(raw_n)
+            + audio_cost
+            + Decimal(max_tokens) * output_price * Decimal(raw_n)
             + web_search_cost
             + rates["request"]
         )
 
         logger.info(
             "OpenRouter price estimate for %s: $%s (~%d input tokens, %d images, "
-            "%d max output tokens)",
+            "%d audio tokens, %d max output tokens)",
             label,
             estimated_cost,
             estimated_input_tokens,
             images,
+            audio_tokens,
             max_tokens,
         )
         return _apply_cost_floor(estimated_cost)
 
-    async def _rates(self, kind: str, model_id: str) -> dict[str, Decimal]:
-        """Catalog rates for one model, in USD.
+    @staticmethod
+    def _input_price(rates: dict[str, Decimal], body: dict[str, Any]) -> Decimal:
+        """Per-token input rate of a chat body.
 
-        ``prompt``, ``completion`` and ``cache_write`` are per token (the
-        cache write rate is never below the prompt rate), ``image`` is per
-        input image and ``request`` is per request.
+        A cache_control breakpoint can bill the whole prompt at the write
+        rate (1.25x on Anthropic), and one with a 1-hour TTL at 2x.
         """
-        output_modalities = "" if kind == _CHAT else kind
-        model_info = await self._fetch_model_info(
-            model_id,
-            output_modalities=output_modalities,
-        )
-        return self._model_rates(model_id, model_info)
+        if not has_nested_key(body, "cache_control"):
+            return rates["prompt"]
+        if long_cache_ttl(body):
+            return max(rates["cache_write"], _LONG_CACHE_WRITE * rates["prompt"])
+        return rates["cache_write"]
 
     def _model_rates(self, model_id: str, model_info: dict[str, Any]) -> dict[str, Decimal]:
-        """Rates of ``_rates`` from a catalog entry already looked up."""
+        """Catalog rates for one model, in USD.
+
+        ``prompt``, ``completion``, ``reasoning`` and ``cache_write`` are per
+        token (the cache write rate is never below the prompt rate),
+        ``audio`` per input audio token, ``image`` per input image,
+        ``web_search`` per search (0 unless the model searches on every
+        request) and ``request`` per request.
+        """
         pricing = model_info.get("pricing", {})
         prompt_price = pricing.get("prompt")
         completion_price = pricing.get("completion")
@@ -1218,19 +1785,60 @@ class OpenRouterProvider(BaseProvider):
                 "Pick a specific model."
             )
 
+        web_search = max(Decimal(str(pricing.get("web_search") or 0)), Decimal(0))
+        if web_search > 0 and _DEEP_RESEARCH in model_id.lower():
+            raise self._error(
+                f"Model '{model_id}' is not supported because x402gate cannot price "
+                "it before payment: deep research runs a number of billed searches "
+                "and reasoning tokens that no request field bounds."
+            )
+
         cache_write = pricing.get("input_cache_write")
         return {
             "prompt": prompt,
             "completion": completion,
+            "reasoning": max(Decimal(str(pricing.get("internal_reasoning") or 0)), Decimal(0)),
             "cache_write": max(prompt, Decimal(str(cache_write or 0))),
+            "audio": max(Decimal(str(pricing.get("audio") or 0)), Decimal(0)),
             "image": max(Decimal(str(pricing.get("image") or 0)), Decimal(0)),
+            "web_search": web_search if _searches_every_request(model_id) else Decimal(0),
             "request": max(Decimal(str(pricing.get("request") or 0)), Decimal(0)),
         }
 
-    async def _max_rates(self, kind: str, model_ids: list[str]) -> dict[str, Decimal]:
-        """Highest rate of each kind among the models OpenRouter may route to."""
-        per_model = [await self._rates(kind, model_id) for model_id in model_ids]
+    async def _max_rates(
+        self, kind: str, model_ids: list[str], input_tokens: int | Decimal | None = None
+    ) -> dict[str, Decimal]:
+        """Highest rate of each kind among the models OpenRouter may route to.
+
+        With ``input_tokens``, each model's rates are first set from its
+        pricing.overrides for a prompt that long (see ``_tiered_rates``).
+        Without, they are the listed base rates, which the endpoint cap uses.
+        """
+        output_modalities = "" if kind == _CHAT else kind
+        per_model = []
+        for model_id in model_ids:
+            model_info = await self._fetch_model_info(model_id, output_modalities=output_modalities)
+            rates = self._model_rates(model_id, model_info)
+            if input_tokens is not None:
+                rates = _tiered_rates(rates, model_info.get("pricing", {}), input_tokens)
+            per_model.append(rates)
         return {key: max(rates[key] for rates in per_model) for key in per_model[0]}
+
+    async def _measure_stt_audio(self, inputs: dict[str, Any]) -> int:
+        """Billing seconds of the request audio, measured in a worker thread."""
+        return await self._in_pricing_slot(lambda: self._stt_billing_seconds(inputs))
+
+    async def _measure_chat_audio(self, audio_inputs: list[Any]) -> int:
+        """Billing seconds of a chat request's audio parts, measured in a worker thread."""
+        return await self._in_pricing_slot(
+            lambda: _chat_audio_seconds(
+                audio_inputs, self.name, max_audio_bytes=self._max_stt_audio_bytes
+            )
+        )
+
+    async def _in_pricing_slot(self, measure: Callable[[], int]) -> int:
+        """Run an audio measurement in a worker thread, in an STT pricing slot."""
+        return await in_audio_pricing_slot(measure, self.name)
 
     async def _estimate_stt(self, model_ids: list[str], inputs: dict[str, Any]) -> Decimal:
         """Maximum cost of a transcription on any of the candidate models.
@@ -1242,25 +1850,21 @@ class OpenRouterProvider(BaseProvider):
         for model_id in model_ids:
             model_info = await self._fetch_model_info(model_id, output_modalities=_TRANSCRIPTION)
             priced.append((model_id, model_info, self._model_rates(model_id, model_info)))
-        seconds = await asyncio.to_thread(self._stt_billing_seconds, inputs)
+        seconds = await self._measure_stt_audio(inputs)
         return max(
             self._estimate_stt_price(model_id, seconds, model_info, rates["prompt"])
             for model_id, model_info, rates in priced
         )
 
-    async def _routing_with_price_cap(self, kind: str, body: dict[str, Any]) -> dict[str, Any]:
-        """The client's provider preferences plus a max_price at the priced rates.
+    async def _fallback_cap_rates(self, kind: str, body: dict[str, Any]) -> dict[str, Decimal]:
+        """Cap rates for a request get_price did not price in this call.
 
-        Used only when ``_steers_endpoints`` says the client's routing picks
-        endpoints. max_price then makes OpenRouter refuse endpoints priced
-        above the catalog rate instead of billing above the reservation. A
-        lower cap the client sent itself is kept.
+        The current rates, lowered to the rates a refresh replaced within
+        ``_CAP_GRACE_S``: the price may come from the old catalog, and a
+        rate raised in between must not lift the cap above what was reserved.
         """
         model_ids = self._candidate_models(body)
         rates = await self._max_rates(kind, model_ids)
-        # get_price may have priced the request from the catalog a refresh
-        # replaced since; a rate raised in between must not lift the cap
-        # above what was reserved.
         replaced = self._catalogs.replaced("" if kind == _CHAT else kind, _CAP_GRACE_S)
         if replaced is not None and all(model_id in replaced for model_id in model_ids):
             try:
@@ -1271,6 +1875,26 @@ class OpenRouterProvider(BaseProvider):
             if per_model:
                 for key in ("prompt", "completion", "request"):
                     rates[key] = min(rates[key], max(r[key] for r in per_model))
+        return rates
+
+    async def _routing_with_price_cap(self, kind: str, body: dict[str, Any]) -> dict[str, Any]:
+        """The client's provider preferences plus a max_price at the priced rates.
+
+        Used only when ``_steers_endpoints`` says the client's routing picks
+        endpoints. max_price then makes OpenRouter refuse endpoints priced
+        above the catalog rate instead of billing above the reservation. A
+        lower cap the client sent itself is kept.
+
+        The cap is the rates get_price stored in the body, so a request
+        priced from a catalog refreshed a moment ago is capped at the rates
+        it paid. A price from the app's price cache skips get_price, and
+        then ``_fallback_cap_rates`` applies.
+        """
+        priced = body.get(_PRICED_RATES)
+        if isinstance(priced, _PricedRates):
+            rates: dict[str, Decimal] = dict(priced)
+        else:
+            rates = await self._fallback_cap_rates(kind, body)
         cap = {
             "prompt": float(rates["prompt"] * _MILLION),
             "completion": float(rates["completion"] * _MILLION),
@@ -1356,6 +1980,7 @@ class OpenRouterProvider(BaseProvider):
             label="OpenRouter",
         )
         result = parse_billed_json(resp, self.name)
+        raise_for_error_body(result, self.name, "OpenRouter")
         usage = result.get("usage")
         if not isinstance(usage, dict):
             usage = {}
@@ -1434,14 +2059,22 @@ class OpenRouterProvider(BaseProvider):
             # one of the candidates; otherwise the most expensive of them.
             served = result.get("model")
             model_ids = [served] if served in candidates else candidates
-            rates = await self._max_rates(kind, model_ids)
+            # Same input, reasoning and long-context rates get_price reserved.
+            rates = await self._max_rates(kind, model_ids, Decimal(prompt_tokens))
         except ProviderError:
             return None
 
-        input_price = rates["prompt"]
-        if has_nested_key(body, "cache_control"):
-            # Same write rate get_price reserved for a cache breakpoint.
-            input_price = rates["cache_write"]
+        input_price = self._input_price(rates, body)
+        audio_ceiling = await held_audio_tokens(usage, body, self._measure_chat_audio, self.name)
+        audio_tokens = _billed_audio_tokens(usage, Decimal(prompt_tokens), body, audio_ceiling)
+        input_cost = (Decimal(prompt_tokens) - audio_tokens) * input_price + audio_tokens * max(
+            rates["audio"], input_price
+        )
+        output_tokens = Decimal(completion_tokens)
+        reasoning = _reasoning_tokens(usage, output_tokens)
+        output_cost = (output_tokens - reasoning) * rates["completion"] + reasoning * max(
+            rates["completion"], rates["reasoning"]
+        )
 
         web_search_cost = Decimal(0)
         plugins = body.get("plugins") or []
@@ -1449,13 +2082,12 @@ class OpenRouterProvider(BaseProvider):
             if isinstance(plugin, dict) and plugin.get("id") == "web":
                 max_results = self._web_results(plugin)
                 web_search_cost += Decimal(max_results) * self._web_search_cost_per_result
+        # The native searches get_price reserved, on a model that searches on
+        # every request; the usage does not count them.
+        completions = _positive_int_or_none(body.get("n")) or 1
+        web_search_cost += Decimal(_NATIVE_SEARCHES * completions) * rates["web_search"]
 
-        actual_cost = (
-            Decimal(prompt_tokens) * input_price
-            + Decimal(completion_tokens) * rates["completion"]
-            + web_search_cost
-            + rates["request"]
-        )
+        actual_cost = input_cost + output_cost + web_search_cost + rates["request"]
         actual_cost = _apply_cost_floor(actual_cost)
 
         logger.info(

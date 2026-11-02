@@ -153,7 +153,7 @@
 # Response: 402 Payment Required
 # Sign payment, then retry with PAYMENT-SIGNATURE header</code></pre>
     {% if not ns.shown_upload %}
-    <p style="color: #8b949e; font-size: 0.85em;">File uploads: max <strong>{{ max_upload_mb }} MB</strong>. Supported
+    <p style="color: #8b949e; font-size: 0.85em;">File uploads: one file, max <strong>{{ max_upload_mb }} MB</strong>. Supported
         formats:
         <a href="https://cloudconvert.com/api/v2/convert#formats">200+ types</a>.
     </p>
@@ -171,7 +171,8 @@
     <div class="note">On Base your payment settles while the provider runs, and the result is returned only
         once it lands; if that settlement fails you get HTTP 402 and are not charged. On Solana it settles
         before the provider is called. If the provider reports a failure, the settled amount is credited to
-        your prepaid balance (in memory, not sent back on-chain). If the outcome is unknown (a timeout or a
+        your prepaid balance (in memory, not sent back on-chain); on Base, if your payment is still unconfirmed,
+        once it confirms. If the outcome is unknown (a timeout or a
         dropped connection after the request was sent), the payment is kept. Use a new payment for every
         request.</div>
 

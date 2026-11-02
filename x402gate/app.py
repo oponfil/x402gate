@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import functools
 import http.cookiejar
 import json
 import logging
 import os
 import pathlib
 import time
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from decimal import Decimal
 from typing import Any
@@ -21,6 +23,7 @@ import httpx
 import jinja2
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from starlette.formparsers import MultiPartException, MultiPartParser
 
 from x402gate.core import stats
 from x402gate.core.balances import fetch_balances
@@ -73,14 +76,51 @@ _HEARTBEAT_PAD = b"\n" * 8192
 # A Solana blockhash lives about a minute, so its claim outlives the signature.
 _BASE_CLAIM_HOLD_S = 60.0
 _SOLANA_CLAIM_HOLD_S = 180.0
+# A Base settlement with an unknown outcome can still land until the
+# authorization's validBefore. Its claim lasts that long plus this margin
+# for clock skew, capped so a far-off validBefore cannot pin it forever.
+_UNKNOWN_CLAIM_MARGIN_S = 60.0
+_MAX_CLAIM_HOLD_S = 86400.0
+# A Base settlement with an unknown outcome is followed by its receipt. The
+# poll starts at a Base block and backs off, since a long validBefore can keep
+# it going for hours.
+_RECONCILE_FIRST_POLL_S = 2.0
+_RECONCILE_MAX_POLL_S = 60.0
+# A reconcile stopped by shutdown looks the receipt up once more, for at most
+# this long, so the log says whether the payer is owed the lost credit.
+_RECONCILE_LAST_LOOKUP_S = 5.0
 # Multipart framing (boundaries, small text fields) on top of the file limit.
 _MULTIPART_OVERHEAD_BYTES = 1024 * 1024
+# CloudConvert takes one file and a few text fields.
+_MULTIPART_MAX_FIELDS = 20
+# Only these providers read an uploaded file; every other one takes JSON. A
+# multipart body for another provider gets a 400 before it is read, so an
+# unpaid client cannot make the gateway hold an upload nobody would use.
+_MULTIPART_PROVIDERS: tuple[type[BaseProvider], ...] = (CloudConvertProvider,)
+# Uploads are read into memory before the request is paid. At most this many
+# maximum-size uploads are read unpaid at once; more get a 503, since an
+# out-of-memory restart wipes every prepaid balance.
+_UNPAID_UPLOAD_SLOTS = 2
+# A multipart body must arrive within this time. Its bytes hold the unpaid
+# budget while it is read, so a client trickling bytes cannot hold it forever.
+# 600 s is a maximum-size upload at 0.5 MB/s.
+_UPLOAD_READ_TIMEOUT_S = 600.0
 _TOPUP_BODY_LIMIT_BYTES = 64 * 1024
 # Parsed JSON takes about 80 bytes per empty object, so a body made of tiny
 # containers grows 20x in memory. Real requests (base64 media, chat) have few.
 _MAX_JSON_CONTAINERS = 200_000
+# A longer JSON integer is refused while the body is parsed. Python parses
+# and prints a long integer in quadratic time, so a body of them cost seconds
+# of unpaid CPU, parsed and again re-encoded for pricing. 2**128 has 39 digits.
+_MAX_JSON_INT_CHARS = 40
 # Keys the gateway adds to the body itself; a client must not supply them.
-_INTERNAL_BODY_KEYS = frozenset({"_caller", "_file_bytes", "_file_name"})
+_INTERNAL_BODY_KEYS = frozenset({"_caller", "_file_bytes", "_file_name", "_priced_rates"})
+# Keys get_price leaves in the body for submit (OpenRouter and NanoGPT cap
+# steered routing at the rates they priced). The price cache keeps them with
+# the price, so a cached price puts them back.
+_PRICED_BODY_KEYS = ("_priced_rates",)
+# A 429 from pricing (all audio parse slots busy) clears in moments.
+_PRICING_RETRY_AFTER_S = "2"
 # A body above this is hashed for the price cache in a worker thread. sha256
 # releases the GIL, so a 24 MB upload (~30 ms) does not stall other requests.
 _HASH_IN_THREAD_BYTES = 1024 * 1024
@@ -123,6 +163,53 @@ async def _close_passthrough_client() -> None:
         await _passthrough.aclose()
     _passthrough = None
     _passthrough_loop = None
+
+
+def _authorization_ttl_s(payment_sig: str) -> float:
+    """Seconds until a Base authorization's validBefore, capped.
+
+    A payload without one falls back to the validity the gateway asks for.
+    """
+    try:
+        payload = json.loads(base64.b64decode(payment_sig))
+        valid_before = int(payload["payload"]["authorization"]["validBefore"])
+    except Exception:
+        return float(config.payment.max_timeout)
+    now = time.time()
+    return min(valid_before, now + _MAX_CLAIM_HOLD_S) - now
+
+
+def _claim_hold_s(payment_sig: str, network: str, state: str) -> float:
+    """How long a payment stays claimed once its settle has returned.
+
+    A failed settle frees it at once. A Base settlement whose outcome is
+    unknown may still land while the authorization is valid, and until
+    then a replay passes verify, so the claim lasts that long.
+    """
+    if state == "failed":
+        return 0.0
+    if not network.startswith("eip155:"):
+        return _SOLANA_CLAIM_HOLD_S
+    if state == "ok":
+        return _BASE_CLAIM_HOLD_S
+    hold = _authorization_ttl_s(payment_sig) + _UNKNOWN_CLAIM_MARGIN_S
+    return max(hold, _BASE_CLAIM_HOLD_S)
+
+
+class _JsonIntTooLongError(ValueError):
+    """A client JSON body holds an integer longer than _MAX_JSON_INT_CHARS."""
+
+
+def _parse_json_int(text: str) -> int:
+    """Parse one JSON integer, refusing an overly long one."""
+    if len(text) > _MAX_JSON_INT_CHARS:
+        raise _JsonIntTooLongError(f"JSON integer longer than {_MAX_JSON_INT_CHARS} characters")
+    return int(text)
+
+
+def _loads_client_json(raw: bytes) -> Any:
+    """Parse a client's JSON body; raises _JsonIntTooLongError on a too-long integer."""
+    return json.loads(raw, parse_int=_parse_json_int)
 
 
 def _error_response(
@@ -189,6 +276,7 @@ async def _refund_settled_payment(payer: str, amount: Decimal) -> dict[str, str]
     in-memory and is lost on restart.
     """
     new_balance = await deposit(payer, amount)
+    stats.record_refund_credit(amount)
     logger.warning(
         "Refund: $%s credited to prepaid %s (balance: $%s)",
         amount,
@@ -250,8 +338,187 @@ payment_handler: PaymentHandler
 price_cache: PriceCache
 _pending_settlements: set[asyncio.Task] = set()
 _pending_jobs: set[asyncio.Task] = set()
+# Followers of Base settlements whose outcome was unknown (_reconcile_base).
+_pending_reconciles: set[asyncio.Task] = set()
 payment_claims = PaymentClaims()
 base_in_flight = InFlightAmounts()
+# Upload bytes in memory for requests that are not paid yet.
+_unpaid_upload_bytes = 0
+
+
+async def _settlement_receipt(
+    network: str, tx_hash: str, payer: str, amount: Decimal
+) -> dict[str, Any] | None:
+    """The receipt lookup for a reconcile; None (not resolved) if it crashes."""
+    try:
+        return await payment_handler.settlement_receipt(network, tx_hash, payer, amount)
+    except Exception:
+        logger.exception("Receipt lookup for Base tx %s failed", tx_hash)
+        return None
+
+
+async def _reconcile_base(
+    network: str,
+    payer: str,
+    payment_sig: str,
+    settlement: dict[str, Any] | None,
+    amount: Decimal,
+    on_landed: Callable[[dict[str, Any]], Awaitable[None]],
+    owed: Callable[[], bool] | None = None,
+    on_unresolved: Callable[[str], None] | None = None,
+) -> None:
+    """Follow a Base settlement whose outcome was unknown until it resolves.
+
+    The receipt is polled by hash rather than by settling again: the SDK's
+    pending entry is single-use and expires. ``on_landed`` runs only once
+    the receipt shows the transfer; a reverted duplicate never reaches it.
+    Polling stops once the authorization has expired, since the transfer
+    can no longer land. :func:`_start_base_reconcile` holds the payer's
+    in-flight amount until this returns.
+
+    ``on_unresolved`` hears "failed" (the transfer reverted) or "expired"
+    when the reconcile ends without a landing, so a caller stops promising
+    a refund that nothing will pay. ``owed`` tells a shutdown log whether
+    a landed transfer is owed back (see :func:`_log_unreconciled`).
+    """
+    tx_hash = (settlement or {}).get("transaction") or ""
+    deadline = time.monotonic() + _claim_hold_s(payment_sig, network, "unknown")
+    delay = _RECONCILE_FIRST_POLL_S
+    outcome: dict[str, Any] | None = None
+    try:
+        while True:
+            expired = time.monotonic() >= deadline
+            if tx_hash:
+                outcome = await _settlement_receipt(network, tx_hash, payer, amount)
+            if outcome is not None or expired:
+                break
+            await asyncio.sleep(min(delay, max(deadline - time.monotonic(), 0.0)))
+            delay = min(delay * 2, _RECONCILE_MAX_POLL_S)
+    except asyncio.CancelledError:
+        await _log_unreconciled(network, tx_hash, payer, amount, owed)
+        raise
+    state = settlement_state(outcome)
+    if state == "ok":
+        try:
+            await on_landed(outcome)
+        except Exception:
+            logger.exception("Recording landed Base tx %s failed", tx_hash)
+        return
+    if on_unresolved is not None:
+        try:
+            on_unresolved("failed" if state == "failed" else "expired")
+        except Exception:
+            logger.exception("Recording unresolved Base tx %s failed", tx_hash)
+    if state == "failed":
+        logger.warning(
+            "Base tx %s from %s did not move $%s; nothing credited",
+            tx_hash,
+            payer[:12] + "…",
+            amount,
+        )
+    else:
+        logger.error(
+            "Base tx %s from %s never resolved before its authorization expired",
+            tx_hash or "?",
+            payer[:12] + "…",
+        )
+
+
+async def _log_unreconciled(
+    network: str,
+    tx_hash: str,
+    payer: str,
+    amount: Decimal,
+    owed: Callable[[], bool] | None = None,
+) -> None:
+    """Log a reconcile that shutdown stopped, after one last receipt lookup.
+
+    The prepaid balance lives in memory, so a credit made now would die
+    with the process anyway. The log tells whether the payer is owed it.
+    A landed transfer is owed for a top-up or a job that failed with a
+    known error. ``owed`` returns False for a job that was delivered or
+    whose outcome is unknown: that payment is kept. Without ``owed``, or
+    if it raises, the transfer is logged as owed.
+    """
+    outcome = None
+    if tx_hash:
+        try:
+            outcome = await asyncio.wait_for(
+                _settlement_receipt(network, tx_hash, payer, amount), _RECONCILE_LAST_LOOKUP_S
+            )
+        except TimeoutError:
+            outcome = None
+    state = settlement_state(outcome)
+    is_owed = True
+    if state == "ok" and owed is not None:
+        try:
+            is_owed = bool(owed())
+        except Exception:
+            logger.exception("Checking whether Base tx %s is owed failed", tx_hash)
+    if state == "ok" and is_owed:
+        logger.error(
+            "Shutdown: Base tx %s from %s landed; $%s is owed and was not credited",
+            tx_hash,
+            payer[:12] + "…",
+            amount,
+        )
+    elif state == "ok":
+        logger.warning(
+            "Shutdown: Base tx %s from %s landed; $%s kept (job delivered or outcome "
+            "unknown), nothing owed",
+            tx_hash,
+            payer[:12] + "…",
+            amount,
+        )
+    elif state == "failed":
+        logger.warning(
+            "Shutdown: Base tx %s from %s did not move $%s; nothing owed",
+            tx_hash,
+            payer[:12] + "…",
+            amount,
+        )
+    else:
+        logger.error(
+            "Shutdown before Base tx %s from %s resolved; $%s not reconciled",
+            tx_hash or "?",
+            payer[:12] + "…",
+            amount,
+        )
+
+
+def _start_base_reconcile(
+    network: str,
+    payer: str,
+    payment_sig: str,
+    settlement: dict[str, Any] | None,
+    amount: Decimal,
+    on_landed: Callable[[dict[str, Any]], Awaitable[None]],
+    *,
+    owed: Callable[[], bool] | None = None,
+    on_unresolved: Callable[[str], None] | None = None,
+) -> None:
+    """Run :func:`_reconcile_base` in the background, taking over the in-flight amount.
+
+    The amount stays in base_in_flight until the task ends, so another
+    authorization over the same USDC fails the balance check meanwhile. It
+    is released when the task is done, however it ends: a task cancelled
+    before its first step never runs the coroutine's own cleanup.
+    """
+    task = asyncio.create_task(
+        _reconcile_base(
+            network, payer, payment_sig, settlement, amount, on_landed, owed, on_unresolved
+        )
+    )
+    _pending_reconciles.add(task)
+    task.add_done_callback(functools.partial(_reconcile_done, payer, amount))
+
+
+def _reconcile_done(payer: str, amount: Decimal, task: asyncio.Task) -> None:
+    """Forget a finished reconcile and release its amount, logging a crash."""
+    _pending_reconciles.discard(task)
+    base_in_flight.remove(payer, amount)
+    if not task.cancelled() and task.exception() is not None:
+        logger.error("Base reconcile crashed", exc_info=task.exception())
 
 
 async def _read_body_capped(request: Request, limit: int) -> bytes | None:
@@ -274,8 +541,73 @@ async def _read_body_capped(request: Request, limit: int) -> bytes | None:
     return b"".join(chunks)
 
 
+class _UploadTooLargeError(Exception):
+    """A multipart body passed its size limit while it was being read."""
+
+
+class _UploadBudgetError(Exception):
+    """Unpaid uploads in memory would pass their budget."""
+
+
+def _unpaid_upload_budget(max_upload_bytes: int) -> int:
+    """Bytes all unpaid uploads may hold in memory together.
+
+    While a body is parsed each file byte exists twice: in the spool and in
+    the copy read from it, until the form is closed.
+    """
+    return _UNPAID_UPLOAD_SLOTS * 2 * (max_upload_bytes + _MULTIPART_OVERHEAD_BYTES)
+
+
+class _UnpaidUpload:
+    """Upload bytes one request holds in memory before it is paid."""
+
+    def __init__(self) -> None:
+        self.size = 0
+
+    def take(self, size: int, limit: int) -> bool:
+        """Hold ``size`` bytes, or return False if all requests would pass ``limit``."""
+        global _unpaid_upload_bytes
+        if _unpaid_upload_bytes + size > limit:
+            return False
+        _unpaid_upload_bytes += size
+        self.size += size
+        return True
+
+    def keep(self, size: int) -> None:
+        """Give back all but ``size`` bytes, once the spool is closed."""
+        global _unpaid_upload_bytes
+        size = min(size, self.size)
+        _unpaid_upload_bytes -= self.size - size
+        self.size = size
+
+    def release(self) -> None:
+        """Give the bytes back once the request is paid or answered."""
+        self.keep(0)
+
+
+async def _capped_stream(
+    request: Request, limit: int, upload: _UnpaidUpload, budget: int
+) -> AsyncGenerator[bytes, None]:
+    """Yield the request body, raising _UploadTooLargeError past ``limit`` bytes.
+
+    A chunked upload has no Content-Length, so the bytes are counted as they
+    arrive. Otherwise an unpaid client could stream any size to the spool.
+    Each chunk takes its share of the unpaid budget before it is spooled
+    (twice: spool and read copy), so parallel uploads cannot fill the memory
+    before any check; past ``budget`` it raises _UploadBudgetError.
+    """
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > limit:
+            raise _UploadTooLargeError
+        if not upload.take(2 * len(chunk), budget):
+            raise _UploadBudgetError
+        yield chunk
+
+
 def _track_job(task: asyncio.Task) -> None:
-    """Keep a polled job alive until it is charged or refunded."""
+    """Keep a provider job alive until it is charged or refunded."""
     _pending_jobs.add(task)
     task.add_done_callback(_job_done)
 
@@ -284,7 +616,7 @@ def _job_done(task: asyncio.Task) -> None:
     """Forget a finished job, logging a crash nobody else may see."""
     _pending_jobs.discard(task)
     if not task.cancelled() and task.exception() is not None:
-        logger.error("Polled job crashed", exc_info=task.exception())
+        logger.error("Provider job crashed", exc_info=task.exception())
 
 
 async def _warm_up(name: str, provider: BaseProvider) -> None:
@@ -333,8 +665,11 @@ async def lifespan(app: FastAPI):
                 kwargs["web_search_cost_per_result"] = gw.web_search_cost_per_result
             elif name == "wavespeed":
                 kwargs["price_cache_ttl"] = config.gateway.price_cache_ttl
-            elif name == "nanogpt" or name == "spicyapi":
+            elif name == "nanogpt":
                 kwargs["default_max_tokens"] = config.gateway.default_max_tokens
+            elif name == "spicyapi":
+                kwargs["default_max_tokens"] = config.gateway.default_max_tokens
+                kwargs["price_cache_ttl"] = config.gateway.price_cache_ttl
             elif name == "tungsten":
                 kwargs["jwt_token"] = provider_config.jwt_token
                 kwargs["cf_clearance"] = provider_config.cf_clearance
@@ -407,13 +742,21 @@ async def lifespan(app: FastAPI):
     for task in warm_ups:
         task.cancel()
     await asyncio.gather(*warm_ups, return_exceptions=True)
-    # Shutdown: finish polled jobs (they may start settlements), then settle
+    # Shutdown: finish provider jobs (they may start settlements), then settle
     if _pending_jobs:
-        logger.info("Waiting for %d polled job(s)...", len(_pending_jobs))
+        logger.info("Waiting for %d provider job(s)...", len(_pending_jobs))
         await asyncio.gather(*_pending_jobs, return_exceptions=True)
     if _pending_settlements:
         logger.info("Waiting for %d pending settlement(s)...", len(_pending_settlements))
         await asyncio.gather(*_pending_settlements, return_exceptions=True)
+    # Unknown Base settlements can take until validBefore, up to hours. What
+    # they would credit lives in memory and dies with the process, so they
+    # stop here. Each looks its receipt up once more (at most
+    # _RECONCILE_LAST_LOOKUP_S, all at once) and logs whether the payer is owed.
+    reconciles = list(_pending_reconciles)
+    for task in reconciles:
+        task.cancel()
+    await asyncio.gather(*reconciles, return_exceptions=True)
     for provider in providers.values():
         if provider is not None:
             await provider.close()
@@ -556,8 +899,11 @@ async def service_info(request: Request) -> Response:
             "The request body format is defined by the upstream provider. "
             "x402gate forwards it unchanged, except that chat requests may get caps "
             "that keep the cost within the quote (max_tokens, provider.max_price, "
-            "web plugin limits), and options it cannot price before payment, such as "
+            "web plugin limits), WaveSpeed's enable_sync_mode is dropped (the gateway "
+            "polls), and options it cannot price before payment, such as "
             "stream: true, are refused with HTTP 400 before any payment. "
+            "Calls longer than 20 seconds are kept open with newline heartbeats "
+            "(status 200); read the body for the result or error. "
             "See provider_docs for API references."
         ),
         "payment_protocol": "x402",
@@ -606,7 +952,8 @@ async def ai_plugin_manifest() -> dict[str, Any]:
             "x402gate is a transparent payment proxy for AI services using the x402 protocol. "
             "The request body format is defined by the upstream provider; "
             "x402gate forwards it unchanged, except for chat cost caps (max_tokens, "
-            "provider.max_price) and HTTP 400 before payment for options it cannot "
+            "provider.max_price), WaveSpeed's enable_sync_mode (dropped; the gateway "
+            "polls) and HTTP 400 before payment for options it cannot "
             "price, such as stream: true. See the provider docs for body schema. "
             f"{providers_text}. "
             "If no payment is attached, the server returns HTTP 402 with accepted payment "
@@ -710,7 +1057,9 @@ async def topup(request: Request) -> Response:
     if raw_body is None:
         return _error_response(413, "Request body too large")
     try:
-        body = json.loads(raw_body) if raw_body else {}
+        body = _loads_client_json(raw_body) if raw_body else {}
+    except _JsonIntTooLongError:
+        return _error_response(400, "Invalid JSON body")
     except Exception:
         body = {}
 
@@ -719,6 +1068,8 @@ async def topup(request: Request) -> Response:
         try:
             requested_amount = Decimal(str(body_amount))
         except Exception:
+            return _error_response(400, "Invalid amount value")
+        if not requested_amount.is_finite():
             return _error_response(400, "Invalid amount value")
         if requested_amount < min_topup:
             return _error_response(400, f"Top-up amount below minimum (${min_topup})")
@@ -765,44 +1116,153 @@ async def topup(request: Request) -> Response:
     if net_credit <= 0:
         return _error_response(400, "Top-up amount too small to cover fees")
 
+    # One payment credits one top-up, and parallel copies must not each
+    # broadcast it. The claim is shared with paid jobs.
+    payment_id = payment_key(payment_sig)
+    if not payment_claims.claim(payment_id):
+        return _error_response(
+            409,
+            "This payment is already used by another request. "
+            "Check your balance before signing a new one.",
+        )
+
+    # Verify does not count this payer's other Base authorizations that have
+    # not landed, each with its own nonce, so the balance must cover them too,
+    # as on the job path. An unknown settlement keeps its amount counted.
+    is_base = payment_network.startswith("eip155:")
+    if is_base:
+        in_flight = base_in_flight.add(payer, topup_amount)
+        has_funds = await payment_handler.check_evm_balance(payment_network, payer, in_flight)
+        if not has_funds:
+            base_in_flight.remove(payer, topup_amount)
+            payment_claims.release(payment_id)
+            if has_funds is None:
+                return _error_response(503, "Payment network unavailable, retry")
+            if in_flight > topup_amount:
+                return _error_response(
+                    402,
+                    "Insufficient USDC balance: other payments from this wallet are still settling",
+                )
+            return _error_response(402, "Insufficient USDC balance")
+
+    async def _credit(settlement: dict[str, Any], settle_latency: float) -> Decimal:
+        """Credit a settled top-up and record it."""
+        new_balance = await deposit(payer, net_credit)
+        _record_onchain_settlement(
+            "topup", payment_network, settlement, settle_latency, revenue_usd=topup_amount
+        )
+        stats.record_topup(topup_amount)
+        # Revenue = full top-up amount, cost = net credit given to user.
+        # Card shows profit as if all balance was spent (commission + gas_surcharge - gas).
+        stats.record_revenue("topup", topup_amount, net_credit)
+        return new_balance
+
+    async def _credit_landed(receipt_settlement: dict[str, Any]) -> None:
+        """Credit a top-up whose unknown settlement later landed."""
+        new_balance = await _credit(receipt_settlement, time.monotonic() - t_settle_start)
+        logger.info(
+            "Top-up tx %s landed; credited $%s to %s (balance: $%s)",
+            receipt_settlement.get("transaction"),
+            net_credit,
+            payer[:12] + "…",
+            new_balance,
+        )
+
     # Settle before crediting. A failed or expired transaction must not
     # leave a prepaid balance that was never paid for.
     t_settle_start = time.monotonic()
-    settlement = await payment_handler.settle(
-        payment_sig,
-        topup_amount,
-        payment_network,
-        extra_context={"provider_name": "topup", "provider_cost": 0},
-    )
+    settlement: dict[str, Any] | None = None
+    state = "unknown"
+    try:
+        settlement = await payment_handler.settle(
+            payment_sig,
+            topup_amount,
+            payment_network,
+            extra_context={"provider_name": "topup", "provider_cost": 0},
+        )
+        state = settlement_state(settlement)
+    finally:
+        payment_claims.release(payment_id, _claim_hold_s(payment_sig, payment_network, state))
+        if is_base and state == "unknown":
+            # A top-up that lands is always owed to the payer.
+            _start_base_reconcile(
+                payment_network,
+                payer,
+                payment_sig,
+                settlement,
+                topup_amount,
+                _credit_landed,
+                owed=lambda: True,
+            )
+        elif is_base:
+            base_in_flight.remove(payer, topup_amount)
     settle_latency = time.monotonic() - t_settle_start
-    if not settlement or not settlement.get("success"):
-        reason = (settlement or {}).get("error_reason") or "unknown"
+    if settlement is None:
+        # settle crashed, maybe after sending. The claim stays held, so the
+        # same payment cannot be credited twice; a new one could pay twice.
+        logger.error("Top-up settlement status unknown for %s; nothing credited", payer[:12] + "…")
+        return _error_response(
+            502,
+            "Payment status unknown. Do not sign a new payment: check your wallet "
+            "and balance before trying again.",
+            outcome_unknown=True,
+        )
+    if state == "failed":
+        reason = settlement.get("error_reason") or "unknown"
         return _error_response(402, f"Payment settlement failed: {reason}")
 
-    new_balance = await deposit(payer, net_credit)
-    _record_onchain_settlement(
-        "topup",
-        payment_network,
-        settlement,
-        settle_latency,
-        revenue_usd=topup_amount,
-    )
+    warning = "Balance is stored in memory only. It will be lost on server restart."
+    if state == "unknown" and is_base:
+        # Sent, but its confirmation wait failed. Another authorization over
+        # the same USDC may have taken the funds, and then this one reverts,
+        # so nothing is credited until the receipt shows the transfer.
+        tx_hash = settlement.get("transaction") or ""
+        logger.error(
+            "Top-up settlement status unknown for %s, tx %s; credit waits for the receipt",
+            payer[:12] + "…",
+            tx_hash or "?",
+        )
+        stats.record_request("topup", time.monotonic() - t_start, True)
+        stats.record_overhead(payment_network, time.monotonic() - t_start)
+        content: dict[str, Any] = {
+            "pubkey": payer,
+            "credited": "0",
+            "pending_credit": str(net_credit),
+            "balance": str(get_balance(payer)),
+            "warning": warning,
+            "settlement_pending": True,
+            "transaction": tx_hash,
+            "message": "Do not sign a new payment; your balance is credited "
+            "once the transaction confirms.",
+        }
+        return JSONResponse(status_code=202, content=content)
+
+    if state == "unknown":
+        # Solana: sent, but its confirmation wait failed. It most likely
+        # lands; refusing the credit would lose the payer's money.
+        new_balance = await deposit(payer, net_credit)
+        stats.record_topup(topup_amount)
+        stats.record_revenue("topup", topup_amount, net_credit)
+        logger.error(
+            "Top-up settlement status unknown; credited $%s to %s, tx %s",
+            net_credit,
+            payer[:12] + "…",
+            settlement.get("transaction") or "?",
+        )
+    else:
+        new_balance = await _credit(settlement, settle_latency)
 
     stats.record_request("topup", time.monotonic() - t_start, True)
-    stats.record_topup(topup_amount)
-    # Revenue = full top-up amount, cost = net credit given to user.
-    # Card shows profit as if all balance was spent (commission + gas_surcharge - gas).
-    stats.record_revenue("topup", topup_amount, net_credit)
     stats.record_overhead(payment_network, time.monotonic() - t_start)
-
-    return JSONResponse(
-        content={
-            "pubkey": payer,
-            "credited": str(net_credit),
-            "balance": str(new_balance),
-            "warning": "Balance is stored in memory only. It will be lost on server restart.",
-        }
-    )
+    content = {
+        "pubkey": payer,
+        "credited": str(net_credit),
+        "balance": str(new_balance),
+        "warning": warning,
+    }
+    if state == "unknown":
+        content["settlement_pending"] = True
+    return JSONResponse(content=content)
 
 
 @app.get("/v1/balance/{pubkey}")
@@ -910,6 +1370,17 @@ async def _passthrough_proxy(provider_name: str, path: str, request: Request) ->
 
 
 async def _handle_managed_request(provider_name: str, path: str, request: Request) -> Response:
+    """Run a managed request, freeing its unpaid upload however it ends."""
+    upload = _UnpaidUpload()
+    try:
+        return await _managed_flow(provider_name, path, request, upload)
+    finally:
+        upload.release()
+
+
+async def _managed_flow(
+    provider_name: str, path: str, request: Request, upload: _UnpaidUpload
+) -> Response:
     """Unified x402 payment flow for managed providers.
 
     Flow:
@@ -945,6 +1416,12 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
     raw_body: bytes | None = None
     hashed_size = 0
     if "multipart/form-data" in content_type:
+        if not isinstance(provider, _MULTIPART_PROVIDERS):
+            return _error_response(
+                400,
+                f"{provider_name} takes a JSON body. Multipart uploads are not accepted.",
+                provider=provider.name,
+            )
         declared = request.headers.get("content-length", "")
         if declared.isdigit() and int(declared) > max_upload_bytes + _MULTIPART_OVERHEAD_BYTES:
             return _error_response(
@@ -953,7 +1430,22 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
             )
         form = None
         try:
-            form = await request.form()
+            # Parsed from a counted stream: a chunked upload declares no size.
+            stream = _capped_stream(
+                request,
+                max_upload_bytes + _MULTIPART_OVERHEAD_BYTES,
+                upload,
+                _unpaid_upload_budget(max_upload_bytes),
+            )
+            form = await asyncio.wait_for(
+                MultiPartParser(
+                    request.headers,
+                    stream,
+                    max_files=1,
+                    max_fields=_MULTIPART_MAX_FIELDS,
+                ).parse(),
+                _UPLOAD_READ_TIMEOUT_S,
+            )
             body: dict[str, Any] = {}
             for key in form:
                 value = form[key]
@@ -978,12 +1470,27 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
                     hashed_size = len(file_bytes)
                 elif key not in _INTERNAL_BODY_KEYS:
                     body[key] = value
+        except _UploadTooLargeError:
+            return _error_response(
+                413,
+                f"Request too large. Maximum file size: {config.gateway.max_upload_mb} MB",
+            )
+        except _UploadBudgetError:
+            response = _error_response(503, "Too many uploads in progress. Retry in a few seconds.")
+            response.headers["Retry-After"] = "5"
+            return response
+        except TimeoutError:
+            return _error_response(408, "Upload took too long. Send the file faster.")
+        except MultiPartException as e:
+            return _error_response(400, f"Invalid multipart form data: {e.message}")
         except Exception:
             return _error_response(400, "Invalid multipart form data")
         finally:
-            # Uploads are spooled to temp files; free them once read.
+            # Uploads are spooled to temp files; free them once read. Only the
+            # read copy stays in memory until the request is paid.
             if form is not None:
                 await form.close()
+            upload.keep(hashed_size)
     else:
         raw_body = await _read_body_capped(request, config.gateway.max_json_mb * 1024 * 1024)
         if raw_body is None:
@@ -993,7 +1500,7 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
         if raw_body.count(b"{") + raw_body.count(b"[") > _MAX_JSON_CONTAINERS:
             return _error_response(413, "Request body has too many JSON objects and arrays")
         try:
-            body = json.loads(raw_body)
+            body = _loads_client_json(raw_body)
         except Exception:
             return _error_response(400, "Invalid JSON body")
         if not isinstance(body, dict):
@@ -1011,15 +1518,31 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
             cache_key = await asyncio.to_thread(price_cache.key, price_key, body, raw_body)
         else:
             cache_key = price_cache.key(price_key, body, raw_body)
-        cached_price = price_cache.get_by_key(cache_key)
-        if cached_price is not None:
-            base_price = cached_price
+        cached = price_cache.entry_by_key(cache_key)
+        if cached is not None:
+            base_price, priced_extra = cached
+            body.update(priced_extra)
         else:
             base_price = await provider.get_price(path, body)
-            price_cache.set_by_key(cache_key, base_price)
+            priced_extra = {key: body[key] for key in _PRICED_BODY_KEYS if key in body}
+            price_cache.set_by_key(cache_key, base_price, priced_extra)
     except ProviderError as e:
-        stats.record_request(provider_name, 0, False, error_msg=e.detail)
-        return _error_response(e.status_code, e.detail, provider=e.provider)
+        # An unpaid client can cause any 4xx (an unknown model, say), so only
+        # provider-side failures count against health. The detail can echo
+        # client text, and the dashboard is public, so it gets a fixed one.
+        if e.status_code >= 500:
+            stats.record_request(
+                provider_name, 0, False, error_msg=f"Pricing failed: HTTP {e.status_code}"
+            )
+        response = _error_response(e.status_code, e.detail, provider=e.provider)
+        if e.status_code == 429:
+            response.headers["Retry-After"] = _PRICING_RETRY_AFTER_S
+        return response
+    except Exception:
+        # A gateway bug, not the provider's failure: nothing is charged and
+        # provider health is untouched.
+        logger.exception("%s pricing crashed", provider_name)
+        return _error_response(400, "Could not price this request", provider=provider.name)
 
     # 3. Apply commission
     final_price = apply_commission(
@@ -1113,6 +1636,8 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
         prepaid_mode = True
     else:
         return payment_handler.create_payment_required(final_price)
+    # Paid or held: the upload may stay in memory for the job.
+    upload.release()
 
     # 5b. Solana transactions carry a blockhash that expires in about a minute.
     # Settle before the provider call so a long job cannot outlive the signature.
@@ -1138,7 +1663,7 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
         finally:
             # Only a clear failure frees the payment at once. A crash or a
             # cancel may still have broadcast the transaction.
-            payment_claims.release(payment_id, 0.0 if state == "failed" else _SOLANA_CLAIM_HOLD_S)
+            payment_claims.release(payment_id, _claim_hold_s(payment_sig, payment_network, state))
         if state == "failed" or upfront_settlement is None:
             # None means settle crashed, maybe before sending anything. The
             # claim stays held in case the transaction went out.
@@ -1158,6 +1683,62 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
                 upfront_settlement,
                 time.monotonic() - t_settle_start,
             )
+
+    # A Base settlement with an unknown outcome is followed by a reconcile,
+    # which may see the transfer land before or after the job ends. Whichever
+    # comes second settles it once: a known failure is credited to prepaid,
+    # a kept payment is counted as revenue. "refund" is None until the job
+    # ends; "cost" is the provider cost of a kept payment. "resolved" is
+    # "failed" or "expired" once the reconcile ended without a landing.
+    base_follow: dict[str, Any] = {
+        "landed": None,
+        "refund": None,
+        "cost": None,
+        "done": False,
+        "resolved": None,
+    }
+
+    async def _follow_up() -> dict[str, str]:
+        """Settle a landed Base payment against the job's outcome, at most once."""
+        landed = base_follow["landed"]
+        if base_follow["done"] or landed is None or base_follow["refund"] is None:
+            return {}
+        # Set before any await, so the two callers cannot both get here.
+        base_follow["done"] = True
+        if base_follow["refund"]:
+            return await _refund_settled_payment(payer, final_price)
+        stats.record_revenue(
+            provider_name, Decimal(str(landed.get("amount_usdc", 0))), base_follow["cost"]
+        )
+        return {}
+
+    def _job_ended(*, refund: bool, cost: Decimal = Decimal("0")) -> None:
+        """Note how the job ended, for a Base payment that lands later."""
+        base_follow["refund"] = refund
+        base_follow["cost"] = cost
+
+    async def _landed(receipt_settlement: dict[str, Any]) -> None:
+        """Record a Base settlement whose unknown outcome later landed."""
+        _record_onchain_settlement(
+            provider_name,
+            payment_network,
+            receipt_settlement,
+            time.monotonic() - t_gen_start,
+        )
+        base_follow["landed"] = receipt_settlement
+        await _follow_up()
+
+    def _unresolved(state: str) -> None:
+        """Note that the reconcile ended without the transfer landing."""
+        base_follow["resolved"] = state
+
+    def _owed() -> bool:
+        """Whether a landed Base payment is owed back: only a known failure.
+
+        A job that has not ended (refund None) counts as an unknown outcome,
+        so its payment is kept.
+        """
+        return base_follow["refund"] is True
 
     async def _settle_base() -> dict[str, Any] | None:
         """Settle the Base authorization while the provider runs.
@@ -1184,10 +1765,26 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
                 },
             )
         finally:
-            base_in_flight.remove(payer, final_price)
-            failed = settlement_state(settlement) == "failed"
-            payment_claims.release(payment_id, 0.0 if failed else _BASE_CLAIM_HOLD_S)
-        if settlement_state(settlement) == "ok":
+            # An unknown outcome keeps the claim until the authorization
+            # expires: a replay would pass verify while the transaction waits.
+            state = settlement_state(settlement)
+            payment_claims.release(payment_id, _claim_hold_s(payment_sig, payment_network, state))
+            if state == "unknown":
+                # The amount stays counted until the receipt resolves, so a
+                # new nonce cannot spend the same USDC in the meantime.
+                _start_base_reconcile(
+                    payment_network,
+                    payer,
+                    payment_sig,
+                    settlement,
+                    final_price,
+                    _landed,
+                    owed=_owed,
+                    on_unresolved=_unresolved,
+                )
+            else:
+                base_in_flight.remove(payer, final_price)
+        if state == "ok":
             _record_onchain_settlement(
                 provider_name,
                 payment_network,
@@ -1234,7 +1831,41 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
             settlement = upfront_settlement
             if base_settle is not None:
                 settlement = await _base_settlement()
-            if settlement_state(settlement) == "unknown" and (upfront_settlement or base_settle):
+            tx_hash = (settlement or {}).get("transaction") or ""
+            if settlement_state(settlement) == "unknown" and base_settle is not None and tx_hash:
+                # The reconcile follows this transaction. A known failure is
+                # credited once the receipt shows the transfer, which may
+                # already have happened; a revert or an expiry credits nothing.
+                _job_ended(refund=not keep_payment, cost=base_price)
+                credited = await _follow_up()
+                resolved = base_follow["resolved"]
+                if credited:
+                    extra.update(credited)
+                elif not keep_payment and resolved == "failed":
+                    # The transfer reverted: the payer was charged nothing.
+                    logger.warning(
+                        "%s failed and Base tx %s reverted; nothing charged or credited",
+                        provider_name,
+                        tx_hash,
+                    )
+                elif not keep_payment and resolved is not None:
+                    logger.error(
+                        "%s failed and Base tx %s never resolved before its authorization "
+                        "expired; nothing credited",
+                        provider_name,
+                        tx_hash,
+                    )
+                elif not keep_payment:
+                    extra["settlement_pending"] = True
+                    extra["pending_refund"] = str(final_price)
+                    extra["transaction"] = tx_hash
+                    logger.error(
+                        "%s failed and the payment status is unknown; the refund waits "
+                        "for the receipt of tx %s",
+                        provider_name,
+                        tx_hash,
+                    )
+            elif settlement_state(settlement) == "unknown" and (upfront_settlement or base_settle):
                 logger.error(
                     "%s failed and the payment status is unknown; nothing credited",
                     provider_name,
@@ -1300,24 +1931,10 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
         base_settle = asyncio.create_task(_settle_base())
         _pending_settlements.add(base_settle)
         base_settle.add_done_callback(_pending_settlements.discard)
-    try:
-        result = await provider.submit(path, body, prepaid=prepaid_mode)
-
-        # 7. Determine if response is async (needs polling) or sync (ready)
-        #    - Sync providers (OpenRouter, TTS, etc.) return results directly,
-        #      often in OpenAI format with "choices" or "data" (list) key
-        #    - Async providers (WaveSpeed) return {"data": {"id": ..., "status": ...}}
-        task_data = result.get("data", result)
-        is_async = (
-            isinstance(task_data, dict)
-            and "id" in task_data
-            and "status" in task_data
-            and "choices" not in result
-        )
-    except ProviderError as e:
-        return await _job_failed(e)
-    except Exception as e:
-        return await _job_crashed(e)
+    # Set by _run_job once the provider answers; _respond reads them.
+    result: dict[str, Any] = {}
+    is_async = False
+    task_id = ""
 
     async def _respond(output: Any) -> JSONResponse:
         """Settle a finished provider call and build the client response."""
@@ -1398,6 +2015,9 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
                 logger.error(
                     "Base settlement status unknown for %s; returning the result", provider_name
                 )
+                # Revenue is counted if the reconcile sees the transfer land.
+                _job_ended(refund=False, cost=actual_base_price)
+                await _follow_up()
             elif state != "ok":
                 # A failure, or a settle that crashed (None), maybe before sending.
                 reason = (settlement or {}).get("error_reason") or "unknown"
@@ -1437,15 +2057,32 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
             },
         )
 
-    if not is_async:
-        return await _respond(task_data)
-
-    task_id = task_data["id"]
-
-    async def _finish_job() -> JSONResponse:
-        """Wait for the polled job, then charge or refund it."""
+    async def _run_job() -> JSONResponse:
+        """Call the provider, wait for a polled job, then charge or refund it."""
+        nonlocal result, is_async, task_id
         try:
-            output = await provider.get_result(task_id)
+            if isinstance(provider, SpicyApiProvider):
+                # SpicyAPI refuses a fresh quote above the price charged here.
+                result = await provider.submit(
+                    path, body, prepaid=prepaid_mode, paid_price=base_price
+                )
+            else:
+                result = await provider.submit(path, body, prepaid=prepaid_mode)
+
+            # 7. Determine if response is async (needs polling) or sync (ready)
+            #    - Sync providers (OpenRouter, TTS, etc.) return results directly,
+            #      often in OpenAI format with "choices" or "data" (list) key
+            #    - Async providers (WaveSpeed) return {"data": {"id": ..., "status": ...}}
+            output = result.get("data", result)
+            is_async = (
+                isinstance(output, dict)
+                and "id" in output
+                and "status" in output
+                and "choices" not in result
+            )
+            if is_async:
+                task_id = output["id"]
+                output = await provider.get_result(task_id)
         except (TaskTimeoutError, ProviderError) as e:
             return await _job_failed(e)
         except Exception as e:
@@ -1454,18 +2091,17 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
 
     # The job runs in its own task, so a client that disconnects does not
     # stop it. It still finishes and is charged or refunded on its outcome.
-    finish = asyncio.create_task(_finish_job())
+    # Synchronous calls (chat, TTS) run the same way: a long one sends no
+    # bytes until it ends, and Railway would cut the idle connection.
+    finish = asyncio.create_task(_run_job())
     _track_job(finish)
     try:
         return await asyncio.wait_for(asyncio.shield(finish), _HEARTBEAT_INTERVAL_S)
     except TimeoutError:
-        logger.info(
-            "Holding %s task %s open with heartbeats",
-            provider_name,
-            task_id,
-        )
+        job = f"task {task_id}" if task_id else "call"
+        logger.info("Holding %s %s open with heartbeats", provider_name, job)
         return StreamingResponse(
-            _stream_finished_job(finish, provider_name, task_id),
+            _stream_finished_job(finish, provider_name, job),
             media_type="application/json",
             headers={
                 "Cache-Control": "no-cache",
@@ -1477,9 +2113,9 @@ async def _handle_managed_request(provider_name: str, path: str, request: Reques
 async def _stream_finished_job(
     finish: asyncio.Task[JSONResponse],
     provider_name: str,
-    task_id: str,
+    job: str,
 ) -> Any:
-    """Send JSON whitespace until a polled job finishes, then its body.
+    """Send JSON whitespace until a provider job finishes, then its body.
 
     The HTTP status is already 200 once the first pad goes out. A later
     failure is the usual error JSON in that body. If the client leaves,
@@ -1497,8 +2133,8 @@ async def _stream_finished_job(
         yield finish.result().body
     except (GeneratorExit, asyncio.CancelledError):
         logger.warning(
-            "Client left %s task %s before the result; it is billed on its outcome",
+            "Client left %s %s before the result; it is billed on its outcome",
             provider_name,
-            task_id,
+            job,
         )
         raise

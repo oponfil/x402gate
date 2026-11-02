@@ -62,7 +62,7 @@ Top up your prepaid balance.
 
 **Without payment header** → validates amount, returns 402 with payment requirements for the specified amount.
 
-**With `PAYMENT-SIGNATURE` header** → verifies the USDC payment, settles it on-chain, and only then deducts commission (4% + $0.001 gas) and credits the remaining amount. The signed amount must sit inside the min/max limits and, when the body includes `amount`, must equal that amount. Otherwise the response is HTTP 400 and nothing is settled. If settlement fails, the balance is not credited and the response is HTTP 402.
+**With `PAYMENT-SIGNATURE` header** → verifies the USDC payment, settles it on-chain, and only then deducts commission (4% + $0.001 gas) and credits the remaining amount. The signed amount must sit inside the min/max limits and, when the body includes `amount`, must equal that amount. Otherwise the response is HTTP 400 and nothing is settled. If settlement fails, the balance is not credited and the response is HTTP 402. A Base top-up is checked before settling: the wallet's USDC must cover it plus its other unsettled Base payments, or the response is HTTP 402 (`Insufficient USDC balance`, or `...: other payments from this wallet are still settling`); if the check cannot run, HTTP 503 `Payment network unavailable, retry`. If the settlement was sent but its confirmation is still pending, the response adds `"settlement_pending": true`. A Solana top-up is then credited at once. A Base top-up answers HTTP 202 with `"credited": "0"`, `pending_credit`, `transaction` and a `message`, and the credit is added once the transaction's receipt shows the transfer; a reverted transfer, an authorization that expires first, or a gateway restart meanwhile credits nothing. Do not sign a new payment while it is pending. If the settle status is unknown (it crashed, maybe after sending), nothing is credited and the response is HTTP 502 with `outcome_unknown: true`: check your wallet and balance before signing a new payment. A payment that another top-up or a job is using gets HTTP 409, and a non-finite `amount` (NaN, Infinity) or a JSON integer longer than 40 characters (`Invalid JSON body`) gets HTTP 400. Base top-ups take EIP-3009 authorizations only; Permit2 gets 402.
 
 Response:
 ```json
@@ -71,6 +71,20 @@ Response:
   "credited": "0.095000",
   "balance": "0.095000",
   "warning": "Balance is stored in memory only. It will be lost on server restart."
+}
+```
+
+Pending Base top-up (HTTP 202):
+```json
+{
+  "pubkey": "0xYourEvmAddress",
+  "credited": "0",
+  "pending_credit": "0.095000",
+  "balance": "0",
+  "warning": "Balance is stored in memory only. It will be lost on server restart.",
+  "settlement_pending": true,
+  "transaction": "0x...",
+  "message": "Do not sign a new payment; your balance is credited once the transaction confirms."
 }
 ```
 
@@ -126,7 +140,7 @@ A failure the provider reported returns the full hold. Its error JSON has `"prep
 
 If the client disconnects during a long job, the job still finishes and is charged or refunded by the same rules.
 
-**Long jobs:** a polled job that runs longer than 20 seconds is kept open with whitespace heartbeats. Its headers go out with the first heartbeat, before the cost is known, so that response has no `X-Prepaid-*` headers and the cost is **only in the body**. The HTTP status is already 200 by then. A failure shows up as the usual error JSON, with `status` and `prepaid`. Reading the body is the reliable way for every request.
+**Long jobs:** any call, synchronous or polled, that runs longer than 20 seconds is kept open with newline heartbeats. Its headers go out with the first heartbeat, before the cost is known, so that response has no `X-Prepaid-*` headers and the cost is **only in the body**. The HTTP status is already 200 by then. A failure shows up as the usual error JSON, with `status` and `prepaid`. Reading the body is the reliable way for every request.
 
 The `prepaid` object appears only on prepaid requests. Do not confuse it with `refunded_to_prepaid` and `prepaid_balance`: those appear on a failed **x402** payment (Base or Solana), when the settled amount is credited to the payer's prepaid balance.
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import re
 from decimal import Decimal
 from typing import Any
 
@@ -18,7 +19,14 @@ import httpx
 from x402gate.core import http
 from x402gate.core.config import ProviderConfig
 from x402gate.core.http import shared_client
-from x402gate.providers.base import BaseProvider, ProviderError, require_text
+from x402gate.core.proxy import UPSTREAM_CREDENTIALS_DETAIL, rejected_credentials
+from x402gate.providers.base import (
+    BaseProvider,
+    ProviderError,
+    optional_str,
+    raise_for_gateway_timeout,
+    require_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +34,28 @@ logger = logging.getLogger(__name__)
 # Can be overridden via config.yaml → providers.fishaudio.pricing
 _DEFAULT_PRICE_PER_1K_BYTES = Decimal("0.015")
 _ONE_THOUSAND = Decimal("1000")
+
+# 'model' is sent as an HTTP header. A value httpx/h11 cannot encode
+# (non-ASCII, CR/LF, NUL) would fail only after payment, so only plain
+# model names such as "s1" or "speech-1.6" pass.
+_MODEL_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+
+def _model_header(inputs: dict[str, Any], provider_name: str) -> str:
+    """Return the optional ``model`` header value, ``""`` when missing or null.
+
+    Raises:
+        ProviderError: 400 for a non-string or a value that is not a plain
+            model name.
+    """
+    model = optional_str(inputs, "model", provider_name)
+    if model and not _MODEL_RE.fullmatch(model):
+        raise ProviderError(
+            provider=provider_name,
+            detail="'model' must be a plain model name: 1-64 letters, digits, '.', '_' or '-'",
+            status_code=400,
+        )
+    return model
 
 
 class FishAudioProvider(BaseProvider):
@@ -54,6 +84,9 @@ class FishAudioProvider(BaseProvider):
             Base price in USD.
         """
         text = require_text(inputs, self.name)
+        # model becomes an HTTP header; both are checked before payment.
+        _model_header(inputs, self.name)
+        optional_str(inputs, "reference_id", self.name)
 
         utf8_bytes = len(text.encode("utf-8"))
         price = Decimal(utf8_bytes) / _ONE_THOUSAND * self._price_per_1k
@@ -88,7 +121,7 @@ class FishAudioProvider(BaseProvider):
         """
         text = require_text(body, self.name)
 
-        reference_id = body.get("reference_id", "")
+        reference_id = optional_str(body, "reference_id", self.name)
         chunk_length = body.get("chunk_length", 200)
         audio_format = body.get("format", "mp3")
         latency = body.get("latency", "normal")
@@ -101,7 +134,7 @@ class FishAudioProvider(BaseProvider):
         }
 
         # Fish Audio API expects 'model' as an HTTP header, not a JSON body field
-        model = body.get("model", "")
+        model = _model_header(body, self.name)
         if model:
             headers["model"] = model
 
@@ -138,12 +171,18 @@ class FishAudioProvider(BaseProvider):
                 detail=f"Failed to call FishAudio: {e}",
             ) from e
 
-        if resp.status_code >= 400:
-            status = 502 if resp.status_code in (401, 402, 403) else resp.status_code
+        if rejected_credentials(resp.status_code):
+            logger.error("FishAudio rejected our key (%d): %s", resp.status_code, resp.text[:300])
+            raise ProviderError(provider=self.name, detail=UPSTREAM_CREDENTIALS_DETAIL)
+
+        raise_for_gateway_timeout(resp.status_code, self.name, "FishAudio")
+
+        # httpx does not follow redirects, so a 3xx never reached the API.
+        if not 200 <= resp.status_code < 300:
             raise ProviderError(
                 provider=self.name,
                 detail=f"FishAudio error ({resp.status_code}): {resp.text[:500]}",
-                status_code=status,
+                status_code=resp.status_code if resp.status_code >= 400 else 502,
             )
 
         audio_b64 = base64.b64encode(resp.content).decode("ascii")

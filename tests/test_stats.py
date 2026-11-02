@@ -11,6 +11,8 @@ from x402gate.core.stats import (
     get_logs,
     get_stats,
     init,
+    record_prepaid_usage,
+    record_refund_credit,
     record_request,
     record_revenue,
     record_topup,
@@ -159,6 +161,31 @@ class TestRecordTopup:
         s = get_stats()
         assert s["total_topups"] == 2
         assert s["total_topup_usd"] == "3.5000"
+
+
+class TestRefundCredit:
+    """A settled payment refunded to prepaid and then spent nets to zero."""
+
+    def setup_method(self):
+        reset()
+        init(["wavespeed"])
+
+    def test_refund_then_spend_keeps_profit_at_zero(self):
+        record_refund_credit(Decimal("0.5"))
+        s = get_stats()
+        assert s["total_revenue_usd"] == "0.5000"
+        assert s["total_profit_usd"] == "0.5000"
+        # The payer spends the credit; the provider is paid the same amount.
+        record_prepaid_usage("wavespeed", Decimal("0.5"))
+        s = get_stats()
+        assert s["total_revenue_usd"] == "0.5000"
+        assert s["total_cost_usd"] == "0.5000"
+        assert s["total_profit_usd"] == "0.0000"
+
+    def test_reset_clears_refund_credit(self):
+        record_refund_credit(Decimal("1"))
+        reset()
+        assert get_stats()["total_revenue_usd"] == "0.0000"
 
 
 class TestLogs:

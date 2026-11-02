@@ -20,7 +20,7 @@ AI agents need to pay for services. Today that means:
 1. **Discover** available services via `GET /` (JSON manifest) or `GET /v1/providers`
 2. **Request** any AI service → receive `HTTP 402` with the USDC price
 3. **Sign** an on-chain payment with its own wallet
-4. **Receive** the result — payment settles only on success (escrow model)
+4. **Receive** the result — if the provider reports a failure, the settled payment is credited back to the agent's prepaid balance
 
 ### Providers Available Today
 
@@ -37,7 +37,7 @@ AI agents need to pay for services. Today that means:
 
 ### Key Design Principles
 
-- **No payment on failure.** If the AI provider errors out, the payment is never settled. The agent keeps its USDC.
+- **Refund on known failure.** The payment settles on-chain with the request: on Base in parallel with the provider call (the result is returned only once it lands), on Solana just before it. If the provider reports a failure, the full settled amount is credited to the agent's prepaid balance on the gateway (in memory, not sent back on-chain) for its next requests; on Base, if the settlement is still unconfirmed, the refund is credited once the transfer confirms. If the outcome is unknown (a timeout or dropped connection after the request was sent), the payment is kept, because the provider may have run and billed the job.
 - **Transparent pricing.** 4% commission + $0.001 gas surcharge. All costs visible in the 402 response.
 - **Multi-network.** Both Base (EVM) and Solana are supported simultaneously.
 - **Prepaid mode.** For high-frequency agents: top-up once, skip per-request blockchain transactions.
@@ -85,10 +85,13 @@ Agent                      x402gate                   AI Provider
   ├─ POST + PAYMENT-SIGNATURE►                          │
   │                          ├─ verify on-chain          │
   │                          ├─ forward request ────────►│
+  │                          ├─ settle on-chain (Base)   │
   │                          │◄─ result ────────────────┤
-  │                          ├─ settle on-chain          │
+  │                          ├─ wait for settlement      │
   │◄─── 200 + result ───────┤                          │
 ```
+
+On Solana the settle step runs right after verify, before the request is forwarded, because the signed transaction expires in about a minute.
 
 ## On-Chain Artifacts
 

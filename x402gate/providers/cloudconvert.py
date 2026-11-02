@@ -12,6 +12,7 @@ Implements the BaseProvider interface for CloudConvert's REST API v2:
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 from decimal import Decimal
 from typing import Any
@@ -28,7 +29,7 @@ from x402gate.core.proxy import (
     UpstreamMayHaveRun,
     rejected_credentials,
 )
-from x402gate.providers.base import BaseProvider, ProviderError
+from x402gate.providers.base import BaseProvider, ProviderError, raise_for_gateway_timeout
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +137,25 @@ def _validate_body(body: dict[str, Any], provider_name: str) -> tuple[str, Any, 
     return operation, output_format, file_bytes, file_name
 
 
+class _UploadFile(io.BytesIO):
+    """The file to upload, noting once httpx has read all of it.
+
+    httpcore asks for the next chunk of a request body only after it wrote
+    the previous one, so a read that finds the end means every byte of the
+    file was handed to the socket. httpcore hides a write that fails midway
+    and reads the answer instead, so the httpx error alone cannot tell a
+    reset during the upload from one after it.
+    """
+
+    sent = False
+
+    def read(self, size: int | None = -1, /) -> bytes:
+        chunk = super().read(size)
+        if not chunk and size != 0:
+            self.sent = True
+        return chunk
+
+
 class CloudConvertProvider(BaseProvider):
     """CloudConvert file conversion and optimization provider.
 
@@ -232,6 +252,12 @@ class CloudConvertProvider(BaseProvider):
             },
         }
 
+        # Until the file is uploaded the job cannot run and CloudConvert bills
+        # nothing, so any failure here is known and refunded, a read timeout
+        # included. It is raised outside the except block so no httpx error
+        # is chained for outcome_unknown() to find.
+        resp: httpx.Response | None = None
+        failure = ""
         try:
             resp = await shared_client().post(
                 f"{self._config.base_url.rstrip('/')}/jobs",
@@ -242,24 +268,26 @@ class CloudConvertProvider(BaseProvider):
                 },
                 timeout=http.timeout(30.0),
             )
+        except Exception as e:
+            failure = f"Failed to create job: {e}"
+        if resp is None:
+            raise ProviderError(provider=self.name, detail=failure, status_code=502)
 
-            if rejected_credentials(resp.status_code):
-                logger.error(
-                    "CloudConvert rejected our key (%d): %s", resp.status_code, resp.text[:200]
-                )
-                raise ProviderError(provider=self.name, detail=UPSTREAM_CREDENTIALS_DETAIL)
+        if rejected_credentials(resp.status_code):
+            logger.error(
+                "CloudConvert rejected our key (%d): %s", resp.status_code, resp.text[:200]
+            )
+            raise ProviderError(provider=self.name, detail=UPSTREAM_CREDENTIALS_DETAIL)
 
-            if resp.status_code >= 400:
-                raise ProviderError(
-                    provider=self.name,
-                    detail=f"Failed to create job: {resp.text}",
-                    status_code=resp.status_code,
-                )
+        if resp.status_code >= 400:
+            raise ProviderError(
+                provider=self.name,
+                detail=f"Failed to create job: {resp.text}",
+                status_code=resp.status_code,
+            )
 
+        try:
             job = resp.json().get("data", resp.json())
-
-        except ProviderError:
-            raise
         except Exception as e:
             raise ProviderError(
                 provider=self.name,
@@ -291,30 +319,42 @@ class CloudConvertProvider(BaseProvider):
                 status_code=502,
             )
 
+        upload_resp: httpx.Response | None = None
+        upload_file = _UploadFile(file_bytes)
         try:
             # Upload: multipart POST with form parameters + file
-            resp = await shared_client().post(
+            upload_resp = await shared_client().post(
                 upload_url,
                 data=upload_params,
-                files={"file": (file_name, file_bytes)},
+                files={"file": (file_name, upload_file)},
                 timeout=http.timeout(120.0),
             )
-
-            if resp.status_code >= 400:
+        except Exception as e:
+            if upload_file.sent:
+                # The whole file was sent before the answer was lost: the
+                # conversion may run and be billed, so the payment is kept.
                 raise ProviderError(
                     provider=self.name,
-                    detail=f"File upload failed: {resp.text}",
+                    detail=f"File upload failed: {e}",
                     status_code=502,
-                )
+                ) from UpstreamMayHaveRun(f"{type(e).__name__} after the upload")
+            # The file never fully arrived (a reset or stall midway, a connect
+            # or pool failure), so the conversion cannot start. Known,
+            # refunded, and raised below so no httpx error is chained.
+            failure = f"File upload failed: {e}"
+        if upload_resp is None:
+            raise ProviderError(provider=self.name, detail=failure, status_code=502)
 
-        except ProviderError:
-            raise
-        except Exception as e:
+        if upload_file.sent:
+            # A proxy that gave up after the whole file was sent: the upload
+            # host may have stored it, as after a lost answer.
+            raise_for_gateway_timeout(upload_resp.status_code, self.name, "File upload")
+        if upload_resp.status_code >= 400:
             raise ProviderError(
                 provider=self.name,
-                detail=f"File upload failed: {e}",
+                detail=f"File upload failed: {upload_resp.text}",
                 status_code=502,
-            ) from e
+            )
 
         job_id = job.get("id")
         logger.info(

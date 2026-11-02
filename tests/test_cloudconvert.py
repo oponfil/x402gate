@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import socket
+import struct
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -903,3 +906,233 @@ class TestPollWithoutDelay:
             await provider.get_result("job_1")
         sleep.assert_not_called()
         assert client.get.call_args.kwargs["timeout"] == http.timeout(30.0)
+
+
+_CREATED = {
+    "data": {
+        "id": "job_1",
+        "tasks": [
+            {
+                "name": "upload-file",
+                "result": {"form": {"url": "https://up.example", "parameters": {}}},
+            }
+        ],
+    }
+}
+
+
+class TestSubmitTransportFailures:
+    """A job only runs once its whole file arrived; before that a failure is refunded."""
+
+    async def _submit(self, responses: list) -> ProviderError:
+        client = _mock_client("post", responses)
+        with (
+            patch("x402gate.providers.cloudconvert.shared_client", return_value=client),
+            pytest.raises(ProviderError) as caught,
+        ):
+            await _make_provider().submit("convert", dict(_VALID_BODY))
+        return caught.value
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "error",
+        [
+            httpx.ReadTimeout("slow"),
+            httpx.ReadError("dropped"),
+            httpx.RemoteProtocolError("dropped"),
+            httpx.ConnectError("refused"),
+        ],
+    )
+    async def test_job_creation_failure_is_refunded(self, error):
+        """No file was uploaded, so the job cannot run and nothing is billed."""
+        caught = await self._submit([error])
+        assert caught.status_code == 502
+        assert "Failed to create job" in caught.detail
+        assert outcome_unknown(caught) is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "error",
+        [
+            httpx.WriteTimeout("slow"),
+            httpx.WriteError("dropped"),
+            httpx.ConnectError("refused"),
+            httpx.PoolTimeout("busy"),
+        ],
+    )
+    async def test_upload_that_never_arrived_is_refunded(self, error):
+        """The file never fully arrived, so the conversion cannot start."""
+        caught = await self._submit([_response(201, _CREATED), error])
+        assert "File upload failed" in caught.detail
+        assert outcome_unknown(caught) is False
+
+    async def _upload(self, answer, *, sent: bool) -> ProviderError:
+        """Submit with an upload that raises or returns ``answer``.
+
+        With ``sent``, httpx reads the whole file first, as when every byte
+        was written to the socket.
+        """
+
+        async def post(url, **kwargs):
+            if "files" not in kwargs:
+                return _response(201, _CREATED)
+            if sent:
+                _name, upload = kwargs["files"]["file"]
+                while upload.read(64 * 1024):
+                    pass
+            if isinstance(answer, BaseException):
+                raise answer
+            return answer
+
+        client = AsyncMock()
+        client.post.side_effect = post
+        with (
+            patch("x402gate.providers.cloudconvert.shared_client", return_value=client),
+            pytest.raises(ProviderError) as caught,
+        ):
+            await _make_provider().submit("convert", dict(_VALID_BODY))
+        return caught.value
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "error",
+        [
+            httpx.ReadTimeout("slow"),
+            httpx.ReadError("dropped"),
+            httpx.RemoteProtocolError("dropped"),
+            httpx.WriteError("dropped"),
+        ],
+    )
+    async def test_answer_lost_after_upload_keeps_the_payment(self, error):
+        """The whole file was sent: the conversion may run and be billed."""
+        caught = await self._upload(error, sent=True)
+        assert "File upload failed" in caught.detail
+        assert outcome_unknown(caught) is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "error",
+        [
+            httpx.ReadTimeout("slow"),
+            httpx.ReadError("reset"),
+            httpx.RemoteProtocolError("Server disconnected without sending a response."),
+        ],
+    )
+    async def test_read_error_before_the_whole_file_was_sent_is_refunded(self, error):
+        """httpcore hides a write that failed midway and reports the read after it."""
+        caught = await self._upload(error, sent=False)
+        assert "File upload failed" in caught.detail
+        assert outcome_unknown(caught) is False
+
+    @pytest.mark.asyncio
+    async def test_upload_error_status_is_refunded(self):
+        caught = await self._submit([_response(201, _CREATED), _response(500, text="down")])
+        assert caught.status_code == 502
+        assert outcome_unknown(caught) is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [500, 502, 503, 521])
+    async def test_other_error_statuses_after_the_upload_are_refunded(self, status):
+        caught = await self._upload(_response(status, text="down"), sent=True)
+        assert caught.status_code == 502
+        assert outcome_unknown(caught) is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [504, 520, 524])
+    async def test_gateway_timeout_after_the_upload_keeps_the_payment(self, status):
+        """A proxy gave up after the whole file was sent: it may have been stored."""
+        caught = await self._upload(_response(status, text="timeout"), sent=True)
+        assert caught.status_code == 504
+        assert outcome_unknown(caught) is True
+
+    @pytest.mark.asyncio
+    async def test_gateway_timeout_before_the_whole_file_was_sent_is_refunded(self):
+        caught = await self._upload(_response(524, text="timeout"), sent=False)
+        assert caught.status_code == 502
+        assert outcome_unknown(caught) is False
+
+
+class TestUploadOverTheNetwork:
+    """A real upload host that resets or stalls; httpcore turns a failed write into a read."""
+
+    _SIZE = 20 * 1024 * 1024
+
+    async def _submit(self, upload_host) -> tuple[ProviderError, int]:
+        """Submit a 20 MB file to a local server whose upload is handled by ``upload_host``."""
+        received = 0
+
+        async def handle(reader, writer):
+            nonlocal received
+            while True:
+                head = (await reader.readuntil(b"\r\n\r\n")).decode()
+                length = int(head.lower().split("content-length:")[1].split("\r\n")[0])
+                if not head.startswith("POST /v2/jobs"):
+                    break
+                await reader.readexactly(length)
+                port = writer.get_extra_info("sockname")[1]
+                form = {"url": f"http://127.0.0.1:{port}/upload", "parameters": {"k": "v"}}
+                body = json.dumps(
+                    {
+                        "data": {
+                            "id": "job_1",
+                            "tasks": [{"name": "upload-file", "result": {"form": form}}],
+                        }
+                    }
+                ).encode()
+                writer.write(
+                    b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\n"
+                    + f"Content-Length: {len(body)}\r\n\r\n".encode()
+                    + body
+                )
+                await writer.drain()
+            received = await upload_host(reader, writer, length)
+
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        provider = _make_provider(base_url=f"http://127.0.0.1:{port}/v2")
+        body = {"output_format": "pdf", "_file_bytes": b"x" * self._SIZE, "_file_name": "a.docx"}
+        try:
+            with pytest.raises(ProviderError) as caught:
+                await provider.submit("convert", body)
+        finally:
+            server.close()
+            await http.close_shared_client()
+        return caught.value, received
+
+    @staticmethod
+    def _reset(writer) -> None:
+        sock = writer.get_extra_info("socket")
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        writer.transport.abort()
+
+    @pytest.mark.asyncio
+    async def test_reset_midway_is_refunded(self):
+        async def upload_host(reader, writer, length):
+            chunk = await reader.read(64 * 1024)
+            self._reset(writer)
+            return len(chunk)
+
+        caught, received = await self._submit(upload_host)
+        assert received < self._SIZE
+        assert outcome_unknown(caught) is False
+
+    @pytest.mark.asyncio
+    async def test_reset_after_the_whole_file_keeps_the_payment(self):
+        async def upload_host(reader, writer, length):
+            await reader.readexactly(length)
+            self._reset(writer)
+            return length
+
+        caught, received = await self._submit(upload_host)
+        assert received > self._SIZE
+        assert outcome_unknown(caught) is True
+
+    @pytest.mark.asyncio
+    async def test_stalled_reader_is_refunded(self):
+        async def upload_host(reader, writer, length):
+            await asyncio.sleep(5)
+            return 0
+
+        with patch.object(http, "timeout", return_value=httpx.Timeout(0.5)):
+            caught, _ = await self._submit(upload_host)
+        assert outcome_unknown(caught) is False

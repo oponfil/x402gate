@@ -68,16 +68,74 @@ _TEXT_CHECK_MAX_ENTRIES = 2048
 # A failed catalog load is retried on demand at most this often.
 _CATALOG_RETRY_S = 60
 
-# Results that came back finished in the submit answer (sync mode), kept until
-# the app asks get_result for them. Bounded in case it never does.
+# Results that came back finished in the submit answer, kept until the app
+# asks get_result for them. Bounded in case it never does.
 _FINISHED_MAX_ENTRIES = 256
 
+# Inputs with more text than this are hashed off the event loop, as app.py
+# does for its own price key: serializing 40 MB of base64 takes tens of ms.
+_HASH_IN_THREAD_CHARS = 1024 * 1024
+# Inputs with more values than this are hashed off the event loop too,
+# without walking the rest of them.
+_ROUGH_SIZE_MAX_VALUES = 10_000
 
-def _price_key(model_path: str, inputs: dict[str, Any], drop: frozenset[str]) -> str:
-    """Return a cache key for the model and the inputs without ``drop``."""
-    kept = {key: value for key, value in inputs.items() if key not in drop}
-    inputs_json = json.dumps(kept, sort_keys=True, default=str)
-    return f"{model_path}:{hashlib.sha256(inputs_json.encode()).hexdigest()[:32]}"
+
+def _price_keys(
+    model_path: str, inputs: dict[str, Any], text_fields: tuple[str, ...]
+) -> tuple[str, str]:
+    """Return the cache keys with and without ``text_fields``.
+
+    The other fields are serialized once for both. The key without the text
+    names the fields it leaves out, so a check run on a prompt alone is not
+    reused for a prompt and a negative prompt, and it never equals a full key.
+    """
+    rest = {
+        key: value
+        for key, value in inputs.items()
+        if key not in _NEVER_PRICED_FIELDS and key not in text_fields
+    }
+    rest_hash = hashlib.sha256(json.dumps(rest, sort_keys=True, default=str).encode())
+    text_key = f"{model_path}:{rest_hash.hexdigest()[:32]}:without:{','.join(text_fields)}"
+    text = {field: inputs[field] for field in text_fields}
+    rest_hash.update(json.dumps(text, sort_keys=True).encode())
+    full_key = f"{model_path}:{rest_hash.hexdigest()[:32]}"
+    return full_key, text_key
+
+
+def _rough_size(inputs: dict[str, Any], limit: int = _HASH_IN_THREAD_CHARS) -> int:
+    """Return about how many characters ``inputs`` serializes to.
+
+    Walks nested dicts and lists, so text hidden in a list of dicts counts
+    too. Strings and keys count their length, an int about its digits (a
+    4000-digit int takes ms to turn into text), any other value one. Stops
+    once the size passes ``limit``, and returns more than ``limit`` after
+    ``_ROUGH_SIZE_MAX_VALUES`` values: walking 200 000 small dicts would
+    itself stall the event loop for tens of ms.
+    """
+    size = 0
+    queued = 1
+    stack: list[Any] = [inputs]
+    while stack and size <= limit:
+        value = stack.pop()
+        if isinstance(value, str):
+            size += len(value)
+            continue
+        if isinstance(value, int):
+            # bit_length() // 3 is a little over the digit count, and costs nothing
+            size += 1 + value.bit_length() // 3
+            continue
+        size += 1
+        if isinstance(value, dict | list):
+            # Checked before copying, so a list of 10 million items is not.
+            queued += len(value)
+            if queued > _ROUGH_SIZE_MAX_VALUES:
+                return limit + 1
+            if isinstance(value, dict):
+                size += sum(len(key) for key in value if isinstance(key, str))
+                stack.extend(value.values())
+            else:
+                stack.extend(value)
+    return size
 
 
 def _text_fields(inputs: dict[str, Any]) -> tuple[str, ...]:
@@ -160,14 +218,20 @@ class WaveSpeedProvider(BaseProvider):
             Base price in USD as a Decimal.
 
         Raises:
-            ProviderError: If the pricing API call fails.
+            ProviderError: If the pricing API call fails, or with 400 for a
+                multipart upload.
         """
+        self._reject_upload(inputs)
         self._refresh_catalog_soon()
         text_fields = _text_fields(inputs)
-        full_key = _price_key(model_path, inputs, _NEVER_PRICED_FIELDS)
-        # Also names the check: a prompt may count only while some other
-        # option is on, so a check holds only for the fields it was run with.
-        text_key = _price_key(model_path, inputs, _NEVER_PRICED_FIELDS.union(text_fields))
+        # text_key also names the check: a prompt may count only while some
+        # other option is on, so a check holds only for the fields it was run with.
+        if _rough_size(inputs) > _HASH_IN_THREAD_CHARS:
+            full_key, text_key = await asyncio.to_thread(
+                _price_keys, model_path, inputs, text_fields
+            )
+        else:
+            full_key, text_key = _price_keys(model_path, inputs, text_fields)
         text_free = self._text_check(text_key) if text_fields else None
 
         cached = self._cached_price(text_key if text_free else full_key)
@@ -390,19 +454,27 @@ class WaveSpeedProvider(BaseProvider):
     ) -> dict[str, Any]:
         """Submit a task to WaveSpeed's API.
 
-        Forwards the request body as-is to POST /api/v3/{path}.
+        Forwards the request body to POST /api/v3/{path}, without
+        ``enable_sync_mode``.
 
         Args:
             path: Model path (e.g. 'wavespeed-ai/flux-dev').
-            body: Request body, forwarded without modification.
+            body: Request body, forwarded as-is but for ``enable_sync_mode``.
 
         Returns:
             WaveSpeed response dict with task ID and status.
 
         Raises:
             ProviderError: If the submission fails, or WaveSpeed accepted it
-                without a task id to poll.
+                without a task id to poll, or with 400 for a multipart upload.
         """
+        self._reject_upload(body)
+        # Sync mode holds the submit open until the output is ready (up to
+        # 110 s), past the 30 s read timeout, and WaveSpeed may answer 504
+        # first. Either one ends it with no task id while the job still runs
+        # and bills, so the payment is kept for a result nobody can poll. The
+        # gateway polls anyway, from 0.3 s after submit.
+        body = {key: value for key, value in body.items() if key != "enable_sync_mode"}
         try:
             result = await proxy_request(
                 base_url=self._config.base_url,
@@ -437,6 +509,19 @@ class WaveSpeedProvider(BaseProvider):
                 detail=f"Failed to submit task: {e}",
             ) from e
 
+    def _reject_upload(self, body: dict[str, Any]) -> None:
+        """Refuse a multipart upload: WaveSpeed takes JSON, with media as URLs.
+
+        The file bytes cannot be sent as JSON, and hashing them into the price
+        key would stall the event loop for seconds on a large upload.
+        """
+        if "_file_bytes" in body:
+            raise ProviderError(
+                provider=self.name,
+                detail="WaveSpeed takes a JSON body. Multipart uploads are not accepted.",
+                status_code=400,
+            )
+
     def _raise_if_key_rejected(self, exc: Exception) -> None:
         """Turn an upstream 401/402/403 into a 502 that hides WaveSpeed's text.
 
@@ -448,7 +533,7 @@ class WaveSpeedProvider(BaseProvider):
             raise ProviderError(provider=self.name, detail=UPSTREAM_CREDENTIALS_DETAIL) from exc
 
     def _remember_if_finished(self, data: dict[str, Any]) -> None:
-        """Keep a task the submit answer already shows finished (sync mode).
+        """Keep a task the submit answer already shows finished.
 
         The app polls every answer with an id and a status; get_result then
         returns this instead of asking WaveSpeed again. A sync wait that ran

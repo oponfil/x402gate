@@ -7,11 +7,21 @@ independent lower bound taken from the bytes themselves, so a forged header
 cannot price a long file as a short one.
 
 The bound is tight where the format allows it: MPEG and FLAC frames are
-counted, PCM is sized from its sample chunk (in MP4, from the frames its
-sample and chunk tables give), AAC and AMR in MP4 from the sample table (or
-fragment runs), Opus in Ogg from each packet's TOC byte and Vorbis from each
-packet's block size. Speex in Ogg is bounded from its packet count, other MP4
-codecs from their sample bytes at the family's top bitrate.
+counted, PCM is sized from its sample chunk at the width the decoder reads
+(in MP4, from the frames its sample and chunk tables give), AAC in MP4
+from the sample table (or fragment runs), Opus from each packet's TOC byte
+(in MP4 too) and Vorbis from each packet's block size. MPEG audio, AMR and FLAC in MP4 have their
+frames counted, ALAC is bounded by its packet count, Speex in Ogg by its
+packet count. MP4 codecs ffmpeg decodes that none of this times are
+refused; entries it cannot decode are bounded by their sample bytes at the
+lossy family's top bitrate.
+ADTS AAC is timed from its frame headers, which is all it has.
+
+The container is read from the bytes, never from the format name or from
+mutagen's guess: ffmpeg skips leading ID3v2 tags and probes what follows,
+so the gateway does too, and prices only the containers listed above.
+mutagen supplies the header duration through its stream-info readers, never
+its tag parsers, whose cost a crafted tag can blow up.
 
 All of this runs before payment, so every scan has a work budget: input that
 would take far more work than any genuine file is rejected, not walked.
@@ -26,22 +36,20 @@ import operator
 import re
 import struct
 import sys
+import threading
 import wave
 import zlib
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from itertools import accumulate, compress, repeat
+from itertools import accumulate, compress, islice, repeat
 
-from mutagen import File as MutagenFile
-from mutagen import MutagenError
-from mutagen.aac import AAC
-from mutagen.aiff import AIFF
-from mutagen.flac import FLAC
-from mutagen.mp3 import MP3
-from mutagen.mp4 import MP4
-from mutagen.oggopus import OggOpus
-from mutagen.oggspeex import OggSpeex
-from mutagen.oggvorbis import OggVorbis
-from mutagen.wave import WAVE
+from mutagen.aiff import AIFFInfo
+from mutagen.flac import StreamInfo as FlacStreamInfo
+from mutagen.mp3 import MPEGInfo
+from mutagen.mp4 import Atoms, MP4Info
+from mutagen.oggopus import OggOpusInfo
+from mutagen.oggspeex import OggSpeexInfo
+from mutagen.oggvorbis import OggVorbisInfo
 
 from x402gate.providers.base import ProviderError
 
@@ -50,16 +58,47 @@ from x402gate.providers.base import ProviderError
 _MPEG_MAX_BPS = 448_000  # top MPEG frame bitrate (Layer I; Layer III is 320k)
 _LOSSY_MAX_BPS = 640_000  # above Opus (510k), stereo AAC (576k), Vorbis q10
 _LOSSLESS_MAX_BPS = 4_608_000  # 96 kHz / 24-bit stereo PCM
-_LOSSY_TYPES = (AAC, MP4, OggOpus, OggSpeex, OggVorbis)
 # A frame count past this stops the scan: 25 MB cannot hold a day of real
 # (not digitally silent) lossless audio, and counting on only costs CPU.
 _MAX_COUNTED_SECONDS = 24 * 3600
 
-# AIFF-C compression IDs that store plain PCM, the only ones the
-# channels x bits x rate byte floor is valid for.
-_AIFC_PCM = frozenset(
-    (b"NONE", b"sowt", b"twos", b"raw ", b"in24", b"in32", b"fl32", b"FL32", b"fl64", b"FL64")
-)
+# Structures a genuine file has few of. Parsers build an object for each, so
+# millions of empty ones (RIFF/AIFF chunks, FLAC metadata blocks, MP4 boxes)
+# cost a gigabyte before any audio is read; such files are rejected. An hour
+# of fragmented MP4 cut every second has about 7,200 top-level boxes.
+_MAX_CHUNKS = 10_000  # RIFF/AIFF chunks, FLAC metadata blocks
+_MAX_MP4_BOXES = 100_000  # in mutagen's container boxes, which it parses whole
+_MAX_MP4_SAMPLE_ENTRIES = 16
+_MAX_ID3_TAGS = 16  # stacked ID3v2 tags; writers stack two at most
+# ffmpeg's format probe reads at most this much, and skips a leading ID3v2
+# tag only when the tag and 16 bytes more fit in what it read.
+_PROBE_BUF_MAX = 1 << 20
+# Unpaid parses run in worker threads; at most this many at once, so
+# concurrent price requests cannot run the process out of memory. Callers
+# queue for a slot on the event loop (openrouter's STT pricing slots); a parse
+# that still finds them all busy is refused at once, so no thread waits.
+_PARSE_SLOTS = threading.BoundedSemaphore(2)
+# Chained frames from the first byte that make a decoder's probe pick MPEG
+# audio (ffmpeg: 7) or ADTS (3) over any format it finds further in.
+_MPEG_PROBE_FRAMES = 7
+_ADTS_PROBE_FRAMES = 3
+_EBML_MAGIC = b"\x1a\x45\xdf\xa3"  # Matroska / WebM
+_NUL_RUN = re.compile(rb"\x00*")
+_SUPPORTED_FORMATS = "wav, mp3, flac, ogg (Opus, Vorbis, Speex), m4a/mp4/mov, aiff or aac (ADTS)"
+
+# Bytes per sample ffmpeg decodes for each AIFF-C compression type it reads
+# as PCM, whatever COMM's sample size claims. Keyed upper-case: ffmpeg falls
+# back to a case-blind match. 'NONE' and 'twos' (None) take their width from
+# the sample size, as plain AIFF does.
+_AIFC_PCM_WIDTHS = {
+    b"NONE": None, b"TWOS": None, b"SOWT": 2, b"RAW ": 1, b"IN24": 3, b"IN32": 4,
+    b"FL32": 4, b"FL64": 8, b"ALAW": 1, b"ULAW": 1,
+}  # fmt: skip
+# Fixed-ratio AIFF-C codecs, by the MP4 entry ffmpeg decodes the same way
+# (block bytes in _MP4_BLOCK_BYTES, frames in _MP4_V0_FRAMES_PER_PACKET).
+# Every other type (G.722, G.726, QDesign, QCELP, SDX2, ...) is refused.
+_AIFC_BLOCK_CODECS = {b"IMA4": b"ima4", b"MAC3": b"MAC3", b"MAC6": b"MAC6", b"GSM ": b"agsm"}
+_AIFC_VERSION1 = 0xA2805140  # FVER timestamp of AIFF-C; any other reads as plain AIFF
 
 # MP4 sample entry codecs that carry uncompressed or lossless audio.
 _MP4_LOSSLESS_CODECS = frozenset(
@@ -86,21 +125,97 @@ _MP4_PCM_WIDTHS = {b"in24": 3, b"in32": 4, b"fl32": 4, b"fl64": 8, b"ulaw": 1, b
 _MP4_WAV_PCM = {1: b"sowt", 3: b"fl32", 6: b"alaw", 7: b"ulaw"}
 # PCM frames per packet ffmpeg assumes for version 0 entries of these codecs.
 _MP4_V0_FRAMES_PER_PACKET = {b"MAC3": 6, b"MAC6": 6, b"ima4": 64, b"agsm": 160}
-_MP4_MAX_RATE = 768_000  # highest real PCM rate; a forged higher one is clamped
+_MAX_PCM_RATE = 768_000  # highest real PCM rate; a forged higher one is clamped
 # Largest AMR frame (mode byte included) per 20 ms: 32 bytes for AMR-NB
 # 12.2k, 62 for AMR-WB 23.85k. Every sample byte is frame data.
 _AMR_MAX_BPS = {b"samr": 32 * 8 * 50, b"sawb": 62 * 8 * 50}
+# Bytes of an AMR frame, its mode byte included, by the frame type in bits
+# 3-6 of that byte; every frame decodes to 20 ms. A NO_DATA frame is the mode
+# byte alone, so a sample of them holds 32x (AMR-WB 61x) the audio the byte
+# cap allows. Reserved types are taken at 1 byte too, the least any decoder
+# reads, so the walk never steps over a frame a decoder would play.
+_AMR_FRAME_BYTES = {
+    b"samr": (13, 14, 16, 18, 20, 21, 27, 32, 6, 1, 1, 1, 1, 1, 1, 1),
+    b"sawb": (18, 24, 33, 37, 41, 47, 51, 59, 61, 6, 1, 1, 1, 1, 1, 1),
+}
+_AMR_FRAME_LENGTHS = {
+    codec: bytes(sizes[byte >> 3 & 0x0F] for byte in range(256))
+    for codec, sizes in _AMR_FRAME_BYTES.items()
+}
+_AMR_FRAMES_PER_SECOND = 50
 # Bytes of AudioSampleEntry fields before its child boxes, by QuickTime
 # sound description version (0 is also the ISO layout).
 _MP4_SOUND_FIELDS = {0: 28, 1: 44, 2: 64}
-# MPEG-4 object types for AAC in esds, and the audio object types that code
-# 1024 (or 960) samples per frame.
+# Box types a movie may open with, and the boxes mutagen parses every child
+# of (this module walks the same ones, and mvex); 'meta' has 4 bytes first.
+_MP4_TOP_BOXES = frozenset(
+    (b"ftyp", b"moov", b"mdat", b"free", b"skip", b"wide", b"pnot", b"uuid", b"styp", b"sidx")
+)
+_MP4_CONTAINERS = frozenset(
+    (b"moov", b"udta", b"trak", b"mdia", b"meta", b"ilst", b"stbl", b"minf", b"moof", b"traf",
+     b"mvex")
+)  # fmt: skip
+# MPEG-4 object types for AAC and for MPEG-1/2 audio in esds, and the audio
+# object types that code 1024 (or 960) samples per frame and 512 (or 480).
 _AAC_OBJECT_TYPES = frozenset((0x40, 0x66, 0x67, 0x68))
+_MPEG_AUDIO_OBJECT_TYPES = frozenset((0x69, 0x6B))
 _AAC_LONG_FRAME_AOTS = frozenset((1, 2, 3, 4, 5, 29))
+_AAC_LOW_DELAY_AOTS = frozenset((23, 39))
+# Shortest packet other fixed-frame codecs decode to: a Layer III frame
+# holds at least 576 samples, Layer II 1152 and Layer I 384, at up to 48 kHz;
+# an Opus packet 2.5 ms. The packets' own headers give their real length (an
+# Opus packet up to 120 ms, an MPEG-2.5 frame 72 ms), and ffmpeg's MPEG
+# decoders play frames of any layer under any of these entries, so these
+# tracks are also timed from their sample bytes; see _mp4_track.
+_MPEG_MIN_FRAME_SECONDS = 576 / 48000
+_MP4_MIN_FRAME_SECONDS = {
+    b".mp3": _MPEG_MIN_FRAME_SECONDS,
+    b"mp3 ": _MPEG_MIN_FRAME_SECONDS,
+    b"ms\x00\x55": _MPEG_MIN_FRAME_SECONDS,
+    b".mp2": 1152 / 48000,
+    b".mp1": 384 / 48000,
+    b"Opus": 120 / 48000,
+}
+_MP4_MPEG_CODECS = frozenset((b".mp3", b"mp3 ", b"ms\x00\x55", b".mp2", b".mp1"))
+_MP4_SCANNED_CODECS = _MP4_MPEG_CODECS | {b"Opus"} | _AMR_FRAME_BYTES.keys()
+# ffmpeg parses AC-3 and E-AC-3 in MP4 into every frame a sample holds, of up
+# to 6 blocks at 16-48 kHz each; no sample-table bound holds, so they are refused.
+# So are the other codecs ffmpeg decodes from MP4 that no table here times:
+# speech codecs whose silence frames are a byte or a few (QCELP, EVRC, SMV,
+# Speex, iLBC, Nellymoser), DTS (down to 12 kbps), lossless TrueHD and the
+# rest, which the 640 kbps byte cap would price up to 100x short. Sample
+# entries ffmpeg cannot decode keep that cap: no decoder plays them.
+_MP4_REFUSED_CODECS = {
+    b"ac-3": "AC-3", b"sac3": "AC-3", b"ec-3": "E-AC-3", b"ac-4": "AC-4",
+    b"dtsc": "DTS", b"dtsh": "DTS", b"dtsl": "DTS", b"dtse": "DTS", b"dtsx": "DTS",
+    b"dtsy": "DTS", b"DTS ": "DTS", b"mlpa": "TrueHD", b"mha1": "MPEG-H", b"mha2": "MPEG-H",
+    b"mhm1": "MPEG-H", b"mhm2": "MPEG-H", b"iamf": "IAMF", b"Qclp": "QCELP", b"Qclq": "QCELP",
+    b"sqcp": "QCELP", b"sevc": "EVRC", b"ssmv": "SMV", b"spex": "Speex", b"SPXN": "Speex",
+    b"ilbc": "iLBC", b"nmos": "Nellymoser", b"NELL": "Nellymoser", b"QDM2": "QDesign",
+    b"QDMC": "QDesign",
+}  # fmt: skip
+# Fixed-ratio codecs (MACE, IMA ADPCM, GSM): bytes of one coded block, and
+# whether the entry's channel count multiplies it (ffmpeg decodes GSM as mono
+# whatever the entry says). Each block decodes to the frames listed above,
+# and the decoder outputs only whole blocks however the packets split the
+# bytes, so packets from a sample table or a fragment are timed from their
+# bytes; old QuickTime audio read by chunk is timed from its chunk table.
+# The 640 kbps byte cap would price them 20-50x short.
+_MP4_BLOCK_BYTES = {
+    b"ima4": (34, True),
+    b"MAC3": (2, True),
+    b"MAC6": (1, True),
+    b"agsm": (33, False),
+}
+# Samples (and chunks) of a track whose bytes are read one by one: 7 hours
+# of 26 ms MPEG frames. Real files have far fewer.
+_MAX_MP4_SCANNED_SAMPLES = 1_000_000
 _AAC_RATES = (
     96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350
 )  # fmt: skip
 
+_HIGH_NIBBLE = bytes(byte >> 4 for byte in range(256))
+_LOW_NIBBLE = bytes(byte & 0x0F for byte in range(256))
 _OGG_BIT_REVERSE = bytes(int(f"{i:08b}"[::-1], 2) for i in range(256))
 _ZERO_CRC = bytes(4)
 _OGG_HEAD_BYTES = 72  # packet bytes kept: up to the Speex header's extra_headers
@@ -109,6 +224,21 @@ _VORBIS_MAX_SETUP = 1 << 20  # setup headers are a few KB; parsing is linear in 
 # that completes no packet (an empty page) more. Real streams stay under half
 # a unit per byte, even 6 kbps Opus with a packet on every page.
 _OGG_PAGE_COST, _OGG_EMPTY_PAGE_COST, _OGG_SLOW_PACKET_COST = 16, 64, 8
+# The Ogg codecs priced here, by the first packet's magic, with mutagen's
+# reader for their header duration; and the heads of the video, subtitle and
+# index streams ffmpeg knows. Any other stream is refused, even beside a
+# priced one: FLAC, PCM, CELT and OGM audio (the DirectShow mapping carries
+# any WAVE codec) are decoded with no packet bound here.
+_OGG_INFOS = (
+    (b"OpusHead", OggOpusInfo),
+    (b"\x01vorbis", OggVorbisInfo),
+    (b"Speex   ", OggSpeexInfo),
+)
+_OGG_NON_AUDIO_HEADS = (
+    b"\x80theora", b"\x80kate", b"fishead\x00", b"fisbone\x00", b"BBCD\x00", b"KW-DIRAC",
+    b"OVP80", b"\x01video", b"\x01text",
+)  # fmt: skip
+_OGG_ALLOWED_HEADS = tuple(magic for magic, _ in _OGG_INFOS) + _OGG_NON_AUDIO_HEADS
 
 # MPEG audio frame tables, keyed by (is MPEG-1, layer); index 0 (free format)
 # and 15 (invalid) are excluded by the sync pattern below.
@@ -152,6 +282,10 @@ def _mpeg_sync_pattern() -> re.Pattern[bytes]:
 
 
 _MPEG_SYNC = _mpeg_sync_pattern()
+# ADTS: a 12-bit sync. A stream must open with a standard header (layer 0),
+# but ffmpeg's parser ignores the layer bits after that, and so does the walk.
+_ADTS_START = re.compile(b"\xff[\xf0\xf1\xf8\xf9]")
+_ADTS_SYNC = re.compile(b"\xff[\xf0-\xff]")
 
 # FLAC frame header tables (RFC 9639, 9.1.1 and 9.1.2): samples per block and
 # sample rate by code. Block size codes 6/7 and rate codes 12-14 read their
@@ -230,7 +364,8 @@ def get_audio_duration_seconds(data: bytes, fmt: str, *, provider: str = "") -> 
         Duration in seconds (may be fractional).
 
     Raises:
-        ProviderError: If format is unsupported or duration cannot be determined.
+        ProviderError: If format is unsupported or duration cannot be determined
+            (400), or if too many files are being priced at once (429).
     """
     normalized = fmt.strip().lower().lstrip(".")
     if not normalized:
@@ -240,37 +375,18 @@ def get_audio_duration_seconds(data: bytes, fmt: str, *, provider: str = "") -> 
             status_code=400,
         )
 
-    if normalized == "wav":
-        return _wav_duration(data, provider=provider)
-
+    if not _PARSE_SLOTS.acquire(False):  # non-blocking
+        # Unpaid clients can fill the slots, so this is a 4xx: a 5xx would
+        # count against the provider's health on the public dashboard.
+        raise ProviderError(
+            provider=provider,
+            detail="Too many audio files are being priced; retry shortly",
+            status_code=429,
+        )
     try:
-        audio_file = MutagenFile(io.BytesIO(data))
-    except MutagenError:
-        audio_file = None  # malformed client bytes are a 400, not a 500
-    if audio_file is None or audio_file.info is None:
-        raise ProviderError(
-            provider=provider,
-            detail=f"Cannot parse audio format '{normalized}'",
-            status_code=400,
-        )
-
-    if isinstance(audio_file, WAVE):
-        # A WAV under another format name gets the same PCM-only parse as
-        # 'wav': a compressed codec (MP3 or GSM in WAV) has no fixed byte
-        # rate, and mutagen takes its length from client-set header fields.
-        return _wav_duration(data, provider=provider)
-    if isinstance(audio_file, AIFF):
-        _require_pcm_aiff(data, audio_file.info, provider=provider)
-
-    length = getattr(audio_file.info, "length", None)
-    if length is None:
-        raise ProviderError(
-            provider=provider,
-            detail=f"Cannot determine duration for format '{normalized}'",
-            status_code=400,
-        )
-
-    duration = max(float(length), _content_floor_seconds(data, audio_file, provider=provider))
+        duration = _container_duration(data, normalized, provider)
+    finally:
+        _PARSE_SLOTS.release()
     if duration <= 0:
         raise ProviderError(
             provider=provider,
@@ -285,10 +401,233 @@ def billing_seconds(duration: float) -> int:
     return max(1, math.ceil(duration))
 
 
+def _container_duration(data: bytes, fmt: str, provider: str) -> float:
+    """Price the container the bytes hold, whatever the format name says.
+
+    A leading ID3v2 tag makes mutagen call any file MP3, while ffmpeg skips
+    the tag and demuxes what follows (an Ogg, FLAC or WAV stream), so the
+    container is read from the bytes after the tags. Only containers with a
+    content floor are priced; anything else is refused.
+
+    Behind a tag ffmpeg's MP3 probe, which scores at most 51, can tie or
+    beat FLAC's 50, ADTS's or that of an MP4 opening with a low-scoring box
+    when the bytes hold long runs of chained MPEG frames, so those runs are
+    priced too. WAV (99), AIFF and Ogg (100) always win, and their samples
+    are not read as MPEG frames: chance sync bytes in dense PCM overcharge.
+    """
+    start, probed = _audio_start(data, provider)
+    body = data[start:] if start else data
+    if probed and (duration := _probed_container_duration(body, fmt, provider)) is not None:
+        if not start or _outscores_mp3_probe(body):
+            return duration
+        return max(duration, _mpeg_chained_seconds(body))
+    if _MPEG_SYNC.match(body):
+        return _mp3_duration(body, fmt, provider)
+    if probed and _ADTS_START.match(body):
+        duration = _adts_duration(body, fmt, provider)
+        return max(duration, _mpeg_chained_seconds(body)) if start else duration
+    if body[:4] == _EBML_MAGIC:
+        raise ProviderError(
+            provider=provider,
+            detail=f"WebM/Matroska audio is not supported; send {_SUPPORTED_FORMATS}",
+            status_code=400,
+        )
+    if fmt == "wav" and not start:
+        return _wav_duration(body, provider=provider)  # says what is wrong with it
+    raise _unparsable(fmt, provider)
+
+
+def _probed_container_duration(body: bytes, fmt: str, provider: str) -> float | None:
+    """Price the WAV, AIFF, FLAC, Ogg or MP4 file whose magic opens ``body``, else None."""
+    magic = body[:4]
+    if magic == b"RIFF":
+        # Any WAV gets the PCM-only parse: a compressed codec (MP3 or GSM in
+        # WAV) has no fixed byte rate, and its header length is client-set.
+        _check_chunk_count(body, little_endian=True, provider=provider)
+        return _wav_duration(body, provider=provider)
+    if magic == b"FORM":
+        return _aiff_duration(body, fmt, provider)
+    if magic == b"fLaC":
+        return _flac_duration(body, fmt, provider)
+    if magic == b"OggS":
+        return _ogg_duration(body, fmt, provider)
+    if body[4:8] in _MP4_TOP_BOXES:
+        return _mp4_duration(body, fmt, provider)
+    return None
+
+
+def _outscores_mp3_probe(body: bytes) -> bool:
+    """True for a WAV, AIFF or Ogg file whose header ffmpeg's probe takes over MP3."""
+    form = body[8:12]
+    return (
+        (body[:4] == b"RIFF" and form == b"WAVE")
+        or (body[:4] == b"FORM" and form in (b"AIFF", b"AIFC"))
+        or (body[:4] == b"OggS" and body[4:5] == b"\x00" and body[5:6] <= b"\x07")
+    )
+
+
+def _unparsable(fmt: str, provider: str) -> ProviderError:
+    return ProviderError(
+        provider=provider,
+        detail=f"Cannot parse audio format '{fmt}'; send {_SUPPORTED_FORMATS}",
+        status_code=400,
+    )
+
+
+def _audio_start(data: bytes, provider: str) -> tuple[int, bool]:
+    """Offset past the leading ID3v2 tags and any zero padding after them,
+    and whether a container other than MPEG audio may be priced there.
+
+    Decoders skip stacked tags (Windows Media Player writes two) and zero
+    padding before, between and after them. ffmpeg's format probe, though,
+    skips one tag, and only one that fits its probe buffer; every container
+    probe but MP3's wants its magic right after it. Behind more tags, any
+    padding or a larger tag the MP3 probe wins whenever the bytes hold
+    enough MPEG frames, so only MPEG audio is priced there.
+    """
+    pos = tags = 0
+    padded = False
+    while size := _id3v2_size(data, pos):
+        tags += 1
+        if tags > _MAX_ID3_TAGS:
+            raise ProviderError(
+                provider=provider,
+                detail="Cannot parse audio: too many ID3v2 tags",
+                status_code=400,
+            )
+        end = _NUL_RUN.match(data, pos + size).end()
+        padded |= end != pos + size
+        pos = end
+    if not tags:
+        return 0, True
+    return pos, tags == 1 and not padded and pos + 16 < min(len(data), _PROBE_BUF_MAX)
+
+
+def _stream_info(parse: Callable[[], object], fmt: str, provider: str) -> tuple[object, float]:
+    """Run a mutagen stream-info reader; return it and the duration it reads.
+
+    mutagen raises IndexError, struct.error and more besides its own errors
+    on crafted bytes; all of them are the client's malformed file, a 400.
+    """
+    try:
+        info = parse()
+    except Exception as exc:
+        raise _unparsable(fmt, provider) from exc
+    length = getattr(info, "length", None)
+    if length is None:
+        raise ProviderError(
+            provider=provider,
+            detail=f"Cannot determine duration for format '{fmt}'",
+            status_code=400,
+        )
+    return info, float(length)
+
+
+def _mp3_duration(body: bytes, fmt: str, provider: str) -> float:
+    if not _mpeg_stream_starts(body):
+        raise _unparsable(fmt, provider)
+    _, length = _stream_info(lambda: MPEGInfo(io.BytesIO(body)), fmt, provider)
+    # Count the real frames; the byte floor covers free-format frames that
+    # the frame scan cannot size.
+    return max(length, _mpeg_frames_seconds(body), len(body) * 8 / _MPEG_MAX_BPS)
+
+
+def _aiff_duration(body: bytes, fmt: str, provider: str) -> float:
+    _check_chunk_count(body, little_endian=False, provider=provider)
+    _stream_info(lambda: AIFFInfo(io.BytesIO(body)), fmt, provider)
+    # The COMM frame count is client-set and may run past EOF, as in a
+    # stream; the decoder plays the SSND bytes sent, so they set the price,
+    # at the byte rate the decoder reads them at.
+    byte_rate = _aiff_byte_rate(body, provider=provider)
+    return _pcm_floor_seconds(body, b"SSND", byte_rate, little_endian=False)
+
+
+def _flac_duration(body: bytes, fmt: str, provider: str) -> float:
+    # STREAMINFO must be the first metadata block, as decoders require.
+    if len(body) < 42 or body[4] & 0x7F or int.from_bytes(body[5:8], "big") < 34:
+        raise _unparsable(fmt, provider)
+    info, length = _stream_info(lambda: FlacStreamInfo(body[8:42]), fmt, provider)
+    rate = int(getattr(info, "sample_rate", 0) or 0)
+    floor = _flac_frames_seconds(body, rate, provider=provider)
+    return max(length, floor, len(body) * 8 / _LOSSLESS_MAX_BPS)
+
+
+def _ogg_duration(body: bytes, fmt: str, provider: str) -> float:
+    if body[4:5] != b"\x00" or body[5:6] > b"\x07":
+        # ffmpeg's Ogg probe wants version 0 and known flags on the first
+        # page; without them it may take the file for MP3 instead.
+        raise _unparsable(fmt, provider)
+    first = 27 + body[26] if len(body) > 26 else len(body)
+    head = body[first : first + 8]
+    info_type = next((info for magic, info in _OGG_INFOS if head.startswith(magic)), None)
+    if info_type is None:
+        raise ProviderError(
+            provider=provider,
+            detail="Only Opus, Vorbis and Speex audio in Ogg is supported",
+            status_code=400,
+        )
+    # The budgeted packet walk runs first, so a crafted stream is refused
+    # before mutagen's search for the last page walks it.
+    floor = max(_ogg_packets_seconds(body, provider=provider), len(body) * 8 / _LOSSY_MAX_BPS)
+
+    def parse() -> object:
+        fileobj = io.BytesIO(body)
+        info = info_type(fileobj)
+        info._post_tags(fileobj)  # the last granule, as mutagen's Ogg types read it
+        return info
+
+    return max(_stream_info(parse, fmt, provider)[1], floor)
+
+
+def _mp4_duration(body: bytes, fmt: str, provider: str) -> float:
+    _check_mp4_box_count(body, provider)
+
+    def parse() -> object:
+        fileobj = io.BytesIO(body)
+        return MP4Info(Atoms(fileobj), fileobj)
+
+    _, length = _stream_info(parse, fmt, provider)
+    return max(length, _mp4_floor_seconds(body, provider=provider))
+
+
+def _adts_duration(body: bytes, fmt: str, provider: str) -> float:
+    if not _adts_stream_starts(body):
+        raise _unparsable(fmt, provider)
+    return _adts_frames_seconds(body, provider=provider)
+
+
+def _check_chunk_count(data: bytes, *, little_endian: bool, provider: str) -> None:
+    """Reject a RIFF/AIFF file with more chunks than any genuine one.
+
+    mutagen's AIFF reader builds an object for every top-level chunk, and
+    the AIFF checks walk them all as ffmpeg does. WAV readers stop at the
+    data chunk, whose size streaming writers often leave unset, so only the
+    chunks before it count.
+    """
+    for count, (chunk_id, _, _) in enumerate(_iff_chunks(data, little_endian=little_endian), 1):
+        if count > _MAX_CHUNKS:
+            raise ProviderError(
+                provider=provider,
+                detail="Cannot parse audio: too many chunks",
+                status_code=400,
+            )
+        if little_endian and chunk_id == b"data":
+            return
+
+
 def _wav_duration(data: bytes, *, provider: str = "") -> float:
     # The wave module reads the last fmt chunk before the data, ffmpeg the
     # first; with two of them the priced format may not be the decoded one.
-    if sum(chunk_id == b"fmt " for chunk_id, _, _ in _iff_chunks(data, little_endian=True)) > 1:
+    # Both stop looking for one at the data chunk.
+    fmt_chunks = 0
+    fmt = b""
+    for chunk_id, pos, size in _iff_chunks(data, little_endian=True):
+        if chunk_id == b"data":
+            break
+        if chunk_id == b"fmt ":
+            fmt_chunks += 1
+            fmt = data[pos : pos + min(size, 40)]
+    if fmt_chunks > 1:
         raise ProviderError(
             provider=provider,
             detail="Cannot parse WAV audio: more than one fmt chunk",
@@ -296,7 +635,6 @@ def _wav_duration(data: bytes, *, provider: str = "") -> float:
         )
     try:
         with wave.open(io.BytesIO(data), "rb") as wav_file:
-            frames = wav_file.getnframes()
             rate = wav_file.getframerate()
             if rate <= 0:
                 raise ProviderError(
@@ -304,8 +642,7 @@ def _wav_duration(data: bytes, *, provider: str = "") -> float:
                     detail="Invalid WAV sample rate",
                     status_code=400,
                 )
-            duration = frames / rate
-            byte_rate = wav_file.getnchannels() * wav_file.getsampwidth() * rate
+            channels, width = wav_file.getnchannels(), wav_file.getsampwidth()
     except ProviderError:
         raise
     except Exception as exc:
@@ -315,9 +652,13 @@ def _wav_duration(data: bytes, *, provider: str = "") -> float:
             status_code=400,
         ) from exc
 
-    # The data chunk size is client-controlled; price at least the PCM bytes
-    # actually sent, since a decoder can read them all.
-    duration = max(duration, _pcm_floor_seconds(data, b"data", byte_rate, little_endian=True))
+    width = _wav_decoded_width(fmt, width)
+    byte_rate = channels * width * min(rate, _MAX_PCM_RATE)
+    # The data chunk size is client-controlled, and streaming writers leave
+    # it at 0xFFFFFFFF; price the PCM bytes actually sent, since a decoder
+    # reads them all and nothing past EOF. A size that fits the file is what
+    # the floor counts already.
+    duration = _pcm_floor_seconds(data, b"data", byte_rate, little_endian=True)
     if duration <= 0:
         raise ProviderError(
             provider=provider,
@@ -327,53 +668,110 @@ def _wav_duration(data: bytes, *, provider: str = "") -> float:
     return duration
 
 
-def _require_pcm_aiff(data: bytes, info: object, *, provider: str = "") -> None:
-    """Reject AIFF audio the PCM byte floor cannot bound.
+def _wav_decoded_width(fmt: bytes, width: int) -> int:
+    """Bytes per sample to price a PCM WAV at, never more than ffmpeg reads.
 
-    A compressed AIFF-C codec (GSM, IMA ADPCM, mu-law) packs more audio into
-    each byte than channels x bits x rate, and with two COMM chunks mutagen
-    and the decoder may read different formats.
+    The wave module sizes samples from wBitsPerSample, the container size.
+    For WAVE_FORMAT_EXTENSIBLE ffmpeg decodes at wValidBitsPerSample when it
+    is set; a narrower sample means more frames in the same bytes, so the
+    smaller width is priced. dwChannelMask is not priced: ffmpeg takes the
+    layout from it only when its bit count equals nChannels and otherwise
+    ignores it, so the decoded channel count is always nChannels. A block
+    align or byte rate claim plays no part either: the PCM decoder sizes
+    frames from its codec and channels alone.
     """
-    chunks = _iff_chunks(data, little_endian=False)
-    comms = [pos for chunk_id, pos, _ in chunks if chunk_id == b"COMM"]
-    valid = len(comms) == 1 and int(getattr(info, "bitrate", 0) or 0) > 0
-    if valid and data[8:12] == b"AIFC":
-        valid = data[comms[0] + 18 : comms[0] + 22] in _AIFC_PCM
-    if not valid:
-        raise ProviderError(
-            provider=provider,
-            detail="Only uncompressed PCM AIFF audio is supported",
-            status_code=400,
-        )
+    if fmt[:2] == b"\xfe\xff" and len(fmt) >= 24:
+        valid_bits = struct.unpack_from("<H", fmt, 18)[0]
+        if valid_bits:
+            width = min(width, (valid_bits + 7) // 8)
+    return width
 
 
-def _content_floor_seconds(data: bytes, audio_file: object, *, provider: str = "") -> float:
-    """Lower bound on the decodable duration that ignores header length fields."""
-    info = audio_file.info  # type: ignore[attr-defined]
-    if isinstance(audio_file, MP3):
-        # Count the real frames; the byte floor covers free-format frames
-        # that the frame scan cannot size.
-        audio_bytes = len(data) - _id3v2_size(data)
-        return max(_mpeg_frames_seconds(data), audio_bytes * 8 / _MPEG_MAX_BPS)
-    if isinstance(audio_file, AIFF):
-        # mutagen's bitrate here is channels x bits x rate, the PCM byte rate
-        # a decoder reads the sample data at (compressed AIFF-C is rejected).
-        byte_rate = int(getattr(info, "bitrate", 0) or 0) // 8
-        return _pcm_floor_seconds(data, b"SSND", byte_rate, little_endian=False)
-    if isinstance(audio_file, MP4):
-        return _mp4_floor_seconds(data, info)
-    lossy = isinstance(audio_file, _LOSSY_TYPES) and getattr(info, "codec", "") != "alac"
-    floor = len(data) * 8 / (_LOSSY_MAX_BPS if lossy else _LOSSLESS_MAX_BPS)
-    if isinstance(audio_file, FLAC):
-        rate = int(getattr(info, "sample_rate", 0) or 0)
-        floor = max(floor, _flac_frames_seconds(data, rate, provider=provider))
-    if data[:4] == b"OggS":
-        floor = max(floor, _ogg_packets_seconds(data, provider=provider))
-    return floor
+def _aiff_byte_rate(data: bytes, *, provider: str = "") -> float:
+    """Bytes a second ffmpeg decodes an AIFF file's sample data at.
+
+    ffmpeg takes the sample width from the codec, not from COMM's sample
+    size: plain AIFF, and AIFF-C 'NONE' and 'twos', round the size up to 1-4
+    bytes and refuse a larger one; the other PCM types have a fixed width;
+    the fixed-ratio codecs decode whole blocks of a set length. An FVER
+    chunk whose timestamp is not AIFF-C's makes ffmpeg read COMM as plain
+    AIFF, so it does here too. Refused: two COMM chunks (mutagen and the
+    decoder may read different ones), an FVER chunk not 4 bytes long or an
+    odd-sized COMM (no writer makes either, and ffmpeg's chunk walk past
+    them need not match this one), an 'APCM' chunk (it switches ffmpeg to
+    XA ADPCM, whatever COMM says) and any codec no table here times.
+    """
+    form = data[8:12]
+    version = _AIFC_VERSION1 if form == b"AIFC" else 0
+    comm = None
+    for chunk_id, pos, size in _iff_chunks(data, little_endian=False):
+        if chunk_id == b"COMM":
+            if comm is not None:
+                raise _unsupported_aiff("more than one COMM chunk", provider)
+            comm = pos, size, version
+        elif chunk_id == b"FVER":
+            if size != 4:
+                raise _unsupported_aiff("malformed FVER chunk", provider)
+            if comm is None:
+                version = int.from_bytes(data[pos : pos + 4], "big")
+        elif chunk_id == b"APCM":
+            raise _unsupported_aiff("XA ADPCM", provider)
+    if form not in (b"AIFF", b"AIFC") or comm is None:
+        raise _unsupported_aiff("no COMM chunk", provider)
+    pos, size, version = comm
+    if size < 18 or size & 1 or pos + 18 > len(data):
+        raise _unsupported_aiff("malformed COMM chunk", provider)
+    channels, bits = struct.unpack_from(">H4xH", data, pos)
+    rate = min(_aiff_rate(data[pos + 8 : pos + 18]), _MAX_PCM_RATE)
+    if not channels or rate <= 0:
+        raise _unsupported_aiff("no channels or sample rate", provider)
+    tag = b"NONE"  # plain AIFF, or a COMM with no room for a compression type
+    if version == _AIFC_VERSION1 and size >= 22:
+        tag = data[pos + 18 : pos + 22].upper()
+    if tag in _AIFC_BLOCK_CODECS:
+        codec = _AIFC_BLOCK_CODECS[tag]
+        block, per_channel = _MP4_BLOCK_BYTES[codec]
+        block_bytes = block * channels if per_channel else block
+        return rate * block_bytes / _MP4_V0_FRAMES_PER_PACKET[codec]
+    width = _AIFC_PCM_WIDTHS.get(tag, 0)
+    if width is None:
+        width = next((n for n, top in ((1, 8), (2, 16), (3, 24), (4, 32)) if bits <= top), 0)
+    if not width:
+        name = tag.decode("ascii", "backslashreplace")
+        reason = f"{bits}-bit samples" if tag in (b"NONE", b"TWOS") else f"compression '{name}'"
+        raise _unsupported_aiff(reason, provider)
+    return rate * width * channels
+
+
+def _aiff_rate(extended: bytes) -> int:
+    """Sample rate ffmpeg reads from COMM's 80-bit float, 0 when it refuses it.
+
+    ffmpeg does not mask the sign bit, rounds a fraction to nearest, and
+    keeps the low 32 bits of the result as a C int; mutagen's float reading
+    differs for crafted values, so the decoder's is mirrored here.
+    """
+    exponent = int.from_bytes(extended[:2], "big") - 16383 - 63
+    mantissa = int.from_bytes(extended[2:10], "big")
+    if not -63 <= exponent <= 63:
+        return 0
+    if exponent >= 0:
+        rate = mantissa << exponent
+    else:
+        rate = ((mantissa + (1 << (-exponent - 1))) & 0xFFFF_FFFF_FFFF_FFFF) >> -exponent
+    rate &= 0xFFFF_FFFF
+    return rate if rate < 1 << 31 else 0  # a negative int: ffmpeg refuses it
+
+
+def _unsupported_aiff(reason: str, provider: str) -> ProviderError:
+    return ProviderError(
+        provider=provider,
+        detail=f"Unsupported AIFF audio: {reason}",
+        status_code=400,
+    )
 
 
 def _pcm_floor_seconds(
-    data: bytes, chunk_id: bytes, byte_rate: int, *, little_endian: bool
+    data: bytes, chunk_id: bytes, byte_rate: float, *, little_endian: bool
 ) -> float:
     """Seconds of PCM in the sample chunk, counted from the bytes sent.
 
@@ -417,7 +815,9 @@ def _chunks_tile_to_eof(data: bytes, pos: int, *, little_endian: bool) -> bool:
     """True when named, non-sample chunks run from ``pos`` exactly to EOF."""
     size_format = "<I" if little_endian else ">I"
     pad = 0
-    while pos + 8 <= len(data):
+    for _ in range(_MAX_CHUNKS):
+        if pos + 8 > len(data):
+            break
         chunk_id = data[pos : pos + 4]
         # Printable IDs keep raw PCM (zero runs read as empty chunks) out.
         if chunk_id in (b"data", b"SSND") or not all(0x20 <= b <= 0x7E for b in chunk_id):
@@ -425,53 +825,160 @@ def _chunks_tile_to_eof(data: bytes, pos: int, *, little_endian: bool) -> bool:
         (size,) = struct.unpack_from(size_format, data, pos + 4)
         pad = size & 1
         pos += 8 + size + pad
+    else:
+        return False  # more chunks than a genuine file has: bill to EOF
     # The last chunk may omit its pad byte.
     return pos == len(data) or (pad == 1 and pos == len(data) + 1)
 
 
-def _id3v2_size(data: bytes) -> int:
-    """Return the size of a leading ID3v2 tag (0 when absent), capped at the data."""
-    if len(data) < 10 or data[:3] != b"ID3":
+def _id3v2_size(data: bytes, pos: int = 0) -> int:
+    """Return the size of an ID3v2 tag at ``pos`` (0 when absent), capped at the data."""
+    if len(data) < pos + 10 or data[pos : pos + 3] != b"ID3":
         return 0
     size = 10 + (
-        (data[6] & 0x7F) << 21 | (data[7] & 0x7F) << 14 | (data[8] & 0x7F) << 7 | data[9] & 0x7F
+        (data[pos + 6] & 0x7F) << 21
+        | (data[pos + 7] & 0x7F) << 14
+        | (data[pos + 8] & 0x7F) << 7
+        | data[pos + 9] & 0x7F
     )
-    if data[5] & 0x10:
+    if data[pos + 5] & 0x10:
         size += 10  # footer
-    return min(size, len(data))
+    return min(size, len(data) - pos)
 
 
-def _mpeg_frames_seconds(data: bytes) -> float:
+def _mpeg_frames_seconds(data: bytes, *, skip_id3: bool = True) -> float:
     """Sum the duration of every MPEG audio frame in the data.
 
     Walks frame to frame and resyncs past junk the way decoders do, so a
     forged Xing/VBRI frame count or padding between frames hides nothing.
     """
     total = 0.0
-    # Decoders skip the ID3v2 tag, so cover art in it cannot hold frames.
-    pos = _id3v2_size(data)
+    # Decoders skip a file's ID3v2 tag, so cover art in it cannot hold
+    # frames; MP4 sample data has no tag to skip.
+    pos = _id3v2_size(data) if skip_id3 else 0
     first = True
     while (match := _MPEG_SYNC.search(data, pos)) is not None:
         start = match.start()
-        b1, b2 = data[start + 1], data[start + 2]
-        version = (b1 >> 3) & 3
-        layer = 4 - ((b1 >> 1) & 3)
-        mpeg1 = version == 3
-        bitrate = _MPEG_KBPS[(mpeg1, layer)][b2 >> 4] * 1000
-        rate = _MPEG_RATES[version][(b2 >> 2) & 3]
-        padding = (b2 >> 1) & 1
-        if layer == 1:
-            samples = 384
-            frame_size = (12 * bitrate // rate + padding) * 4
-        else:
-            samples = 1152 if layer == 2 or mpeg1 else 576
-            frame_size = samples // 8 * bitrate // rate + padding
+        samples, rate, frame_size = _mpeg_frame(data, start)
         # A leading Xing/Info/VBRI frame carries the tag, not audio.
         head = data[start : start + 40]
         if not (first and (b"Xing" in head or b"Info" in head or b"VBRI" in head)):
             total += samples / rate
         first = False
         pos = start + frame_size
+    return total
+
+
+def _mpeg_chained_seconds(data: bytes) -> float:
+    """Sum the MPEG frames that sit in runs of chained frames, each at least
+    as long as the run that makes ffmpeg's MP3 probe pick a file.
+
+    A run ends at the first offset that is not a frame header, and the
+    search goes on past it, as the probe's does. Chance sync bytes in PCM or
+    FLAC data rarely chain more than a few frames, so they are not summed.
+    """
+    total = 0.0
+    pos = 0
+    while (match := _MPEG_SYNC.search(data, pos)) is not None:
+        run, seconds, end = 0, 0.0, match.start()
+        while end < len(data) and _MPEG_SYNC.match(data, end):
+            samples, rate, frame_size = _mpeg_frame(data, end)
+            run += 1
+            seconds += samples / rate
+            end += frame_size
+        if run >= _MPEG_PROBE_FRAMES:
+            total += seconds
+        pos = end + 1
+    return total
+
+
+def _mpeg_frame(data: bytes, start: int) -> tuple[int, int, int]:
+    """(samples, sample rate, bytes) of the frame whose header _MPEG_SYNC matched at ``start``."""
+    b1, b2 = data[start + 1], data[start + 2]
+    version = (b1 >> 3) & 3
+    layer = 4 - ((b1 >> 1) & 3)
+    mpeg1 = version == 3
+    bitrate = _MPEG_KBPS[(mpeg1, layer)][b2 >> 4] * 1000
+    rate = _MPEG_RATES[version][(b2 >> 2) & 3]
+    padding = (b2 >> 1) & 1
+    if layer == 1:
+        return 384, rate, (12 * bitrate // rate + padding) * 4
+    samples = 1152 if layer == 2 or mpeg1 else 576
+    return samples, rate, samples // 8 * bitrate // rate + padding
+
+
+def _mpeg_stream_starts(data: bytes) -> bool:
+    """True when MPEG frames chain from the first byte, as an MP3 stream starts.
+
+    A few frames hidden in another stream's metadata (an ADTS or AC-3 stream
+    with MPEG frames inside) do not make ffmpeg's probe pick MP3; this many
+    chained frames at the start do, so the frame count is what it decodes.
+    """
+    pos = 0
+    for _ in range(_MPEG_PROBE_FRAMES):
+        if pos >= len(data):
+            return True  # a short file: every frame chains to the end
+        if not _MPEG_SYNC.match(data, pos):
+            return False
+        pos += _mpeg_frame(data, pos)[2]
+    return True
+
+
+def _adts_header(data: bytes, start: int) -> tuple[float, int] | None:
+    """(seconds, frame bytes) of an ADTS header at ``start`` ffmpeg accepts, or None.
+
+    Each frame holds raw_data_blocks + 1 blocks of 1024 samples at its
+    sampling index's rate (the AAC core rate, also for HE-AAC).
+    """
+    head = data[start : start + 7]
+    if len(head) < 7:
+        return None
+    index = head[2] >> 2 & 0x0F
+    size = (head[3] & 0x03) << 11 | head[4] << 3 | head[5] >> 5
+    if index >= len(_AAC_RATES) or size < 7:
+        return None
+    return ((head[6] & 0x03) + 1) * 1024 / _AAC_RATES[index], size
+
+
+def _adts_stream_starts(data: bytes) -> bool:
+    """True when ADTS frames chain from the first byte, as an AAC stream starts."""
+    pos = 0
+    for _ in range(_ADTS_PROBE_FRAMES):
+        if pos >= len(data):
+            return True
+        frame = _adts_header(data, pos) if _ADTS_SYNC.match(data, pos) else None
+        if frame is None:
+            return False
+        pos += frame[1]
+    return True
+
+
+def _adts_frames_seconds(data: bytes, *, provider: str = "") -> float:
+    """Sum the frames of an ADTS stream as ffmpeg's parser splits them.
+
+    The parser takes each frame's length from its header and resyncs byte
+    by byte past anything that is not a header, so the walk does the same.
+    Genuine frames are tens of bytes or more; input with more headers than
+    one per 32 bytes is crafted and rejected rather than walked.
+    """
+    total = 0.0
+    budget = len(data) // 32 + 10_000
+    pos = 0
+    while (match := _ADTS_SYNC.search(data, pos)) is not None:
+        budget -= 1
+        if budget < 0:
+            raise ProviderError(
+                provider=provider,
+                detail="Cannot parse AAC audio: too many frame headers",
+                status_code=400,
+            )
+        start = match.start()
+        frame = _adts_header(data, start)
+        if frame is None:
+            pos = start + 1
+            continue
+        total += frame[0]
+        pos = start + frame[1]
     return total
 
 
@@ -494,7 +1001,7 @@ def _flac_frames_seconds(data: bytes, stream_rate: int, *, provider: str = "") -
     """
     total = 0.0
     budget = len(data) // 64 + 10_000
-    pos = _flac_audio_start(data)
+    pos = _flac_audio_start(data, provider=provider)
     while (match := _FLAC_SYNC.search(data, pos)) is not None:
         budget -= 1
         if budget < 0:
@@ -513,17 +1020,26 @@ def _flac_frames_seconds(data: bytes, stream_rate: int, *, provider: str = "") -
     return total
 
 
-def _flac_audio_start(data: bytes) -> int:
+def _flac_audio_start(data: bytes, *, provider: str = "") -> int:
     """Offset of the first byte after the FLAC metadata blocks.
 
     Decoders skip each block by its declared length, so cover art in a
-    PICTURE block cannot hold frames.
+    PICTURE block cannot hold frames. A file has a handful of blocks; one
+    with thousands of empty ones is crafted and rejected.
     """
     pos = _id3v2_size(data)
     if data[pos : pos + 4] != b"fLaC":
         return 0
     pos += 4
+    blocks = 0
     while pos + 4 <= len(data):
+        blocks += 1
+        if blocks > _MAX_CHUNKS:
+            raise ProviderError(
+                provider=provider,
+                detail="Cannot parse FLAC audio: too many metadata blocks",
+                status_code=400,
+            )
         last = data[pos] & 0x80
         pos += 4 + int.from_bytes(data[pos + 1 : pos + 4], "big")
         if last:
@@ -579,36 +1095,54 @@ class _Mp4Track:
     """What one MP4 audio track's tables say the decoder will read."""
 
     codec: bytes
-    frame_seconds: float | None  # AAC: the shortest frame the decoder outputs
+    # Seconds each packet is billed at: for AAC, MPEG and Opus the shortest
+    # the decoder outputs, for ALAC the longest (all but the last fill it).
+    frame_seconds: float | None
     rate: float  # decode sample rate: stsd's, or mdhd's timescale without one
     frame_bytes: int  # PCM bytes per frame (all channels); 0 when not PCM
+    block_bytes: int = 0  # bytes per coded block of a fixed-ratio codec, else 0
     count: int = 0  # coded samples (packets)
     sample_bytes: int = 0
     frames: int | None = None  # PCM frames, when the samples are sized in frames
+    content_seconds: float = 0.0  # MPEG and Opus: timed from the sample bytes
 
 
-def _mp4_floor_seconds(data: bytes, info: object) -> float:
+def _mp4_floor_seconds(data: bytes, *, provider: str = "") -> float:
     """Lower bound from the sample tables of the MP4 audio tracks.
 
-    The decoder reads exactly the samples a track's stsz (or, in a
+    The decoder reads exactly the samples a track's stsz or stz2 (or, in a
     fragmented movie, its trun boxes) lists, or for uncompressed QuickTime
     audio the frames its chunk table lists, so they set the bound rather than
     the forgeable mdhd duration, and the bytes of video, timecode, metadata
     or subtitle tracks are not billed as audio. The longest track sets the
     price: the provider transcribes one audio stream, so a second language
-    or a spatial audio track is not billed again. Only a movie with no audio
-    track, a compressed moov, or a layout this walk cannot follow (malformed
-    boxes, fragment sample sizes given nowhere) falls back to the whole file
-    at the top bitrate: nothing smaller is then known to hold all the audio.
+    or a spatial audio track is not billed again. A movie this walk cannot
+    follow (malformed boxes, a compressed moov, fragment sample sizes given
+    nowhere, an AAC object type it cannot time) or with no audio track is
+    refused: no byte count is then known to bound the audio it decodes.
     """
     try:
         tracks = _mp4_audio_tracks(data)
-    except (ValueError, IndexError, struct.error):
-        tracks = None
-    if tracks:
-        return max(_mp4_track_floor(track) for track in tracks)
-    lossless = getattr(info, "codec", "") == "alac"
-    return len(data) * 8 / (_LOSSLESS_MAX_BPS if lossless else _LOSSY_MAX_BPS)
+    except (ValueError, IndexError, OverflowError, struct.error) as exc:
+        raise ProviderError(
+            provider=provider,
+            detail=f"Cannot parse MP4 audio: {exc}",
+            status_code=400,
+        ) from exc
+    if not tracks:
+        raise ProviderError(
+            provider=provider,
+            detail="Cannot parse MP4 audio: no audio track",
+            status_code=400,
+        )
+    floor = max(_mp4_track_floor(track) for track in tracks)
+    flac_rates = [track.rate for track in tracks if track.codec == b"fLaC"]
+    if flac_rates:
+        # Each FLAC sample is a frame with a checked header, and the scan
+        # counts every one in the file, wherever the sample table puts it.
+        stream_rate = max(1, int(min(flac_rates)))
+        floor = max(floor, _flac_frames_seconds(data, stream_rate, provider=provider))
+    return floor
 
 
 def _mp4_track_floor(track: _Mp4Track) -> float:
@@ -620,7 +1154,8 @@ def _mp4_track_floor(track: _Mp4Track) -> float:
         floor = track.sample_bytes * 8 / cap
         if track.frame_seconds is not None:
             floor = max(floor, track.count * track.frame_seconds)
-    rate = min(track.rate, _MP4_MAX_RATE)
+    floor = max(floor, track.content_seconds)
+    rate = min(track.rate, _MAX_PCM_RATE)
     if track.frames is None or rate <= 0:
         return floor
     # PCM frames at the decode rate are its exact duration; the byte floor
@@ -629,28 +1164,33 @@ def _mp4_track_floor(track: _Mp4Track) -> float:
     return seconds if track.frame_bytes else max(seconds, floor)
 
 
-def _mp4_audio_tracks(data: bytes) -> list[_Mp4Track] | None:
+def _mp4_audio_tracks(data: bytes) -> list[_Mp4Track]:
     """Return the sample totals of each audio track.
 
     A track is audio when its handler is 'soun', or when it is not 'vide'
     and not every sample entry is a known data, subtitle or video type:
     ffmpeg decodes an audio entry as audio whatever the handler says, and an
     unknown entry is billed rather than trusted. Samples in fragments
-    (moof/traf/trun) are added to their track's moov sample table. None for
-    a compressed movie. Raises ValueError on malformed boxes or unknown
-    fragment sizes.
+    (moof/traf/trun) are added to their track's moov sample table. Raises
+    ValueError on malformed boxes, a compressed movie or unknown fragment
+    sizes.
     """
-    top = list(_mp4_boxes(data, 0, len(data)))
-    moov = next(((start, end) for kind, start, end in top if kind == b"moov"), None)
+    moov = None
+    fragments = []
+    for kind, start, end in _mp4_boxes(data, 0, len(data), cut_tail=True):
+        if kind == b"moov" and moov is None:
+            moov = (start, end)
+        elif kind == b"moof":
+            fragments.append((start, end))
     if moov is None:
-        return None
+        raise ValueError("no moov box")
     tracks: list[_Mp4Track] = []
     track_ids: list[int] = []
     audio_ids: dict[int, _Mp4Track] = {}
     trex_sizes: dict[int, int] = {}
     for kind, start, end in _mp4_boxes(data, *moov):
         if kind == b"cmov":
-            return None
+            raise ValueError("compressed movie")
         if kind == b"mvex":
             for found, payload, _ in _mp4_boxes(data, start, end):
                 if found == b"trex":
@@ -668,18 +1208,14 @@ def _mp4_audio_tracks(data: bytes) -> list[_Mp4Track] | None:
         if handler == b"vide":
             continue
         stbl = _mp4_child(data, *_mp4_child(data, *mdia, b"minf"), b"stbl")
-        stsd = _mp4_child(data, *stbl, b"stsd")
-        if handler != b"soun" and all(
-            entry in _MP4_NON_AUDIO_ENTRIES
-            for entry, _, _ in _mp4_boxes(data, stsd[0] + 8, stsd[1])
-        ):
+        entries = _mp4_sample_entries(data, *_mp4_child(data, *stbl, b"stsd"))
+        if handler != b"soun" and all(entry in _MP4_NON_AUDIO_ENTRIES for entry, _, _ in entries):
             continue  # timecode, metadata, subtitle, hint and other data tracks
         mdhd, _ = _mp4_child(data, *mdia, b"mdhd")
         timescale = struct.unpack_from(">I", data, mdhd + (20 if data[mdhd] == 1 else 12))[0]
-        track = _mp4_track(data, stbl, *stsd, timescale)
+        track = _mp4_track(data, stbl, entries, timescale)
         tracks.append(track)
         audio_ids[track_id] = track
-    fragments = [(start, end) for kind, start, end in top if kind == b"moof"]
     if fragments and len(set(track_ids)) != len(track_ids):
         raise ValueError("duplicate MP4 track_ID")  # a traf could not be matched
     for moof in fragments:
@@ -690,7 +1226,7 @@ def _mp4_audio_tracks(data: bytes) -> list[_Mp4Track] | None:
 
 
 def _mp4_track(
-    data: bytes, stbl: tuple[int, int], stsd: int, stsd_end: int, timescale: int
+    data: bytes, stbl: tuple[int, int], entries: list[tuple[bytes, int, int]], timescale: int
 ) -> _Mp4Track:
     """Read one audio track's sound description and sample tables.
 
@@ -698,31 +1234,211 @@ def _mp4_track(
     description, not stsz, sizes it), and when stts gives every sample a
     duration of 1 it reads the frames the chunk table lists, ignoring the
     stsz count. Both are counted in frames, as the decoder plays them.
+    Fixed-ratio codecs read packet by packet are counted in whole blocks.
     """
-    codec, frame_seconds, rate, frame_bytes, packet_frames = _mp4_sound_entry(data, stsd, stsd_end)
+    codec, frame_seconds, rate, frame_bytes, packet_frames, channels = _mp4_sound_entry(
+        data, entries
+    )
     track = _Mp4Track(codec, frame_seconds, rate if rate > 0 else timescale, frame_bytes)
-    stsz, stsz_end = _mp4_child(data, *stbl, b"stsz")
-    sample_size, count = struct.unpack_from(">II", data, stsz + 4)
-    if sample_size:
-        sample_bytes = sample_size * count
-    else:
-        if stsz + 12 + 4 * count > stsz_end:
-            raise ValueError("truncated stsz")
-        sample_bytes = _sum_u32_be(data, stsz + 12, count)
+    sample_size, count, sample_bytes = _mp4_sample_sizes(data, stbl)
     chunk_frames = _mp4_chunk_frames(data, stbl)
+    if chunk_frames and codec in _AMR_FRAME_BYTES:
+        # ffmpeg then cuts each chunk into packets of its own size, so the
+        # frame walk below would not see the packets the decoder gets.
+        raise ValueError("AMR read by chunk is not supported")
+    if codec in _MP4_BLOCK_BYTES:
+        block, per_channel = _MP4_BLOCK_BYTES[codec]
+        # ffmpeg refuses these with no channels; without a rate no bound holds.
+        if channels <= 0 or track.rate <= 0:
+            raise ValueError(f"{codec.decode()} audio without channels or a rate")
+        if not chunk_frames and sample_size == 1:
+            raise ValueError(f"{codec.decode()} audio sized in frames is not supported")
+        track.block_bytes = block * channels if per_channel else block
     if sample_size == 1:
         track.frames = max(count, chunk_frames)
         track.sample_bytes = max(count, chunk_frames)  # one byte a sample, either way
     elif frame_bytes:
         track.frames = max(sample_bytes // frame_bytes, chunk_frames)
         track.count, track.sample_bytes = count, sample_bytes
-    elif packet_frames > 1 and chunk_frames:
+    elif chunk_frames and (packet_frames > 1 or track.block_bytes):
         track.frames = chunk_frames  # sized per packet from the sound description
+        track.count, track.sample_bytes = count, sample_bytes
+    elif track.block_bytes:
+        track.frames = _mp4_block_frames(track, sample_bytes)
         track.count, track.sample_bytes = count, sample_bytes
     else:
         track.count = count
         track.sample_bytes = max(sample_bytes, chunk_frames * sample_size)
+    if codec in _MP4_SCANNED_CODECS:
+        samples, sizes = _mp4_samples(data, stbl)
+        if codec == b"Opus":
+            track.content_seconds = _opus_samples_seconds(samples, sizes)
+        elif codec in _AMR_FRAME_BYTES:
+            track.content_seconds = _amr_samples_seconds(samples, sizes, codec)
+        else:
+            track.content_seconds = _mpeg_frames_seconds(samples, skip_id3=False)
     return track
+
+
+def _mp4_block_frames(track: _Mp4Track, sample_bytes: int) -> int:
+    """PCM frames a fixed-ratio codec's packets of ``sample_bytes`` decode to at most.
+
+    A packet decodes to its whole blocks, so the blocks in all the packets'
+    bytes together are never fewer.
+    """
+    return sample_bytes // track.block_bytes * _MP4_V0_FRAMES_PER_PACKET[track.codec]
+
+
+def _mp4_sample_sizes(data: bytes, stbl: tuple[int, int]) -> tuple[int, int, int]:
+    """Return (constant sample size or 0, sample count, sample bytes) from stsz or stz2."""
+    try:
+        stsz, stsz_end = _mp4_child(data, *stbl, b"stsz")
+    except ValueError:
+        return _mp4_compact_sizes(data, *_mp4_child(data, *stbl, b"stz2"))
+    sample_size, count = struct.unpack_from(">II", data, stsz + 4)
+    if sample_size:
+        return sample_size, count, sample_size * count
+    if stsz + 12 + 4 * count > stsz_end:
+        raise ValueError("truncated stsz")
+    return 0, count, _sum_u32_be(data, stsz + 12, count)
+
+
+def _mp4_compact_sizes(data: bytes, start: int, end: int) -> tuple[int, int, int]:
+    """Read a stz2 table of 4, 8 or 16-bit sample sizes, as ffmpeg supports."""
+    values = _mp4_compact_table(data, start, end)
+    return 0, len(values), sum(values)
+
+
+def _mp4_compact_table(data: bytes, start: int, end: int) -> Sequence[int]:
+    """Each sample's size from a stz2 table of 4, 8 or 16-bit fields."""
+    field = data[start + 7]
+    (count,) = struct.unpack_from(">I", data, start + 8)
+    table = start + 12
+    size = {4: (count + 1) // 2, 8: count, 16: 2 * count}.get(field)
+    if size is None or table + size > end:
+        raise ValueError("bad stz2")
+    packed = data[table : table + size]
+    if field == 16:
+        values = array.array("H", packed)
+        if sys.byteorder == "little":
+            values.byteswap()
+        return values
+    if field == 8:
+        return packed
+    nibbles = bytearray(2 * size)
+    nibbles[0::2] = packed.translate(_HIGH_NIBBLE)
+    nibbles[1::2] = packed.translate(_LOW_NIBBLE)
+    return bytes(nibbles[:count])  # without the pad nibble
+
+
+def _mp4_size_table(data: bytes, stbl: tuple[int, int]) -> Sequence[int]:
+    """Each sample's size, from stsz or stz2."""
+    try:
+        stsz, stsz_end = _mp4_child(data, *stbl, b"stsz")
+    except ValueError:
+        sizes = _mp4_compact_table(data, *_mp4_child(data, *stbl, b"stz2"))
+    else:
+        sample_size, count = struct.unpack_from(">II", data, stsz + 4)
+        if count > _MAX_MP4_SCANNED_SAMPLES:
+            raise ValueError("too many MP4 samples")
+        if sample_size:
+            return array.array("I", [sample_size]) * count
+        if stsz + 12 + 4 * count > stsz_end:
+            raise ValueError("truncated stsz")
+        sizes = array.array("I", data[stsz + 12 : stsz + 12 + 4 * count])
+        if sys.byteorder == "little":
+            sizes.byteswap()
+    if len(sizes) > _MAX_MP4_SCANNED_SAMPLES:
+        raise ValueError("too many MP4 samples")
+    return sizes
+
+
+def _mp4_samples(data: bytes, stbl: tuple[int, int]) -> tuple[bytearray, Sequence[int]]:
+    """The track's sample bytes in decode order, and the size of each sample.
+
+    The demuxer reads each chunk's samples back to back from its stco or
+    co64 offset and never the bytes between chunks, so a frame header put
+    there cannot hide the frames after it from this walk. Chunks that
+    together reach past the file's size (overlapping) or past its end, and
+    a malformed stsc, are refused.
+    """
+    sizes = _mp4_size_table(data, stbl)
+    stsc, stsc_end = _mp4_child(data, *stbl, b"stsc")
+    try:
+        stco, stco_end = _mp4_child(data, *stbl, b"stco")
+        typecode, width = "I", 4
+    except ValueError:
+        stco, stco_end = _mp4_child(data, *stbl, b"co64")
+        typecode, width = "Q", 8
+    (chunks,) = struct.unpack_from(">I", data, stco + 4)
+    (entries,) = struct.unpack_from(">I", data, stsc + 4)
+    if stco + 8 + width * chunks > stco_end or stsc + 8 + 12 * entries > stsc_end:
+        raise ValueError("truncated MP4 chunk table")
+    if chunks > _MAX_MP4_SCANNED_SAMPLES:
+        raise ValueError("too many MP4 chunks")
+    offsets = array.array(typecode, data[stco + 8 : stco + 8 + width * chunks])
+    values = array.array("I", data[stsc + 8 : stsc + 8 + 12 * entries])
+    if sys.byteorder == "little":
+        offsets.byteswap()
+        values.byteswap()
+    firsts, counts = values[0::3], values[1::3]
+    if entries and (firsts[0] != 1 or not all(map(operator.lt, firsts, firsts[1:]))):
+        raise ValueError("malformed stsc")
+    starts = [min(first, chunks + 1) for first in firsts]
+    per_chunk = array.array("I")
+    spans = map(operator.sub, [*starts[1:], chunks + 1], starts)
+    for count, span in zip(counts, spans, strict=True):
+        per_chunk.extend(repeat(count, span))
+    ends = array.array("Q", accumulate(sizes, initial=0))
+    view = memoryview(data)
+    samples = bytearray()  # appended chunk by chunk: a list of a million slices is 60 MB
+    sample = 0
+    for offset, count in zip(offsets, per_chunk, strict=False):  # stsc may list fewer
+        if sample >= len(sizes):
+            break
+        last = min(sample + count, len(sizes))
+        length = ends[last] - ends[sample]
+        if offset + length > len(data) or len(samples) + length > len(data):
+            raise ValueError("MP4 samples reach past the file")
+        samples += view[offset : offset + length]
+        sample = last
+    return samples, sizes[:sample]
+
+
+def _opus_samples_seconds(samples: bytearray, sizes: Sequence[int]) -> float:
+    """Sum the Opus packets laid back to back in ``samples``, timed from their TOC bytes.
+
+    In a multistream packet every stream lasts as long as the first, whose
+    TOC byte opens the packet. Empty packets carry no audio.
+    """
+    tocs = bytes(map(samples.__getitem__, compress(accumulate(sizes, initial=0), sizes)))
+    seconds = sum(map(_OPUS_TOC_SECONDS.__getitem__, tocs))
+    if tocs.translate(_OPUS_CODE3).count(1):
+        # Code 3 gives its frame count in the second byte.
+        starts = compress(accumulate(sizes, initial=0), sizes)
+        for start, toc in zip(starts, tocs, strict=True):
+            if toc & 3 == 3:
+                seconds += _opus_packet_seconds(samples[start : start + 2])
+    return seconds
+
+
+def _amr_samples_seconds(samples: bytearray, sizes: Sequence[int], codec: bytes) -> float:
+    """Count the 20 ms AMR frames in each sample, sized from their mode bytes.
+
+    The decoder reads a packet's frames back to back and starts afresh at
+    the next packet, so each sample is walked on its own; a frame the
+    sample's end cuts short still counts. The walk stops past a day.
+    """
+    lengths = samples.translate(_AMR_FRAME_LENGTHS[codec])
+    limit = _MAX_COUNTED_SECONDS * _AMR_FRAMES_PER_SECOND
+    frames = pos = 0
+    for size in sizes:
+        end = pos + size
+        while pos < end and frames <= limit:
+            pos += lengths[pos]
+            frames += 1
+        pos = end
+    return frames / _AMR_FRAMES_PER_SECOND
 
 
 def _mp4_chunk_frames(data: bytes, stbl: tuple[int, int]) -> int:
@@ -771,6 +1487,8 @@ def _mp4_add_fragment(
     track = audio_ids.get(track_id)
     if track is None:
         return  # a video or data track, or one no trak declares (not decoded)
+    if track.codec in _MP4_SCANNED_CODECS:
+        raise ValueError("fragmented MPEG, Opus or AMR audio is not supported")
     pos = tfhd + 8
     pos += 8 if flags & 0x01 else 0  # base_data_offset
     pos += 4 if flags & 0x02 else 0  # sample_description_index
@@ -798,6 +1516,8 @@ def _mp4_add_fragment(
             raise ValueError("MP4 fragment sample sizes unknown")
         if track.frame_bytes:
             track.frames = (track.frames or 0) + sample_bytes // track.frame_bytes
+        elif track.block_bytes:
+            track.frames = (track.frames or 0) + _mp4_block_frames(track, sample_bytes)
         track.count += count
         track.sample_bytes += sample_bytes
 
@@ -814,8 +1534,13 @@ def _sum_u32_be(data: bytes, pos: int, count: int, *, stride: int = 1, index: in
     return sum(values[index::stride])
 
 
-def _mp4_boxes(data: bytes, start: int, end: int):
-    """Yield (type, payload start, box end) for the boxes in ``data[start:end]``."""
+def _mp4_boxes(data: bytes, start: int, end: int, *, cut_tail: bool = False):
+    """Yield (type, payload start, box end) for the boxes in ``data[start:end]``.
+
+    With ``cut_tail`` a last box cut off by the end of the file ends the
+    walk, as a demuxer stops at EOF; a cut-off moov or moof is still an
+    error, since samples it lists could point at data earlier in the file.
+    """
     pos = start
     while pos + 8 <= end:
         size, kind = struct.unpack_from(">I4s", data, pos)
@@ -826,9 +1551,46 @@ def _mp4_boxes(data: bytes, start: int, end: int):
         elif size == 0:
             size = end - pos  # runs to the end of the parent
         if size < header or pos + size > end:
+            if cut_tail and size >= header and kind not in (b"moov", b"moof"):
+                return
             raise ValueError("bad MP4 box size")
         yield kind, pos + header, pos + size
         pos += size
+
+
+def _check_mp4_box_count(data: bytes, provider: str) -> None:
+    """Reject a movie with more boxes than any genuine one.
+
+    mutagen builds an object for every box inside its container boxes, and
+    this module walks the same ones, so millions of empty boxes would take
+    a gigabyte before payment. Malformed sizes end the count; the parse
+    after it rejects them.
+    """
+    budget = _MAX_MP4_BOXES
+    spans = [(0, len(data))]
+    while spans:
+        start, end = spans.pop()
+        pos = start
+        while pos + 8 <= end:
+            size, kind = struct.unpack_from(">I4s", data, pos)
+            header = 8
+            if size == 1 and pos + 16 <= end:
+                (size,) = struct.unpack_from(">Q", data, pos + 8)
+                header = 16
+            elif size == 0:
+                size = end - pos
+            if size < header:
+                break
+            budget -= 1
+            if budget < 0:
+                raise ProviderError(
+                    provider=provider,
+                    detail="Cannot parse MP4 audio: too many boxes",
+                    status_code=400,
+                )
+            if kind in _MP4_CONTAINERS:
+                spans.append((pos + header + (4 if kind == b"meta" else 0), min(pos + size, end)))
+            pos += size
 
 
 def _mp4_child(data: bytes, start: int, end: int, kind: bytes) -> tuple[int, int]:
@@ -839,24 +1601,55 @@ def _mp4_child(data: bytes, start: int, end: int, kind: bytes) -> tuple[int, int
     raise ValueError(f"missing MP4 {kind!r} box")
 
 
-def _mp4_sound_entry(
-    data: bytes, start: int, end: int
-) -> tuple[bytes, float | None, float, int, int]:
-    """Read the track's single sound description as ffmpeg does.
-
-    Returns the codec, the shortest AAC frame in seconds, the sample rate
-    (0 when unknown), PCM bytes per frame (0 when not PCM) and PCM frames per
-    coded packet (0 when unknown).
-    """
+def _mp4_sample_entries(data: bytes, start: int, end: int) -> list[tuple[bytes, int, int]]:
+    """The sample entries stsd counts; boxes after them are ignored, as ffmpeg does."""
     (count,) = struct.unpack_from(">I", data, start + 4)
-    entries = list(_mp4_boxes(data, start + 8, end))
-    if count != 1 or len(entries) != 1:
-        return b"", None, 0.0, 0, 0  # several sample descriptions: not bounded
-    codec, entry, entry_end = entries[0]
+    if not 0 < count <= _MAX_MP4_SAMPLE_ENTRIES:
+        raise ValueError(f"{count} sample descriptions")
+    entries = list(islice(_mp4_boxes(data, start + 8, end), count))
+    if len(entries) != count:
+        raise ValueError("truncated stsd")
+    return entries
+
+
+def _mp4_sound_entry(
+    data: bytes, entries: list[tuple[bytes, int, int]]
+) -> tuple[bytes, float | None, float, int, int, int]:
+    """Read the track's sound description as ffmpeg does.
+
+    Returns the codec ffmpeg decodes, the seconds each packet is billed at
+    (None when the codec has no fixed frame), the sample rate (0 when
+    unknown), PCM bytes per frame (0 when not PCM), PCM frames per coded
+    packet (0 when unknown) and the channel count (0 when unknown).
+    Several entries are priced only when they all read the same: ffmpeg
+    switches between them by chunk, and different ones could hide a cheaper
+    reading behind the first.
+    """
+    parsed = [_mp4_sound_fields(data, *entry) for entry in entries]
+    if any(fields != parsed[0] for fields in parsed[1:]):
+        raise ValueError("different sample descriptions")
+    return parsed[0]
+
+
+def _mp4_sound_fields(
+    data: bytes, codec: bytes, entry: int, entry_end: int
+) -> tuple[bytes, float | None, float, int, int, int]:
+    """Read one sample entry; see _mp4_sound_entry."""
+    if codec in _MP4_REFUSED_CODECS:
+        raise ValueError(f"{_MP4_REFUSED_CODECS[codec]} audio is not supported")
+    wav_tag = int.from_bytes(codec[2:], "big")
+    wav_wrapped = codec[:2] in (b"ms", b"TS") and codec not in _MP4_MPEG_CODECS
+    if wav_wrapped and wav_tag not in _MP4_WAV_PCM:
+        # QuickTime's wrapper for a WAVE codec: ADPCM, GSM, G.723 and the
+        # other non-PCM ones are low-rate codecs no table here times.
+        raise ValueError(f"WAVE format 0x{wav_tag:04x} audio is not supported")
+    frame_seconds = _MP4_MIN_FRAME_SECONDS.get(codec)
     version = struct.unpack_from(">H", data, entry + 8)[0]
     fields = _MP4_SOUND_FIELDS.get(version)
     if fields is None or entry + fields > entry_end:
-        return codec, None, 0.0, 0, 0
+        if codec in (b"mp4a", b"alac"):
+            raise ValueError(f"unreadable {codec.decode()} sample entry")
+        return codec, frame_seconds, 0.0, 0, 0, 0
     channels, bits = struct.unpack_from(">HH", data, entry + 16)
     rate: float = struct.unpack_from(">I", data, entry + 24)[0] >> 16
     packet_frames = _MP4_V0_FRAMES_PER_PACKET.get(codec, 0)
@@ -867,15 +1660,66 @@ def _mp4_sound_entry(
         (packet_frames,) = struct.unpack_from(">I", data, entry + 60)
         if not 0 < rate < 1e9:
             rate = 0.0  # NaN, infinite or negative
-    frame_seconds = None
     pcm_bits = bits
-    if codec in (b"mp4a", b"ipcm", b"fpcm"):
-        for kind, payload, box_end in _mp4_boxes(data, entry + fields, entry_end):
-            if kind == b"esds" and codec == b"mp4a":
-                frame_seconds = _aac_frame_seconds(data, payload, box_end)
-            elif kind == b"pcmC" and payload + 6 <= box_end:
+    children = entry + fields
+    if codec == b"mp4a":
+        frame_seconds = _aac_min_frame_seconds(rate)  # no esds: AAC at this rate
+        decoded = codec
+        for kind, payload, box_end in _mp4_boxes(data, children, entry_end):
+            if kind == b"esds":
+                decoded, frame_seconds = _esds_frame_seconds(data, payload, box_end, rate)
+        if frame_seconds is None:
+            raise ValueError("MP4 audio object type not supported")
+        codec = decoded
+    elif codec in (b"ipcm", b"fpcm"):
+        for kind, payload, box_end in _mp4_boxes(data, children, entry_end):
+            if kind == b"pcmC" and payload + 6 <= box_end:
                 pcm_bits = data[payload + 5]  # ISO PCM sample size, as ffmpeg reads it
-    return codec, frame_seconds, rate, _mp4_pcm_width(codec, pcm_bits) * channels, packet_frames
+    elif codec == b"alac":
+        frame_seconds = _alac_frame_seconds(data, children, entry_end, rate)
+    elif codec == b"fLaC":
+        rate = _dfla_rate(data, children, entry_end) or rate
+    frame_bytes = _mp4_pcm_width(codec, pcm_bits) * channels
+    return codec, frame_seconds, rate, frame_bytes, packet_frames, channels
+
+
+def _alac_frame_seconds(data: bytes, start: int, end: int, entry_rate: float) -> float:
+    """Longest packet an ALAC track decodes to, from its magic cookie.
+
+    The decoder outputs at most the cookie's frameLength samples a packet,
+    and every packet an encoder writes but the last holds exactly that many.
+    It runs at the cookie's sample rate (ffmpeg and AudioToolbox take it
+    over the entry's, where Apple's writer leaves 44100 at any rate), or at
+    the entry's when the cookie gives none.
+    """
+    cookie = None
+    for kind, payload, box_end in _mp4_boxes(data, start, end):
+        if kind == b"wave":  # QuickTime keeps the cookie inside a wave box
+            cookie = next(
+                ((pos, stop) for found, pos, stop in _mp4_boxes(data, payload, box_end)
+                 if found == b"alac"),
+                None,
+            )  # fmt: skip
+        elif kind == b"alac":
+            cookie = payload, box_end
+        if cookie is not None:
+            break
+    if cookie is None or cookie[0] + 28 > cookie[1]:
+        raise ValueError("ALAC sample entry without a magic cookie")
+    frame_length, cookie_rate = struct.unpack_from(">I16xI", data, cookie[0] + 4)
+    rate = cookie_rate or entry_rate
+    if rate <= 0:
+        raise ValueError("ALAC sample rate unknown")
+    return frame_length / min(rate, _MAX_PCM_RATE)
+
+
+def _dfla_rate(data: bytes, start: int, end: int) -> int:
+    """STREAMINFO's sample rate in a fLaC entry's dfLa box, 0 when absent."""
+    for kind, payload, box_end in _mp4_boxes(data, start, end):
+        if kind == b"dfLa" and payload + 21 <= box_end:
+            # Version and flags, a metadata block header, then STREAMINFO.
+            return int.from_bytes(data[payload + 18 : payload + 21], "big") >> 4
+    return 0
 
 
 def _mp4_pcm_width(codec: bytes, bits: int) -> int:
@@ -891,16 +1735,22 @@ def _mp4_pcm_width(codec: bytes, bits: int) -> int:
     return _MP4_PCM_WIDTHS.get(codec, 0)
 
 
-def _aac_frame_seconds(data: bytes, start: int, end: int) -> float | None:
-    """Read the AudioSpecificConfig in an esds box into a frame duration.
+def _esds_frame_seconds(
+    data: bytes, start: int, end: int, entry_rate: float
+) -> tuple[bytes, float | None]:
+    """The codec an mp4a track decodes, and its shortest frame, from its esds.
 
-    The first sampling rate in the config is the AAC core rate, also for
-    HE-AAC, so 960 samples at it is the shortest frame the decoder outputs.
+    The first sampling rate in the AudioSpecificConfig is the AAC core rate,
+    also for HE-AAC, so 960 samples at it is the shortest frame (480 for the
+    low-delay object types). MPEG-1/2 audio is reported as '.mp3', with
+    frames of at least 576 samples at up to 48 kHz. AAC with no usable
+    config is decoded at the sample entry's rate. The frame is None for
+    object types this module does not time.
     """
     pos = start + 4  # version and flags
     tag, pos, _ = _mp4_descriptor(data, pos)
     if tag != 0x03:  # ES_Descriptor
-        return None
+        return b"mp4a", _aac_min_frame_seconds(entry_rate)
     flags = data[pos + 2]
     pos += 3
     if flags & 0x80:
@@ -910,11 +1760,15 @@ def _aac_frame_seconds(data: bytes, start: int, end: int) -> float | None:
     if flags & 0x20:
         pos += 2
     tag, pos, _ = _mp4_descriptor(data, pos)
-    if tag != 0x04 or data[pos] not in _AAC_OBJECT_TYPES:  # DecoderConfigDescriptor
-        return None
+    if tag != 0x04:  # DecoderConfigDescriptor
+        return b"mp4a", _aac_min_frame_seconds(entry_rate)
+    if data[pos] in _MPEG_AUDIO_OBJECT_TYPES:
+        return b".mp3", _MPEG_MIN_FRAME_SECONDS
+    if data[pos] not in _AAC_OBJECT_TYPES:
+        return b"mp4a", None
     tag, pos, size = _mp4_descriptor(data, pos + 13)
     if tag != 0x05 or size < 2 or pos + size > end:  # DecoderSpecificInfo
-        return None
+        return b"mp4a", _aac_min_frame_seconds(entry_rate)
     config = int.from_bytes(data[pos : pos + 6].ljust(6, b"\x00"), "big")
     shift = 43  # 48 bits read, 5-bit audio object type first
     aot = config >> shift
@@ -927,10 +1781,19 @@ def _aac_frame_seconds(data: bytes, start: int, end: int) -> float | None:
     elif index < len(_AAC_RATES):
         rate = _AAC_RATES[index]
     else:
-        return None
-    if aot not in _AAC_LONG_FRAME_AOTS or rate <= 0:
-        return None
-    return 960 / rate
+        return b"mp4a", _aac_min_frame_seconds(entry_rate)
+    if rate <= 0:
+        return b"mp4a", _aac_min_frame_seconds(entry_rate)
+    if aot in _AAC_LONG_FRAME_AOTS:
+        return b"mp4a", 960 / rate
+    if aot in _AAC_LOW_DELAY_AOTS:
+        return b"mp4a", 480 / rate
+    return b"mp4a", None
+
+
+def _aac_min_frame_seconds(rate: float) -> float:
+    """Shortest AAC frame at a sample entry's rate, held to AAC's 7.35-96 kHz."""
+    return 960 / min(max(rate, 7350), 96000)
 
 
 def _mp4_descriptor(data: bytes, pos: int) -> tuple[int, int, int]:
@@ -1030,7 +1893,8 @@ def _ogg_packets_seconds(data: bytes, *, provider: str = "") -> float:
     as frames_per_packet frames of their mode. For Vorbis and Speex the
     packets on a stream's first and last audio pages are left out, covering
     a start or end trim the granules may ask for. A stream's codec comes from
-    its first packet, as the demuxer decides it; other codecs get no bound.
+    its first packet, as the demuxer decides it; a stream that is not one of
+    these codecs or a known video, subtitle or index stream is refused.
     """
     streams: dict[int, _OpusStream | _VorbisStream | _SpeexStream | None] = {}
     budget = len(data) // 2 + 100_000
@@ -1043,6 +1907,12 @@ def _ogg_packets_seconds(data: bytes, *, provider: str = "") -> float:
                 budget -= stream.add_page(data, starts, lengths, spans, provider)
         elif starts:
             head = data[starts[0] : starts[0] + min(lengths[0], _OGG_HEAD_BYTES)]
+            if not head.startswith(_OGG_ALLOWED_HEADS):
+                raise ProviderError(
+                    provider=provider,
+                    detail="Only Opus, Vorbis and Speex audio in Ogg is supported",
+                    status_code=400,
+                )
             stream = streams[serial] = _ogg_stream(head)
             if stream is not None:
                 budget -= stream.add_page(

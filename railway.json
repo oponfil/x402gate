@@ -7,6 +7,7 @@
     "deploy": {
         "startCommand": "python -m x402gate.main",
         "healthcheckPath": "/health",
-        "restartPolicyType": "ON_FAILURE"
+        "restartPolicyType": "ON_FAILURE",
+        "drainingSeconds": 1020
     }
 }

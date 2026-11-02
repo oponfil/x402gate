@@ -19,6 +19,10 @@ x402gate can be deployed using Railway (recommended), Docker, or a traditional V
    - `BASE_PAY_TO_ADDRESS` — your EVM wallet address for receiving USDC
 5. Railway auto-detects the `Dockerfile` and deploys
 
+### Graceful Shutdown
+
+`railway.json` sets `deploy.drainingSeconds` to 1020: Railway waits up to 17 minutes between SIGTERM and SIGKILL, so a redeploy lets in-flight jobs and settlements finish. That is the longest `poll_timeout` in `config.yaml` (900 s) plus 120 s for submit and the Base settlement. On Docker or systemd, give the stop timeout the same room (`docker stop -t 1020`, `TimeoutStopSec=1020`).
+
 ### Custom Domain
 
 1. Go to **Settings** → **Domains** in Railway

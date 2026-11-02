@@ -25,6 +25,7 @@ from typing import Any
 
 import httpx2
 from solana.rpc.async_api import AsyncClient
+from solana.rpc.commitment import Confirmed
 from solana.rpc.types import TxOpts
 from solders.commitment_config import CommitmentLevel
 from solders.keypair import Keypair
@@ -65,8 +66,15 @@ _INFLIGHT_TTL_S = _CONFIRM_RUN_TIMEOUT_S
 # exact bytes the request's own verify simulated a moment before. A passed
 # simulation of the same bytes is reused once within this window. The send
 # preflight still simulates at broadcast, so a balance spent in between is
-# still refused before anything is sent.
+# still refused before anything is sent. Both run at confirmed commitment:
+# the default, finalized, lags ~13 s and still shows a balance a confirmed
+# payment already spent.
 _SIMULATION_REUSE_S = 10.0
+# A known failure (landed with an error, or expired unlanded) is kept per
+# signature so a later confirm of it, such as the SDK's pending-store retry,
+# fails at once instead of polling, and settle can report it as failed. Longer
+# than the SDK's 300 s pending-store TTL, and restarted on each lookup.
+_TERMINAL_TTL_S = 600.0
 # solana-py's default drops an idle RPC connection after 5 s, so most
 # payments paid a new TLS handshake. Same expiry as the shared HTTP pool.
 _RPC_LIMITS = httpx2.Limits(
@@ -126,10 +134,15 @@ class SolanaSigner:
         self._inflight: dict[str, tuple[bytes, float]] = {}
         # Digest of signed bytes -> when their simulation passed. Same loop.
         self._simulated: dict[bytes, float] = {}
+        # Signature -> (failure reason, when recorded). Written on the loop,
+        # read by settle from its worker thread, so it has a lock.
+        self._terminal: dict[str, tuple[str, float]] = {}
+        self._terminal_lock = threading.Lock()
 
-        # Persistent background event loop + async client
+        # Persistent background event loop + async client. Confirmed, not the
+        # default finalized, for simulations (see _SIMULATION_REUSE_S).
         self._loop = asyncio.new_event_loop()
-        self._client = AsyncClient(rpc_url, timeout=_RPC_TIMEOUT_S)
+        self._client = AsyncClient(rpc_url, commitment=Confirmed, timeout=_RPC_TIMEOUT_S)
         self._client._provider.session = httpx2.AsyncClient(
             timeout=_RPC_TIMEOUT_S, limits=_RPC_LIMITS
         )
@@ -340,7 +353,7 @@ class SolanaSigner:
         # settle reuse the verify simulation, and a refused preflight sends
         # nothing, so the settle fails cleanly instead of landing a failed
         # transaction whose fee the gateway pays.
-        opts = TxOpts(skip_preflight=False, max_retries=3)
+        opts = TxOpts(skip_preflight=False, preflight_commitment=Confirmed, max_retries=3)
         result = await self._client.send_transaction(tx, opts=opts)
 
         sig = getattr(result, "value", None)
@@ -373,6 +386,33 @@ class SolanaSigner:
         for sig in stale:
             del self._inflight[sig]
 
+    def terminal_failure(self, signature: str) -> str | None:
+        """Return why this transaction failed for certain, or None if it did not.
+
+        Set only when the transaction landed with an error at confirmed
+        commitment or its blockhash expired before it landed. A timeout or an
+        unreadable status is not a known failure and returns None.
+        """
+        with self._terminal_lock:
+            entry = self._terminal.get(signature)
+            if entry is None:
+                return None
+            # Each lookup restarts the TTL, so a client that keeps replaying
+            # the payload cannot outlast the record.
+            self._terminal[signature] = (entry[0], time.monotonic())
+        return entry[0]
+
+    def _record_terminal(self, signature: str, reason: str) -> None:
+        self._inflight.pop(signature, None)
+        now = time.monotonic()
+        with self._terminal_lock:
+            self._terminal = {
+                sig: entry
+                for sig, entry in self._terminal.items()
+                if now - entry[1] < _TERMINAL_TTL_S
+            }
+            self._terminal[signature] = (reason, now)
+
     # ------------------------------------------------------------------
     # Protocol: confirm_transaction
     # ------------------------------------------------------------------
@@ -392,6 +432,9 @@ class SolanaSigner:
         later confirm of the same signature can still rebroadcast them. A
         failed status read is logged and retried, and never counts as expiry.
         """
+        known_failure = self.terminal_failure(signature)
+        if known_failure is not None:
+            raise RuntimeError(known_failure)
         sig = Signature.from_string(signature)
         start = time.monotonic()
         # A first confirm resends 2 s after the send. A later confirm of the
@@ -427,7 +470,7 @@ class SolanaSigner:
                     # An unread status is not proof the transaction missed:
                     # keep polling until the next check or the timeout.
                     if read and last is None:
-                        self._inflight.pop(signature, None)
+                        self._record_terminal(signature, _EXPIRED_MESSAGE)
                         logger.warning(
                             "Transaction %s expired before landing",
                             signature[:16] + "...",
@@ -466,16 +509,22 @@ class SolanaSigner:
         return None
 
     def _apply_status(self, status: Any, signature: str, start: float) -> bool:
-        """Record a terminal status. Return True when the transaction is confirmed."""
-        if status is None:
-            return False
-        if status.err:
-            self._inflight.pop(signature, None)
-            raise RuntimeError(f"Transaction failed: {status.err}")
-        if status.confirmation_status is None:
+        """Record a terminal status. Return True when the transaction is confirmed.
+
+        An error counts only at confirmed or finalized: one seen at processed
+        may be on a fork that is dropped, so polling goes on.
+        """
+        if status is None or status.confirmation_status is None:
             return False
         conf = str(status.confirmation_status).lower()
-        if "confirmed" in conf or "finalized" in conf:
+        landed = "confirmed" in conf or "finalized" in conf
+        if status.err:
+            if not landed:
+                return False
+            reason = f"Transaction failed: {status.err}"
+            self._record_terminal(signature, reason)
+            raise RuntimeError(reason)
+        if landed:
             self._inflight.pop(signature, None)
             logger.info(
                 "Transaction %s %s (%.1fs)",

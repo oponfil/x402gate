@@ -12,6 +12,7 @@ import respx
 
 from x402gate.core import http
 from x402gate.core.config import ProviderConfig
+from x402gate.core.proxy import UPSTREAM_CREDENTIALS_DETAIL
 from x402gate.providers.base import ProviderError, outcome_unknown
 from x402gate.providers.elevenlabs import ElevenLabsProvider, _is_turbo_model
 
@@ -154,8 +155,8 @@ class TestSubmit:
         """Raises ProviderError on API error."""
         provider = _make_provider()
         mock_response = MagicMock()
-        mock_response.status_code = 401
-        mock_response.text = "Unauthorized"
+        mock_response.status_code = 500
+        mock_response.text = "Internal Server Error"
 
         with patch("x402gate.providers.elevenlabs.shared_client") as mock_shared:
             mock_client = AsyncMock()
@@ -312,3 +313,76 @@ class TestPooledClient:
         with pytest.raises(ProviderError) as caught:
             await provider.submit("voice123", {"text": "Hello"})
         assert outcome_unknown(caught.value) is False
+
+
+class TestUpstreamStatus:
+    """How ElevenLabs' error statuses are billed and shown to the client."""
+
+    @respx.mock
+    @pytest.mark.parametrize("status", [401, 402, 403])
+    async def test_rejected_key_hides_the_body(self, pooled, status):
+        """Our remaining credits stay private, and a 402 is not an x402 request."""
+        respx.post(_TTS_URL).mock(
+            return_value=httpx.Response(
+                status, text='{"detail":{"status":"quota_exceeded","message":"120 credits"}}'
+            )
+        )
+        with pytest.raises(ProviderError) as caught:
+            await _make_provider().submit("voice123", {"text": "Hello"})
+        assert caught.value.status_code == 502
+        assert caught.value.detail == UPSTREAM_CREDENTIALS_DETAIL
+        assert outcome_unknown(caught.value) is False
+
+    @respx.mock
+    @pytest.mark.parametrize("status", [504, 520, 524])
+    async def test_gateway_timeout_keeps_the_payment(self, pooled, status):
+        """A proxy gave up after forwarding: the audio may be made and billed."""
+        respx.post(_TTS_URL).mock(return_value=httpx.Response(status, text="timeout"))
+        with pytest.raises(ProviderError) as caught:
+            await _make_provider().submit("voice123", {"text": "Hello"})
+        assert caught.value.status_code == 504
+        assert outcome_unknown(caught.value) is True
+
+    @respx.mock
+    @pytest.mark.parametrize("status", [422, 500, 503])
+    async def test_reported_error_is_refunded(self, pooled, status):
+        respx.post(_TTS_URL).mock(return_value=httpx.Response(status, text="bad"))
+        with pytest.raises(ProviderError) as caught:
+            await _make_provider().submit("voice123", {"text": "Hello"})
+        assert caught.value.status_code == status
+        assert outcome_unknown(caught.value) is False
+
+    @respx.mock
+    async def test_redirect_is_refunded(self, pooled):
+        """httpx does not follow redirects, so a 3xx never reached the API."""
+        respx.post(_TTS_URL).mock(return_value=httpx.Response(307, text=""))
+        with pytest.raises(ProviderError) as caught:
+            await _make_provider().submit("voice123", {"text": "Hello"})
+        assert caught.value.status_code == 502
+        assert outcome_unknown(caught.value) is False
+
+
+class TestInputTypes:
+    """Wrong types are a 400 before payment, not a 500."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("text", [["x" * 5000], 5, {"a": "b"}, "   "])
+    async def test_bad_text_is_rejected(self, text):
+        """A list must not be priced by its element count."""
+        with pytest.raises(ProviderError) as caught:
+            await _make_provider().get_price("voice123", {"text": text})
+        assert caught.value.status_code == 400
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("model_id", [5, ["eleven_turbo_v2"], {"a": 1}])
+    async def test_non_string_model_id_is_rejected(self, model_id):
+        with pytest.raises(ProviderError) as caught:
+            await _make_provider().get_price("voice123", {"text": "hi", "model_id": model_id})
+        assert caught.value.status_code == 400
+        assert "model_id" in caught.value.detail
+
+    @pytest.mark.asyncio
+    async def test_null_model_id_is_the_standard_rate(self):
+        provider = _make_provider()
+        price = await provider.get_price("voice123", {"text": "a" * 1000, "model_id": None})
+        assert price == Decimal("0.30")

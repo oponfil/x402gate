@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from decimal import Decimal
@@ -170,7 +171,7 @@ class TestPriceCache:
         """A price older than the TTL is dropped on the next insert and not served."""
         provider = _provider()
         old = time.monotonic() - spicyapi._PRICED_TTL_SECONDS - 1
-        provider._priced["old"] = (Decimal("0.01"), old)
+        provider._priced["old"] = [(Decimal("0.01"), old)]
 
         assert provider._price_for("old") is None
         provider._remember_price("new", Decimal("0.02"))
@@ -210,6 +211,211 @@ class TestPriceCache:
         assert exc.value.status_code == 409
         assert not outcome_unknown(exc.value)
         provider._client.request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_higher_price_for_an_equivalent_body_does_not_raise_the_guard(self):
+        """A client charged the cached lower price never runs at a newer higher quote."""
+        provider = _provider()
+        provider._client.request.side_effect = [
+            _quote(cost="0.010", quote_id="q1"),
+            _quote(cost="0.020", quote_id="q2"),
+        ]
+        await provider.get_price("jobs", _BODY)
+        # Same SpicyAPI payload, but a different gateway price-cache entry.
+        await provider.get_price("jobs", {**_BODY, "_caller": "other"})
+
+        with pytest.raises(ProviderError, match="increased") as exc:
+            await provider.submit("jobs", _BODY)
+
+        assert exc.value.status_code == 409
+        assert not outcome_unknown(exc.value)
+        assert provider._client.request.await_count == 2
+
+    def test_lower_price_inside_the_window_is_the_guard(self, monkeypatch):
+        """The lowest price shown inside the window is kept; past it the latest counts."""
+        provider = _provider()
+        now = [1000.0]
+        monkeypatch.setattr(spicyapi.time, "monotonic", lambda: now[0])
+
+        provider._remember_price("key", Decimal("0.010"))
+        now[0] += 10
+        provider._remember_price("key", Decimal("0.020"))
+        assert provider._price_for("key") == Decimal("0.010")
+
+        now[0] += provider._price_window + 1
+        assert provider._price_for("key") == Decimal("0.020")
+        provider._remember_price("key", Decimal("0.030"))
+        assert provider._priced["key"] == [(Decimal("0.030"), now[0])]
+
+    def test_newer_lower_price_replaces_higher_ones(self):
+        """A price that is not below a newer one can never be the guard."""
+        provider = _provider()
+
+        provider._remember_price("key", Decimal("0.010"))
+        provider._remember_price("key", Decimal("0.030"))
+        provider._remember_price("key", Decimal("0.020"))
+
+        assert [cost for cost, _ in provider._priced["key"]] == [
+            Decimal("0.010"),
+            Decimal("0.020"),
+        ]
+        assert provider._price_for("key") == Decimal("0.010")
+
+    def test_window_follows_the_gateway_price_cache_ttl(self):
+        provider = SpicyApiProvider(config=_config(), price_cache_ttl=300)
+        assert provider._price_window == 300 + spicyapi._PRICE_GRACE_SECONDS
+
+    def test_grace_covers_a_slow_solana_settlement(self, monkeypatch):
+        """A price read from the gateway cache just before it expires still guards
+        a submit that waited out a long Solana confirmation."""
+        provider = _provider()
+        now = [1000.0]
+        monkeypatch.setattr(spicyapi.time, "monotonic", lambda: now[0])
+        provider._remember_price("key", Decimal("0.010"))  # cached until t=60
+        now[0] += 50
+        provider._remember_price("key", Decimal("0.020"))  # equivalent body, price rose
+
+        # Paid from the cache at t=59, then settlement ran its full confirm wait.
+        now[0] = 1000.0 + spicyapi._PRICE_CACHE_TTL_S - 1 + 150
+        assert provider._price_for("key") == Decimal("0.010")
+
+    @pytest.mark.asyncio
+    async def test_paid_price_is_the_guard_whenever_the_price_was_shown(self, monkeypatch):
+        """With the charged price passed in, the guard does not depend on the clock."""
+        provider = _provider()
+        now = [1000.0]
+        monkeypatch.setattr(spicyapi.time, "monotonic", lambda: now[0])
+        provider._client.request.side_effect = [
+            _quote(cost="0.010", quote_id="q1"),
+            _quote(cost="0.020", quote_id="q2"),
+        ]
+        await provider.get_price("jobs", _BODY)
+        await provider.get_price("jobs", {**_BODY, "_caller": "other"})
+        now[0] += provider._price_window + 1
+
+        with pytest.raises(ProviderError, match="increased") as exc:
+            await provider.submit("jobs", _BODY, paid_price=Decimal("0.010"))
+
+        assert exc.value.status_code == 409
+        assert not outcome_unknown(exc.value)
+        assert provider._client.request.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_client_who_paid_the_new_price_is_not_refused(self):
+        """A lower price still in the window does not refuse a client charged the new one."""
+        provider = _provider()
+        provider._client.request.side_effect = [
+            _quote(cost="0.010", quote_id="q1"),
+            _quote(cost="0.020", quote_id="q2"),
+            _task("queued"),
+        ]
+        await provider.get_price("jobs", {**_BODY, "_caller": "other"})
+        await provider.get_price("jobs", _BODY)
+
+        result = await provider.submit("jobs", _BODY, paid_price=Decimal("0.020"))
+
+        assert result["data"]["id"] == "job_1"
+        create = provider._client.request.await_args_list[2]
+        assert create.kwargs["json"]["quoteId"] == "q2"
+
+    @pytest.mark.asyncio
+    async def test_paid_price_runs_without_a_price_on_record(self):
+        """The charged amount is known, so an evicted record does not refuse the job."""
+        provider = _provider()
+        provider._client.request.side_effect = [_quote(cost="0.010"), _task("queued")]
+        await provider.get_price("jobs", _BODY)
+        provider._priced.clear()
+
+        result = await provider.submit("jobs", _BODY, paid_price=Decimal("0.010"))
+
+        assert result["data"]["id"] == "job_1"
+
+    @pytest.mark.asyncio
+    async def test_chat_checks_the_quote_against_the_paid_price(self):
+        """Chat uses the charged price as its guard too, and nothing is streamed."""
+        provider = _provider()
+        provider._client.request.side_effect = [
+            _quote(cost="0.0098895", quote_id="qchat", unit="per_1k_tokens"),
+        ]
+        opened: list[object] = []
+        provider._client.stream = lambda *args, **kwargs: opened.append(args)
+        await provider.get_price("chat/completions", _CHAT)
+
+        with pytest.raises(ProviderError, match="increased") as exc:
+            await provider.submit("chat/completions", _CHAT, paid_price=Decimal("0.005"))
+
+        assert exc.value.status_code == 409
+        assert not outcome_unknown(exc.value)
+        assert opened == []
+
+
+class TestQuoteFailureDuringSubmit:
+    """A quote starts no job, so a quote that fails is always a known failure."""
+
+    @pytest.mark.asyncio
+    async def test_requote_timeout_after_stale_create_is_known(self):
+        provider = _provider()
+        provider._sleep = AsyncMock()
+        request = httpx.Request("POST", "https://api.spicyapi.ai/api/v1/jobs/quote")
+        provider._client.request.side_effect = [
+            _quote(quote_id="q1"),
+            _response(409, {"code": 40901, "msg": "quote no longer matches"}),
+            *[httpx.ReadTimeout("slow", request=request)] * 3,
+        ]
+        await provider.get_price("jobs", _BODY)
+
+        with pytest.raises(ProviderError, match="timed out") as exc:
+            await provider.submit("jobs", _BODY)
+
+        assert not outcome_unknown(exc.value)
+        paths = [call.args[1] for call in provider._client.request.await_args_list]
+        assert sum(path.endswith("/createTask") for path in paths) == 1
+
+    @pytest.mark.asyncio
+    async def test_expired_quote_timeout_before_create_is_known(self):
+        provider = _provider()
+        provider._sleep = AsyncMock()
+        request = httpx.Request("POST", "https://api.spicyapi.ai/api/v1/jobs/quote")
+        provider._client.request.side_effect = [
+            _quote(quote_id="q1"),
+            *[httpx.ReadTimeout("slow", request=request)] * 3,
+        ]
+        await provider.get_price("jobs", _BODY)
+        for quote in provider._quotes.values():
+            quote.expires_at = 0
+
+        with pytest.raises(ProviderError) as exc:
+            await provider.submit("jobs", _BODY)
+
+        assert exc.value.status_code == 504
+        assert not outcome_unknown(exc.value)
+
+    @pytest.mark.asyncio
+    async def test_requote_read_error_after_stale_stream_is_known(self):
+        provider = _provider()
+        provider._sleep = AsyncMock()
+        request = httpx.Request("POST", "https://api.spicyapi.ai/api/v1/jobs/quote")
+        provider._client.request.side_effect = [
+            _quote(quote_id="q1", unit="per_1k_tokens"),
+            *[httpx.ReadError("reset", request=request)] * 3,
+        ]
+        opened: list[int] = []
+
+        def open_stream(*args: object, **kwargs: object) -> _StreamContext:
+            opened.append(1)
+            return _StreamContext(
+                _StreamResponse(409, payload={"code": 40901, "msg": "quote no longer matches"})
+            )
+
+        provider._client.stream = open_stream
+        await provider.get_price("chat/completions", _CHAT)
+
+        with pytest.raises(ProviderError) as exc:
+            await provider.submit("chat/completions", _CHAT)
+
+        assert exc.value.status_code == 503
+        assert not outcome_unknown(exc.value)
+        assert len(opened) == 1
 
 
 class TestSubmit:
@@ -1226,6 +1432,65 @@ class TestChat:
 
         assert result["task_id"] == "job_chat"
         assert provider._client.stream is not None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [504, 520, 524])
+    async def test_gateway_timeout_on_stream_keeps_payment(self, status):
+        """A proxy that gave up waiting leaves the chat running upstream; not re-sent."""
+        provider = _provider()
+        provider._client.request.return_value = _quote(unit="per_1k_tokens")
+        opened: list[int] = []
+
+        def open_stream(*args: object, **kwargs: object) -> _StreamContext:
+            opened.append(1)
+            return _StreamContext(_StreamResponse(status, payload={"msg": "origin timeout"}))
+
+        provider._client.stream = open_stream
+        await provider.get_price("chat/completions", _CHAT)
+
+        with pytest.raises(ProviderError) as exc:
+            await provider.submit("chat/completions", _CHAT)
+
+        assert exc.value.status_code == status
+        assert outcome_unknown(exc.value)
+        assert len(opened) == 1
+
+    @pytest.mark.asyncio
+    async def test_other_5xx_on_stream_is_a_known_failure(self):
+        provider = _provider()
+        provider._client.request.return_value = _quote(unit="per_1k_tokens")
+        _attach_stream(provider, [_StreamResponse(502, payload={"msg": "bad gateway"})])
+        await provider.get_price("chat/completions", _CHAT)
+
+        with pytest.raises(ProviderError) as exc:
+            await provider.submit("chat/completions", _CHAT)
+
+        assert exc.value.status_code == 502
+        assert not outcome_unknown(exc.value)
+
+    @pytest.mark.asyncio
+    async def test_keepalives_past_poll_timeout_end_the_chat_and_keep_payment(self):
+        """Keepalive comments reset the read timeout, so the stream has a total limit."""
+        provider = _provider()
+        provider._config.poll_timeout = 0.2
+        provider._client.request.return_value = _quote(unit="per_1k_tokens")
+
+        class _Keepalives(_StreamResponse):
+            async def aiter_lines(self):
+                while True:
+                    await asyncio.sleep(0.01)
+                    yield ": keepalive"
+
+        _attach_stream(provider, [_Keepalives(200)])
+        await provider.get_price("chat/completions", _CHAT)
+
+        started = time.monotonic()
+        with pytest.raises(ProviderError, match="did not finish") as exc:
+            await provider.submit("chat/completions", _CHAT)
+
+        assert time.monotonic() - started < 2
+        assert exc.value.status_code == 504
+        assert outcome_unknown(exc.value)
 
 
 class TestSettledCostLookup:
