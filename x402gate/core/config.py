@@ -135,6 +135,7 @@ class ProviderConfig(BaseModel):
     pricing: dict[str, Any] = {}  # Per-model pricing tiers (e.g. TTS providers)
     models_cache_ttl: int = 86400  # Cache TTL for models list (seconds)
     max_stt_audio_mb: int = 25  # max STT upload size in MB (OpenRouter Whisper limit)
+    max_stt_audio_seconds: int = 3600  # max audio length per request, transcription or chat
 
 
 class AppConfig(BaseModel):

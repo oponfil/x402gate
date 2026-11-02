@@ -1118,8 +1118,35 @@ def _extract_stt_audio(
     return audio_bytes, str(fmt)
 
 
+def check_audio_length(seconds: int, max_seconds: int, provider_name: str) -> int:
+    """Refuse audio longer than ``max_seconds`` before payment; return ``seconds``.
+
+    A few dollars of transcription fit in one upload at a low bitrate, and no
+    real request needs hours of audio, so long files get a 400.
+    """
+    if seconds > max_seconds:
+        raise ProviderError(
+            provider=provider_name,
+            detail=(
+                f"Audio too long ({_audio_length(seconds)}). "
+                f"Maximum: {_audio_length(max_seconds)} per request"
+            ),
+            status_code=400,
+        )
+    return seconds
+
+
+def _audio_length(seconds: int) -> str:
+    """Seconds as "45 s", "60 min" or "61.5 min", for error messages."""
+    if seconds < 60:
+        return f"{seconds} s"
+    if seconds % 60 == 0:
+        return f"{seconds // 60} min"
+    return f"{seconds / 60:.1f} min"
+
+
 def _chat_audio_seconds(
-    audio_inputs: list[Any], provider_name: str, *, max_audio_bytes: int
+    audio_inputs: list[Any], provider_name: str, *, max_audio_bytes: int, max_audio_seconds: int
 ) -> int:
     """Billing seconds of all the audio parts of a chat request.
 
@@ -1139,7 +1166,7 @@ def _chat_audio_seconds(
         else:
             duration = get_audio_duration_seconds(data, fmt, provider=provider_name)
         seconds += billing_seconds(duration)
-    return seconds
+    return check_audio_length(seconds, max_audio_seconds, provider_name)
 
 
 def _reported_cost(usage: dict[str, Any]) -> Decimal | None:
@@ -1361,6 +1388,7 @@ class OpenRouterProvider(BaseProvider):
         self._default_web_search_max_results = default_web_search_max_results
         self._web_search_cost_per_result = Decimal(str(web_search_cost_per_result))
         self._max_stt_audio_bytes = config.max_stt_audio_mb * 1024 * 1024
+        self._max_stt_audio_seconds = config.max_stt_audio_seconds
 
     async def _fetch_model_info(
         self,
@@ -1496,7 +1524,8 @@ class OpenRouterProvider(BaseProvider):
             self.name,
             max_audio_bytes=self._max_stt_audio_bytes,
         )
-        return billing_seconds(get_audio_duration_seconds(audio_bytes, fmt, provider=self.name))
+        seconds = billing_seconds(get_audio_duration_seconds(audio_bytes, fmt, provider=self.name))
+        return check_audio_length(seconds, self._max_stt_audio_seconds, self.name)
 
     def _estimate_stt_price(
         self,
@@ -1832,7 +1861,10 @@ class OpenRouterProvider(BaseProvider):
         """Billing seconds of a chat request's audio parts, measured in a worker thread."""
         return await self._in_pricing_slot(
             lambda: _chat_audio_seconds(
-                audio_inputs, self.name, max_audio_bytes=self._max_stt_audio_bytes
+                audio_inputs,
+                self.name,
+                max_audio_bytes=self._max_stt_audio_bytes,
+                max_audio_seconds=self._max_stt_audio_seconds,
             )
         )
 

@@ -314,8 +314,10 @@ class NanoGptProvider(BaseProvider):
             float(config.models_cache_ttl), self._fetch_models_list, self.name
         )
         self._default_max_tokens = default_max_tokens
-        # Cap on each input_audio part, decoded and timed before payment.
+        # Caps on each input_audio part's size and on the request's total audio
+        # length, both checked before payment.
         self._max_audio_bytes = config.max_stt_audio_mb * 1024 * 1024
+        self._max_audio_seconds = config.max_stt_audio_seconds
 
     def _require_chat(self, path: str) -> None:
         if path.strip("/") != _CHAT_PATH:
@@ -407,7 +409,10 @@ class NanoGptProvider(BaseProvider):
         """Billing seconds of a chat request's audio parts, measured in a worker thread."""
         return await in_audio_pricing_slot(
             lambda: _chat_audio_seconds(
-                audio_inputs, self.name, max_audio_bytes=self._max_audio_bytes
+                audio_inputs,
+                self.name,
+                max_audio_bytes=self._max_audio_bytes,
+                max_audio_seconds=self._max_audio_seconds,
             ),
             self.name,
         )

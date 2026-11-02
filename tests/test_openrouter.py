@@ -402,6 +402,45 @@ class TestGetPrice:
         assert exc_info.value.status_code == 413
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(("seconds", "refused"), [(5.0, False), (5.5, True)])
+    async def test_stt_audio_longer_than_the_limit_is_refused(
+        self, transcription_model_info_response, seconds, refused
+    ):
+        """Audio over max_stt_audio_seconds gets a 400 before payment."""
+        config = ProviderConfig(
+            enabled=True,
+            base_url="https://openrouter.ai/api/v1",
+            api_key="test-key-123",
+            max_stt_audio_seconds=5,
+        )
+        short_provider = OpenRouterProvider(config=config)
+        body = {
+            "model": "openai/whisper-1",
+            "input_audio": {"data": make_wav_b64(seconds), "format": "wav"},
+        }
+
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = transcription_model_info_response
+            if not refused:
+                assert await short_provider.get_price("audio/transcriptions", body) > 0
+                return
+            with pytest.raises(ProviderError, match="Audio too long") as exc_info:
+                await short_provider.get_price("audio/transcriptions", body)
+
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.detail == "Audio too long (6 s). Maximum: 5 s per request"
+
+    @pytest.mark.parametrize(
+        ("seconds", "text"), [(45, "45 s"), (3600, "60 min"), (3690, "61.5 min")]
+    )
+    def test_audio_length_in_messages(self, seconds, text):
+        assert openrouter._audio_length(seconds) == text
+
+    def test_default_audio_limit_is_one_hour(self):
+        config = ProviderConfig(enabled=True, base_url="https://openrouter.ai/api/v1")
+        assert config.max_stt_audio_seconds == 3600
+
+    @pytest.mark.asyncio
     async def test_model_not_found(self, provider):
         """Should raise ProviderError for unknown model."""
         body = {
@@ -2905,6 +2944,24 @@ class TestChatAudioInput:
         with pytest.raises(ProviderError) as caught:
             await self._price(small, body, self._model(audio=str(self.AUDIO)))
         assert caught.value.status_code == 413
+
+    @pytest.mark.asyncio
+    async def test_audio_parts_longer_than_the_limit_together_are_refused(self):
+        """The length limit covers all the audio parts of a request together."""
+        config = ProviderConfig(
+            enabled=True,
+            base_url="https://openrouter.ai/api/v1",
+            api_key="k",
+            max_stt_audio_seconds=5,
+        )
+        short = OpenRouterProvider(config=config)
+        model = self._model(audio=str(self.AUDIO))
+        one = _audio_body(_audio_part(make_wav_b64(3.0)))
+        assert await self._price(short, one, model) > 0
+        two = _audio_body(_audio_part(make_wav_b64(3.0)), _audio_part(make_wav_b64(3.0)))
+        with pytest.raises(ProviderError, match="Audio too long") as caught:
+            await self._price(short, two, model)
+        assert caught.value.status_code == 400
 
     @pytest.mark.asyncio
     async def test_audio_tokens_count_toward_the_long_context_tier(self, provider):

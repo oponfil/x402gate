@@ -1238,6 +1238,23 @@ class TestAudioInput:
         assert caught.value.status_code == 413
 
     @pytest.mark.asyncio
+    async def test_audio_longer_than_the_limit_is_refused(self):
+        config = ProviderConfig(
+            enabled=True,
+            base_url="https://api.nano-gpt.com/api/v1",
+            api_key="k",
+            max_stt_audio_seconds=5,
+        )
+        short = NanoGptProvider(config=config, default_max_tokens=2048)
+        assert await self._price(
+            short, _audio_body(_audio_part(make_wav_b64(5.0))), _gemini_flash()
+        )
+        body = _audio_body(_audio_part(make_wav_b64(6.0)))
+        with pytest.raises(ProviderError, match="Audio too long") as caught:
+            await self._price(short, body, _gemini_flash())
+        assert caught.value.status_code == 400
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "audio",
         [

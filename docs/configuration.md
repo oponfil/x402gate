@@ -68,6 +68,7 @@ Each provider is a key under `providers`:
 | `example_request_4` | dict | `{}` | Fourth example request (e.g. STT / `audio/transcriptions`) |
 | `models_cache_ttl` | int | `86400` | Seconds to cache the list of models (for providers that fetch it dynamically) |
 | `max_stt_audio_mb` | int | `25` | Max size in MB of an STT upload (OpenRouter) and of each `input_audio` part in a chat request (OpenRouter, NanoGPT); larger gets 413 |
+| `max_stt_audio_seconds` | int | `3600` | Max audio length in seconds per request: an STT upload, or all `input_audio` parts of a chat request together (OpenRouter, NanoGPT). Longer audio gets 400 before payment |
 | `jwt_token` | string | `""` | JWT token for cookie-based auth (Tungsten only) |
 | `cf_clearance` | string | `""` | Cloudflare clearance cookie (Tungsten only) |
 
