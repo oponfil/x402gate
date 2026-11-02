@@ -3944,3 +3944,180 @@ class TestSpicyApiPaidPrice:
 
         assert response.status_code == 200
         assert calls == [{"prepaid": prepaid, "paid_price": Decimal("0.05")}]
+
+
+class TestVideoNeedsPrepaid:
+    """An OpenRouter video request is held at the context window and paid only from prepaid."""
+
+    MODELS_URL = "https://openrouter.ai/api/v1/models"
+    CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
+    CATALOG = {
+        "data": [
+            {
+                "id": "qwen/omni",
+                "context_length": 100_000,
+                "pricing": {"prompt": "0.0000002", "completion": "0.000001"},
+            }
+        ]
+    }
+    BODY = {
+        "model": "qwen/omni",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe"},
+                    {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,AAAA"}},
+                ],
+            }
+        ],
+    }
+
+    @staticmethod
+    def _hold() -> Decimal:
+        """100k window tokens at the input rate plus the default output ceiling."""
+        output = providers["openrouter"]._default_max_tokens
+        return Decimal(100_000) * Decimal("0.0000002") + Decimal(output) * Decimal("0.000001")
+
+    def _mock_catalog(self) -> None:
+        respx.get(self.MODELS_URL).mock(return_value=httpx.Response(200, json=self.CATALOG))
+
+    def _mock_chat(self, cost: float = 0.0012) -> respx.Route:
+        return respx.post(self.CHAT_URL).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": "gen-1",
+                    "choices": [{"message": {"content": "{}"}}],
+                    "usage": {"prompt_tokens": 3000, "completion_tokens": 10, "cost": cost},
+                },
+            )
+        )
+
+    @respx.mock
+    def test_unpaid_video_gets_400_not_a_payment_offer(self, client):
+        self._mock_catalog()
+        response = client.post(OPENROUTER_CHAT, json=self.BODY)
+        assert response.status_code == 400
+        assert "prepaid balance" in response.json()["error"]
+        assert "accepts" not in response.json()
+
+    @respx.mock
+    def test_x402_payment_is_refused_before_it_is_verified(self, client):
+        self._mock_catalog()
+        chat = self._mock_chat()
+        with patch("x402gate.app.payment_handler") as mock_ph:
+            _paid_handler(mock_ph, SOLANA_NETWORK, SOL_PAYER)
+            response = client.post(
+                OPENROUTER_CHAT, json=self.BODY, headers={"Payment-Signature": "fake-sig"}
+            )
+        assert response.status_code == 400
+        assert "prepaid balance" in response.json()["error"]
+        mock_ph.verify.assert_not_called()
+        mock_ph.settle.assert_not_called()
+        assert not chat.called
+        assert gateway.payment_claims.claim(payment_key("fake-sig"))
+
+    @respx.mock
+    def test_x402_payment_beside_prepaid_headers_is_refused(self, client):
+        """With both, the payment header wins in the gateway, so the request is refused."""
+        reset()
+        kp = Keypair()
+        asyncio.run(deposit(str(kp.pubkey()), Decimal("1.00")))
+        self._mock_catalog()
+        with patch("x402gate.app.payment_handler") as mock_ph:
+            _paid_handler(mock_ph, SOLANA_NETWORK, SOL_PAYER)
+            response = client.post(
+                OPENROUTER_CHAT,
+                json=self.BODY,
+                headers={
+                    "Payment-Signature": "fake-sig",
+                    **_prepaid_headers(kp, "openrouter/chat/completions"),
+                },
+            )
+        assert response.status_code == 400
+        mock_ph.verify.assert_not_called()
+        assert get_balance(str(kp.pubkey())) == Decimal("1.00")
+
+    @respx.mock
+    def test_prepaid_holds_the_window_and_returns_the_rest(self, client):
+        reset()
+        kp = Keypair()
+        pubkey = str(kp.pubkey())
+        asyncio.run(deposit(pubkey, Decimal("1.00")))
+        self._mock_catalog()
+        chat = self._mock_chat(cost=0.0012)
+        response = client.post(
+            OPENROUTER_CHAT,
+            json=self.BODY,
+            headers=_prepaid_headers(kp, "openrouter/chat/completions"),
+        )
+        assert response.status_code == 200
+        assert response.headers["x-prepaid-cost"] == "0.0012"
+        assert get_balance(pubkey) == Decimal("1.00") - Decimal("0.0012")
+        sent = json.loads(chat.calls.last.request.content)
+        assert sent["messages"][0]["content"][1]["type"] == "video_url"
+        assert not any(key.startswith("_") for key in sent)
+
+    @respx.mock
+    def test_prepaid_balance_below_the_hold_gets_402(self, client):
+        reset()
+        kp = Keypair()
+        pubkey = str(kp.pubkey())
+        hold = self._hold()
+        asyncio.run(deposit(pubkey, hold - Decimal("0.000001")))
+        self._mock_catalog()
+        chat = self._mock_chat()
+        response = client.post(
+            OPENROUTER_CHAT,
+            json=self.BODY,
+            headers=_prepaid_headers(kp, "openrouter/chat/completions"),
+        )
+        assert response.status_code == 402
+        assert f"< ${hold}" in response.json()["error"]
+        assert not chat.called
+
+    @respx.mock
+    def test_cached_price_still_refuses_x402(self, client, monkeypatch):
+        monkeypatch.setattr(gateway, "price_cache", PriceCache(ttl=60))
+        reset()
+        kp = Keypair()
+        asyncio.run(deposit(str(kp.pubkey()), Decimal("1.00")))
+        self._mock_catalog()
+        self._mock_chat()
+        first = client.post(
+            OPENROUTER_CHAT,
+            json=self.BODY,
+            headers=_prepaid_headers(kp, "openrouter/chat/completions"),
+        )
+        assert first.status_code == 200
+        with (
+            patch.object(providers["openrouter"], "get_price") as priced,
+            patch("x402gate.app.payment_handler") as mock_ph,
+        ):
+            _paid_handler(mock_ph, SOLANA_NETWORK, SOL_PAYER)
+            second = client.post(
+                OPENROUTER_CHAT, json=self.BODY, headers={"Payment-Signature": "fake-sig"}
+            )
+        priced.assert_not_called()
+        assert second.status_code == 400
+        mock_ph.verify.assert_not_called()
+
+    def test_client_cannot_mark_its_own_request_prepaid_only(self, client):
+        seen: list[dict] = []
+
+        async def get_price(path: str, inputs: dict) -> Decimal:
+            seen.append(dict(inputs))
+            return Decimal("0.01")
+
+        with patch.object(providers["openrouter"], "get_price", side_effect=get_price):
+            response = client.post(
+                OPENROUTER_CHAT,
+                json={
+                    "model": "m",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "_prepaid_only": "forged",
+                },
+            )
+        assert response.status_code == 402
+        assert "_prepaid_only" not in seen[0]

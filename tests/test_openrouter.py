@@ -574,7 +574,7 @@ class TestRequestChecks:
         assert caught.value.status_code == 400
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("part_type", ["file", "video_url", None])
+    @pytest.mark.parametrize("part_type", ["file", "input_video", None])
     async def test_rejects_unpriced_content_parts(self, provider, part_type):
         part = {"type": part_type, "file": {"file_data": "https://example.com/a.pdf"}}
         body = {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": [part]}]}
@@ -3230,3 +3230,172 @@ class TestWebSearchRoutes:
             await provider.submit("chat/completions", _chat_body(**extra))
         assert caught.value.status_code == 400
         mock_post.assert_not_called()
+
+
+class TestVideoInput:
+    """A video part is priced at the model's whole context window, prepaid only."""
+
+    OMNI = {
+        "id": "qwen/omni",
+        "context_length": 100_000,
+        "pricing": {"prompt": "0.0000002", "completion": "0.000001", "audio": "0.0000005"},
+    }
+    VIDEO = {"type": "video_url", "video_url": {"url": "data:video/mp4;base64," + "A" * 400_000}}
+
+    @staticmethod
+    def _body(*parts: dict, **extra) -> dict:
+        content = [{"type": "text", "text": "Describe"}, *parts]
+        return {"model": "qwen/omni", "messages": [{"role": "user", "content": content}], **extra}
+
+    async def _price(self, provider, body: dict, *models: dict) -> Decimal:
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = _catalog(*(models or (self.OMNI,)))
+            return await provider.get_price("chat/completions", body)
+
+    @pytest.mark.asyncio
+    async def test_video_is_priced_at_the_context_window(self, provider):
+        """The window bills at the audio rate when it is above the input rate."""
+        body = self._body(self.VIDEO)
+        price = await self._price(provider, body)
+        assert price == Decimal(100_000) * Decimal("0.0000005") + Decimal(1024) * Decimal(
+            "0.000001"
+        )
+        assert body[openrouter._PREPAID_ONLY] == openrouter._VIDEO_NEEDS_PREPAID
+
+    @pytest.mark.asyncio
+    async def test_video_url_from_the_web_is_priced_the_same(self, provider):
+        remote = {"type": "video_url", "video_url": {"url": "https://example.com/a.mp4"}}
+        assert await self._price(provider, self._body(remote)) == await self._price(
+            provider, self._body(self.VIDEO)
+        )
+
+    @pytest.mark.asyncio
+    async def test_input_rate_when_no_audio_rate(self, provider):
+        model = {**self.OMNI, "pricing": {"prompt": "0.0000002", "completion": "0.000001"}}
+        price = await self._price(provider, self._body(self.VIDEO), model)
+        assert price == Decimal(100_000) * Decimal("0.0000002") + Decimal(1024) * Decimal(
+            "0.000001"
+        )
+
+    @pytest.mark.asyncio
+    async def test_top_provider_window_counts_when_larger(self, provider):
+        model = {**self.OMNI, "top_provider": {"context_length": 200_000}}
+        price = await self._price(provider, self._body(self.VIDEO), model)
+        assert price == Decimal(200_000) * Decimal("0.0000005") + Decimal(1024) * Decimal(
+            "0.000001"
+        )
+
+    @pytest.mark.asyncio
+    async def test_largest_window_and_rates_among_fallbacks(self, provider):
+        wide = {
+            "id": "google/wide",
+            "context_length": 1_000_000,
+            "pricing": {"prompt": "0.0000001", "completion": "0.000002"},
+        }
+        body = self._body(self.VIDEO, models=["google/wide"])
+        price = await self._price(provider, body, self.OMNI, wide)
+        assert price == Decimal(1_000_000) * Decimal("0.0000005") + Decimal(1024) * Decimal(
+            "0.000002"
+        )
+
+    @pytest.mark.asyncio
+    async def test_window_reaches_the_long_context_tier(self, provider):
+        model = {
+            **self.OMNI,
+            "pricing": {
+                **self.OMNI["pricing"],
+                "overrides": [{"min_prompt_tokens": 50_000, "prompt": "0.000001"}],
+            },
+        }
+        price = await self._price(provider, self._body(self.VIDEO), model)
+        # The tier raises the input rate above the audio rate it scales.
+        assert price == Decimal(100_000) * Decimal("0.0000025") + Decimal(1024) * Decimal(
+            "0.000001"
+        )
+
+    @pytest.mark.asyncio
+    async def test_flat_image_fee_comes_on_top(self, provider):
+        model = {**self.OMNI, "pricing": {**self.OMNI["pricing"], "image": "0.001"}}
+        image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+        price = await self._price(provider, self._body(self.VIDEO, image, image), model)
+        assert price == (
+            Decimal(100_000) * Decimal("0.0000005")
+            + 2 * Decimal("0.001")
+            + Decimal(1024) * Decimal("0.000001")
+        )
+
+    @pytest.mark.asyncio
+    async def test_text_above_the_window_keeps_the_text_estimate(self, provider):
+        model = {**self.OMNI, "context_length": 1_000}
+        text = {"type": "text", "text": "x" * 27_000}  # 10k tokens
+        price = await self._price(provider, self._body(self.VIDEO, text), model)
+        text_tokens = _ascii_tokens("Describe") + _ascii_tokens("x" * 27_000)
+        assert price > Decimal(1_000) * Decimal("0.0000005") + Decimal(1024) * Decimal("0.000001")
+        assert price >= Decimal(text_tokens) * Decimal("0.0000002")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("window", [None, 0, -5, "100000", True])
+    async def test_model_without_a_window_is_refused(self, provider, window):
+        model = {k: v for k, v in self.OMNI.items() if k != "context_length"}
+        if window is not None:
+            model["context_length"] = window
+        with pytest.raises(ProviderError, match="lists no context window") as caught:
+            await self._price(provider, self._body(self.VIDEO), model)
+        assert caught.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_without_video_the_request_is_not_prepaid_only(self, provider):
+        body = self._body()
+        await self._price(provider, body)
+        assert openrouter._PREPAID_ONLY not in body
+
+    @pytest.mark.asyncio
+    async def test_submit_forwards_the_video_without_internal_keys(
+        self, provider, chat_completion_response
+    ):
+        provider._catalogs.put("", {"qwen/omni": self.OMNI})
+        body = self._body(self.VIDEO)
+        body[openrouter._PREPAID_ONLY] = openrouter._VIDEO_NEEDS_PREPAID
+        with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = chat_completion_response
+            await provider.submit("chat/completions", body, prepaid=True)
+        sent = mock_post.call_args.kwargs["json"]
+        assert sent["messages"][0]["content"][1] == self.VIDEO
+        assert not any(key.startswith("_") for key in sent)
+
+    @pytest.mark.asyncio
+    async def test_catalog_fallback_cost_prices_the_prompt_as_audio(self, provider):
+        """Without usage.cost, a video's prompt is costed at the audio rate the hold assumed."""
+        usage = {"prompt_tokens": 50_000, "completion_tokens": 10, "is_byok": True}
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = _catalog(self.OMNI)
+            cost = await provider.calculate_actual_cost(self._body(self.VIDEO), {"usage": usage})
+        assert cost == Decimal(50_000) * Decimal("0.0000005") + Decimal(10) * Decimal("0.000001")
+
+    @pytest.mark.asyncio
+    async def test_catalog_fallback_cost_trusts_reported_audio_tokens(self, provider):
+        usage = {
+            "prompt_tokens": 50_000,
+            "completion_tokens": 10,
+            "prompt_tokens_details": {"audio_tokens": 1_000},
+            "is_byok": True,
+        }
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = _catalog(self.OMNI)
+            cost = await provider.calculate_actual_cost(self._body(self.VIDEO), {"usage": usage})
+        assert cost == (
+            Decimal(49_000) * Decimal("0.0000002")
+            + Decimal(1_000) * Decimal("0.0000005")
+            + Decimal(10) * Decimal("0.000001")
+        )
+
+    def test_video_parts_are_counted(self):
+        body = self._body(self.VIDEO, self.VIDEO)
+        assert openrouter.chat_video_parts(body) == 2
+        assert openrouter.chat_video_parts(self._body()) == 0
+
+    def test_nanogpt_helpers_still_refuse_video(self):
+        with pytest.raises(ProviderError, match="Use text, image_url or input_audio"):
+            openrouter.check_content_parts(self._body(self.VIDEO), "nanogpt")
+        with pytest.raises(ProviderError, match="not supported"):
+            estimate_chat_input_tokens(self._body(self.VIDEO), "nanogpt")

@@ -153,10 +153,25 @@ _IMAGE_INPUT_TOKENS = 4800
 _MILLION = Decimal("1000000")
 
 # Content parts the estimate can price. Files go through OpenRouter's PDF
-# parser (billed per page) and video length is unknown up front.
+# parser (billed per page), so they are refused.
 _TEXT_PARTS = frozenset({"text"})
 _IMAGE_PARTS = frozenset({"image_url"})
 _INLINE_PARTS = frozenset({"input_audio"})  # base64 data, counted by size
+# A video's length is unknown up front, so a request with one is priced at
+# the model's whole context window: the model cannot bill more input tokens
+# than that. Only OpenRouter takes video, and only on a prepaid balance,
+# which gets the unused part of that hold back (see _PREPAID_ONLY).
+_VIDEO_PARTS = frozenset({"video_url"})
+
+# Body key get_price sets, with the reason as its value, on a request that
+# only a prepaid balance may pay for. The app refuses an x402 payment for it.
+_PREPAID_ONLY = "_prepaid_only"
+_VIDEO_NEEDS_PREPAID = (
+    "Video input is accepted only with a prepaid balance. A video is priced at the "
+    "model's whole context window, and a prepaid balance gets back everything above "
+    "the actual cost after the response, which a per-request x402 payment cannot. "
+    "Top up with POST /v1/topup and sign the request with the X-PREPAID-* headers."
+)
 
 # Exa results are billed per result, so the count the client may ask for is
 # capped. Native search engines bill by the provider's own rates and are not
@@ -300,8 +315,11 @@ def _too_deep(provider_name: str) -> ProviderError:
     )
 
 
-def _part_type(part: dict[str, Any], provider_name: str) -> Any:
-    """A content part's type, refusing types the estimate cannot price."""
+def _part_type(part: dict[str, Any], provider_name: str, *, video: bool = False) -> Any:
+    """A content part's type, refusing types the estimate cannot price.
+
+    Video parts pass only with ``video`` (OpenRouter); NanoGPT refuses them.
+    """
     part_type = part.get("type", "text" if "text" in part else None)
     if not isinstance(part_type, (str, type(None))):
         # A list or object type is unhashable, so it cannot be looked up below.
@@ -312,11 +330,16 @@ def _part_type(part: dict[str, Any], provider_name: str) -> Any:
         )
     if part_type in _TEXT_PARTS or part_type in _IMAGE_PARTS or part_type in _INLINE_PARTS:
         return part_type
+    if video and part_type in _VIDEO_PARTS:
+        return part_type
+    supported = (
+        "text, image_url, input_audio or video_url" if video else ("text, image_url or input_audio")
+    )
     raise ProviderError(
         provider=provider_name,
         detail=(
             f"Content part type '{part_type}' is not supported because x402gate "
-            "cannot price it before payment. Use text, image_url or input_audio."
+            f"cannot price it before payment. Use {supported}."
         ),
         status_code=400,
     )
@@ -331,8 +354,12 @@ def _content_parts(content: Any) -> list[Any] | None:
     return None
 
 
-def _content_size(content: Any, provider_name: str) -> tuple[int, int]:
-    """Return (token units, images) for a message's content."""
+def _content_size(content: Any, provider_name: str, *, video: bool = False) -> tuple[int, int]:
+    """Return (token units, images) for a message's content.
+
+    A video part adds nothing: a request with one is priced at the whole
+    context window (see ``chat_video_parts``).
+    """
     parts = _content_parts(content)
     if parts is None:
         return _value_units(content), 0
@@ -342,11 +369,13 @@ def _content_size(content: Any, provider_name: str) -> tuple[int, int]:
         if not isinstance(part, dict):
             units += _value_units(part)
             continue
-        part_type = _part_type(part, provider_name)
+        part_type = _part_type(part, provider_name, video=video)
         if part_type in _TEXT_PARTS:
             units += _value_units(part.get("text"))
         elif part_type in _IMAGE_PARTS:
             images += 1
+        elif part_type in _VIDEO_PARTS:
+            continue
         else:
             # The base64 audio is priced by its duration (see
             # chat_audio_inputs), not as text. Anything else the part carries
@@ -378,6 +407,21 @@ def chat_audio_inputs(body: dict[str, Any]) -> list[Any]:
             if isinstance(part, dict) and part.get("type") in _INLINE_PARTS:
                 found.append(part.get("input_audio"))
     return found
+
+
+def chat_video_parts(body: dict[str, Any]) -> int:
+    """Number of video content parts in a chat body."""
+    count = 0
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return count
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        for part in _content_parts(message.get("content")) or ():
+            if isinstance(part, dict) and part.get("type") in _VIDEO_PARTS:
+                count += 1
+    return count
 
 
 def reject_server_tools(body: dict[str, Any], provider_name: str) -> None:
@@ -423,12 +467,12 @@ def reject_server_tools(body: dict[str, Any], provider_name: str) -> None:
         )
 
 
-def check_content_parts(body: dict[str, Any], provider_name: str) -> None:
+def check_content_parts(body: dict[str, Any], provider_name: str, *, video: bool = False) -> None:
     """Refuse content parts the estimate cannot price, as chat_input_size does.
 
     Checks the part types without weighing any text, which on a body of
     megabytes takes tens of milliseconds of event loop time per pass. Shared
-    with NanoGPT.
+    with NanoGPT, which passes no ``video`` and so refuses video parts.
     """
     messages = body.get("messages")
     if not isinstance(messages, list):
@@ -438,27 +482,30 @@ def check_content_parts(body: dict[str, Any], provider_name: str) -> None:
             continue
         for part in _content_parts(message.get("content")) or ():
             if isinstance(part, dict):
-                _part_type(part, provider_name)
+                _part_type(part, provider_name, video=video)
 
 
-def chat_input_size(body: dict[str, Any], provider_name: str) -> tuple[int, int]:
+def chat_input_size(
+    body: dict[str, Any], provider_name: str, *, video: bool = False
+) -> tuple[int, int]:
     """Return (text tokens, images) of everything a chat model reads as input.
 
     Message text and every other non-numeric field the client sends (tools,
     functions, tool_choice, prompt, response_format, tool_calls, system...)
     are counted, so the reservation cannot be dodged by moving the prompt
     out of ``messages[].content``. Only ``model`` and gateway-internal keys
-    are skipped, and the base64 data of audio parts, which is priced by its
-    duration (``chat_audio_inputs``). Unknown content part types and nesting
-    too deep to serialize raise a 400 ProviderError.
+    are skipped, the base64 data of audio parts, which is priced by its
+    duration (``chat_audio_inputs``), and video parts, which ``video``
+    allows and the caller prices at the context window. Unknown content part
+    types and nesting too deep to serialize raise a 400 ProviderError.
     """
     try:
-        return _chat_input_size(body, provider_name)
+        return _chat_input_size(body, provider_name, video)
     except RecursionError as exc:
         raise _too_deep(provider_name) from exc
 
 
-def _chat_input_size(body: dict[str, Any], provider_name: str) -> tuple[int, int]:
+def _chat_input_size(body: dict[str, Any], provider_name: str, video: bool) -> tuple[int, int]:
     units = 0
     images = 0
     messages = body.get("messages")
@@ -471,7 +518,7 @@ def _chat_input_size(body: dict[str, Any], provider_name: str) -> tuple[int, int
                 if key == "role":
                     continue
                 if key == "content":
-                    part_units, part_images = _content_size(value, provider_name)
+                    part_units, part_images = _content_size(value, provider_name, video=video)
                     units += part_units
                     images += part_images
                 else:
@@ -686,11 +733,15 @@ def _billed_audio_tokens(
     audio costs no less than the hold assumed and the text beside it bills
     at the prompt rate. Without a ceiling (the audio could not be timed
     again), the whole prompt is priced as audio, the dearer of the two
-    rates; the app never charges more than the hold.
+    rates; the app never charges more than the hold. So is the whole prompt
+    of a body with video parts: a video's sound track bills as audio, and
+    nothing times it.
     """
     reported = _reported_audio_tokens(usage)
     if reported > 0:
         return min(reported, prompt_tokens)
+    if chat_video_parts(body):
+        return prompt_tokens
     if not chat_audio_inputs(body):
         return Decimal(0)
     if audio_ceiling is None:
@@ -1232,6 +1283,24 @@ def _upstream_body(body: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in body.items() if not k.startswith("_")}
 
 
+def _context_window(model_info: dict[str, Any]) -> int | None:
+    """Largest context window a catalog entry lists, or None when it lists none.
+
+    The entry's own context_length and its top provider's may differ; the
+    larger one bounds every endpoint.
+    """
+    top = model_info.get("top_provider")
+    lengths = [model_info.get("context_length")]
+    if isinstance(top, dict):
+        lengths.append(top.get("context_length"))
+    valid = [
+        int(length)
+        for length in lengths
+        if not isinstance(length, bool) and isinstance(length, (int, float)) and length > 0
+    ]
+    return max(valid) if valid else None
+
+
 def _apply_cost_floor(cost: Decimal) -> Decimal:
     if cost < Decimal("0.000001"):
         return Decimal("0.000001")
@@ -1621,7 +1690,7 @@ class OpenRouterProvider(BaseProvider):
                     )
             reject_non_text_output(body, self.name)
             reasoning_budget(body, self.name)  # rejects a malformed budget
-            check_content_parts(body, self.name)
+            check_content_parts(body, self.name, video=True)
         return kind
 
     def _web_results(self, plugin: dict[str, Any]) -> int:
@@ -1708,7 +1777,12 @@ class OpenRouterProvider(BaseProvider):
             return _apply_cost_floor(estimated_cost)
 
         # Weighed once here; _check_request only checked the part types.
-        estimated_input_tokens, images = chat_input_size(inputs, self.name)
+        estimated_input_tokens, images = chat_input_size(inputs, self.name, video=True)
+        # A video bills an unknown number of tokens, up to the context window.
+        context_window = None
+        if chat_video_parts(inputs):
+            context_window = await self._max_context_window(candidates)
+            inputs[_PREPAID_ONLY] = _VIDEO_NEEDS_PREPAID
         # Audio parts are timed, not weighed as text: their base64 would
         # otherwise price as text tokens at the input rate, which is far
         # above the audio tokens they bill for most files but can be below
@@ -1738,8 +1812,9 @@ class OpenRouterProvider(BaseProvider):
         # The estimate is weighed to stay above the real prompt, so a prompt
         # billed at the long-context tier is priced at it. The cap above
         # keeps the listed rates, which are what OpenRouter compares.
+        prompt_tokens = estimated_input_tokens + images * _IMAGE_INPUT_TOKENS + audio_tokens
         rates = await self._max_rates(
-            kind, candidates, estimated_input_tokens + images * _IMAGE_INPUT_TOKENS + audio_tokens
+            kind, candidates, context_window if context_window is not None else prompt_tokens
         )
         web_search_cost += Decimal(_NATIVE_SEARCHES * raw_n) * rates["web_search"]
         input_price = self._input_price(rates, inputs)
@@ -1749,11 +1824,19 @@ class OpenRouterProvider(BaseProvider):
         image_cost = Decimal(images) * max(_IMAGE_INPUT_TOKENS * input_price, rates["image"])
         # Audio tokens bill at the catalog audio rate, or as input tokens.
         audio_cost = Decimal(audio_tokens) * max(rates["audio"], input_price)
+        input_cost = Decimal(estimated_input_tokens) * input_price + image_cost + audio_cost
+        if context_window is not None:
+            # Every input token fits in the window, the video's included, at
+            # the audio rate a video's sound track may bill at. A flat
+            # per-image fee comes on top of the image's tokens.
+            input_cost = max(
+                input_cost,
+                Decimal(context_window) * max(rates["audio"], input_price)
+                + Decimal(images) * rates["image"],
+            )
 
         estimated_cost = (
-            Decimal(estimated_input_tokens) * input_price
-            + image_cost
-            + audio_cost
+            input_cost
             + Decimal(max_tokens) * output_price * Decimal(raw_n)
             + web_search_cost
             + rates["request"]
@@ -1761,13 +1844,14 @@ class OpenRouterProvider(BaseProvider):
 
         logger.info(
             "OpenRouter price estimate for %s: $%s (~%d input tokens, %d images, "
-            "%d audio tokens, %d max output tokens)",
+            "%d audio tokens, %d max output tokens%s)",
             label,
             estimated_cost,
             estimated_input_tokens,
             images,
             audio_tokens,
             max_tokens,
+            f", video at a {context_window}-token window" if context_window is not None else "",
         )
         return _apply_cost_floor(estimated_cost)
 
@@ -1852,6 +1936,24 @@ class OpenRouterProvider(BaseProvider):
                 rates = _tiered_rates(rates, model_info.get("pricing", {}), input_tokens)
             per_model.append(rates)
         return {key: max(rates[key] for rates in per_model) for key in per_model[0]}
+
+    async def _max_context_window(self, model_ids: list[str]) -> int:
+        """Largest context window among the models OpenRouter may route to.
+
+        A model with no window in the catalog cannot bound a video's tokens,
+        so the request is refused.
+        """
+        windows = []
+        for model_id in model_ids:
+            model_info = await self._fetch_model_info(model_id)
+            window = _context_window(model_info)
+            if window is None:
+                raise self._error(
+                    f"Model '{model_id}' lists no context window, so x402gate cannot "
+                    "price video input for it before payment."
+                )
+            windows.append(window)
+        return max(windows)
 
     async def _measure_stt_audio(self, inputs: dict[str, Any]) -> int:
         """Billing seconds of the request audio, measured in a worker thread."""

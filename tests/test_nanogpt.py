@@ -291,8 +291,14 @@ class TestInputEstimate:
         assert price == _expected(1 + 4800)
 
     @pytest.mark.asyncio
-    async def test_rejects_unpriced_content_parts(self, provider):
-        part = {"type": "file", "file": {"file_data": "https://example.com/a.pdf"}}
+    @pytest.mark.parametrize(
+        "part",
+        [
+            {"type": "file", "file": {"file_data": "https://example.com/a.pdf"}},
+            {"type": "video_url", "video_url": {"url": "https://example.com/a.mp4"}},
+        ],
+    )
+    async def test_rejects_unpriced_content_parts(self, provider, part):
         body = _chat_body(messages=[{"role": "user", "content": [part]}])
         with pytest.raises(ProviderError) as caught:
             await provider.get_price("chat/completions", body)

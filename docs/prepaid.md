@@ -45,6 +45,8 @@ This injection does **not** apply to OpenRouter `embeddings` or duration-priced 
 
 In **prepaid mode**, OpenRouter chat gets the same `max_tokens` ceiling. The gateway reserves that estimate on the balance before calling the provider, then charges the actual cost up to the reservation and returns the rest. A failed provider call releases the whole reservation. Set `max_tokens` yourself when you want a higher ceiling; that larger value is what gets reserved.
 
+OpenRouter chat with a video part (`video_url`) is accepted in prepaid mode only. Its length is unknown before the call, so the reservation is the model's whole context window at the higher of its audio and input rates, plus the output ceiling: about $0.15 for a model with a 1M-token window at $0.15 per million tokens. Keep that much free on the balance for each video request in flight. After the response only the actual cost is charged (usually a fraction of a cent for a short clip) and the rest goes back. If the outcome is unknown, the whole reservation is charged (see below). An x402 payment for a video request gets HTTP 400.
+
 ## Endpoints
 
 ### `POST /v1/topup`

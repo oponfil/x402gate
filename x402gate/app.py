@@ -113,12 +113,18 @@ _MAX_JSON_CONTAINERS = 200_000
 # and prints a long integer in quadratic time, so a body of them cost seconds
 # of unpaid CPU, parsed and again re-encoded for pricing. 2**128 has 39 digits.
 _MAX_JSON_INT_CHARS = 40
+# Set by get_price, with the reason, on a request only a prepaid balance may
+# pay for (OpenRouter video, held at the whole context window).
+_PREPAID_ONLY = "_prepaid_only"
 # Keys the gateway adds to the body itself; a client must not supply them.
-_INTERNAL_BODY_KEYS = frozenset({"_caller", "_file_bytes", "_file_name", "_priced_rates"})
-# Keys get_price leaves in the body for submit (OpenRouter and NanoGPT cap
-# steered routing at the rates they priced). The price cache keeps them with
-# the price, so a cached price puts them back.
-_PRICED_BODY_KEYS = ("_priced_rates",)
+_INTERNAL_BODY_KEYS = frozenset(
+    {"_caller", "_file_bytes", "_file_name", "_priced_rates", _PREPAID_ONLY}
+)
+# Keys get_price leaves in the body: for submit (OpenRouter and NanoGPT cap
+# steered routing at the rates they priced), and _PREPAID_ONLY for the
+# payment step. The price cache keeps them with the price, so a cached price
+# puts them back.
+_PRICED_BODY_KEYS = ("_priced_rates", _PREPAID_ONLY)
 # A 429 from pricing (all audio parse slots busy) clears in moments.
 _PRICING_RETRY_AFTER_S = "2"
 # A body above this is hashed for the price cache in a worker thread. sha256
@@ -1555,6 +1561,12 @@ async def _managed_flow(
     upfront_settlement: dict[str, Any] | None = None
     payment_id = ""
     prepaid_reserved: Decimal | None = None
+
+    prepaid_only = body.get(_PREPAID_ONLY)
+    if prepaid_only and (payment_sig or not prepaid_pubkey):
+        # Checked before an x402 payment is verified or claimed, so a refused
+        # one is never settled.
+        return _error_response(400, prepaid_only, provider=provider.name)
 
     if payment_sig:
         # 5a. Standard x402 payment flow
