@@ -23,7 +23,7 @@ from solders.keypair import Keypair
 
 import x402gate.app as gateway
 from tests.helpers import make_wav_b64
-from x402gate.app import _pending_settlements, app, providers
+from x402gate.app import app, providers
 from x402gate.core.config import load_config as real_load
 from x402gate.core.payment import payment_key
 from x402gate.core.prepaid import deposit, get_balance, reset
@@ -935,17 +935,22 @@ class TestSolanaUpfrontSettlement:
         assert response.json()["data"]["outputs"][0].endswith("clip.mp4")
 
 
-class TestBaseParallelSettlement:
-    """Base settles while the provider runs, and the result waits for it."""
+class TestBaseUpfrontSettlement:
+    """Base payments settle before the provider runs, like Solana."""
 
     @respx.mock
-    def test_settles_once_and_returns_result(self, client):
-        """Settle starts with the provider call; a settled job returns 200."""
+    def test_settles_once_before_provider(self, client):
+        """Settle is awaited once, and that happens before WaveSpeed is called."""
         reset()
         _price_ok()
-        respx.post(WAVESPEED_SUBMIT).mock(
-            return_value=httpx.Response(200, json={"outputs": ["ok"]})
-        )
+        seen: dict[str, int] = {}
+
+        def on_submit(request):
+            seen["settle_before_submit"] = mock_ph.settle.await_count
+            seen["in_flight"] = _in_flight()
+            return httpx.Response(200, json={"outputs": ["ok"]})
+
+        respx.post(WAVESPEED_SUBMIT).mock(side_effect=on_submit)
 
         with patch("x402gate.app.payment_handler") as mock_ph:
             _paid_handler(mock_ph, EVM_NETWORK, "0xPayer")
@@ -954,17 +959,20 @@ class TestBaseParallelSettlement:
 
         assert response.status_code == 200
         assert response.json()["data"] == {"outputs": ["ok"]}
+        assert seen["settle_before_submit"] == 1
+        # The settled amount no longer counts against the wallet.
+        assert seen["in_flight"] == 0
         assert mock_ph.settle.await_count == 1
         expected = apply_commission(Decimal("0.003"), 0.04, 0.001)
         assert mock_ph.settle.await_args.args[1] == expected
         assert mock_ph.settle.await_args.args[2] == EVM_NETWORK
 
     @respx.mock
-    def test_failed_settle_withholds_result(self, client):
-        """A payer who moved the USDC during the job gets a 402, not the result."""
+    def test_failed_settle_does_not_call_provider(self, client):
+        """A payer who moved the USDC gets a 402 and the provider is not called."""
         reset()
         _price_ok()
-        respx.post(WAVESPEED_SUBMIT).mock(
+        submit = respx.post(WAVESPEED_SUBMIT).mock(
             return_value=httpx.Response(200, json={"outputs": ["secret"]})
         )
 
@@ -976,9 +984,36 @@ class TestBaseParallelSettlement:
             response = _post_wavespeed(client)
 
         assert response.status_code == 402
-        assert "insufficient_funds" in response.json()["error"]
-        assert "secret" not in response.text
-        assert "data" not in response.json()
+        assert response.json()["error"] == "Payment settlement failed: insufficient_funds"
+        assert not submit.called
+        assert get_balance("0xpayer") == 0
+        assert _in_flight() == 0
+        assert gateway._pending_reconciles == set()
+
+    @respx.mock
+    def test_crashed_settle_does_not_call_provider_and_holds_the_payment(self, client):
+        """settle returned None, maybe after sending: a 402, the claim and amount stay held."""
+        reset()
+        _price_ok()
+        submit = respx.post(WAVESPEED_SUBMIT).mock(
+            return_value=httpx.Response(200, json={"outputs": ["secret"]})
+        )
+        price = apply_commission(Decimal("0.003"), 0.04, 0.001)
+
+        with patch("x402gate.app.payment_handler") as mock_ph:
+            _paid_handler(mock_ph, EVM_NETWORK, "0xPayer")
+            mock_ph.settle = AsyncMock(return_value=None)
+            response = _post_wavespeed(client)
+            replay = _post_wavespeed(client)
+
+        assert response.status_code == 402
+        assert response.json()["error"] == "Payment settlement failed: unknown"
+        assert not submit.called
+        assert replay.status_code == 409
+        assert mock_ph.settle.await_count == 1
+        # Nothing to look up, so the amount stays counted until the authorization expires.
+        assert _in_flight() == price
+        assert len(gateway._pending_reconciles) == 1
 
     @respx.mock
     def test_provider_error_after_settle_refunds_prepaid(self, client):
@@ -994,26 +1029,11 @@ class TestBaseParallelSettlement:
 
         expected = apply_commission(Decimal("0.003"), 0.04, 0.001)
         assert response.status_code == 502
-        assert response.json()["refunded_to_prepaid"] == str(expected)
+        body = response.json()
+        assert body["refunded_to_prepaid"] == str(expected)
+        assert Decimal(body["prepaid_balance"]) == expected
+        assert "settlement_pending" not in body
         assert get_balance("0xpayer") == expected
-
-    @respx.mock
-    def test_provider_error_with_failed_settle_refunds_nothing(self, client):
-        """No settlement, no refund: the payer kept the USDC."""
-        reset()
-        _price_ok()
-        respx.post(WAVESPEED_SUBMIT).mock(return_value=httpx.Response(400, text="bad prompt"))
-
-        with patch("x402gate.app.payment_handler") as mock_ph:
-            _paid_handler(mock_ph, EVM_NETWORK, "0xPayer")
-            mock_ph.settle = AsyncMock(
-                return_value={"success": False, "error_reason": "invalid_signature"}
-            )
-            response = _post_wavespeed(client)
-
-        assert response.status_code == 502
-        assert "refunded_to_prepaid" not in response.json()
-        assert get_balance("0xPayer") == 0
 
     @respx.mock
     def test_payment_in_use_is_rejected(self, client):
@@ -1033,6 +1053,60 @@ class TestBaseParallelSettlement:
         assert response.status_code == 409
         assert not submit.called
         assert mock_ph.settle.await_count == 0
+
+    @respx.mock
+    def test_slow_settle_is_covered_by_heartbeats(self, client):
+        """The heartbeat clock starts at the settle, not at the provider call."""
+        reset()
+        _price_ok()
+        respx.post(WAVESPEED_SUBMIT).mock(
+            return_value=httpx.Response(200, json={"outputs": ["ok"]})
+        )
+
+        async def slow_settle(*args, **kwargs):
+            await asyncio.sleep(0.15)
+            return _settled_ok("ETH")
+
+        with (
+            patch("x402gate.app.payment_handler") as mock_ph,
+            patch("x402gate.app._HEARTBEAT_INTERVAL_S", 0.04),
+        ):
+            _paid_handler(mock_ph, EVM_NETWORK, "0xPayer")
+            mock_ph.settle = AsyncMock(side_effect=slow_settle)
+            response = _post_wavespeed(client)
+
+        assert response.status_code == 200
+        assert response.content.startswith(b"\n")
+        assert response.json()["data"] == {"outputs": ["ok"]}
+
+    @respx.mock
+    def test_slow_failed_settle_reports_the_402_in_the_body(self, client):
+        """After the first pad the status is 200; the settle failure is in the body."""
+        reset()
+        _price_ok()
+        submit = respx.post(WAVESPEED_SUBMIT).mock(
+            return_value=httpx.Response(200, json={"outputs": ["secret"]})
+        )
+
+        async def slow_failed_settle(*args, **kwargs):
+            await asyncio.sleep(0.15)
+            return {"success": False, "error_reason": "insufficient_funds"}
+
+        with (
+            patch("x402gate.app.payment_handler") as mock_ph,
+            patch("x402gate.app._HEARTBEAT_INTERVAL_S", 0.04),
+        ):
+            _paid_handler(mock_ph, EVM_NETWORK, "0xPayer")
+            mock_ph.settle = AsyncMock(side_effect=slow_failed_settle)
+            response = _post_wavespeed(client)
+
+        assert response.status_code == 200
+        assert response.content.startswith(b"\n")
+        payload = response.json()
+        assert payload["status"] == 402
+        assert payload["error"] == "Payment settlement failed: insufficient_funds"
+        assert not submit.called
+        assert _in_flight() == 0
 
     @respx.mock
     def test_settled_payment_cannot_be_replayed_at_once(self, client):
@@ -1100,47 +1174,29 @@ class TestBaseSettlementEdgeCases:
     """Pending settlements and many payments drawing on one balance."""
 
     @respx.mock
-    def test_pending_settlement_still_returns_result(self, client):
-        """A broadcast whose confirmation wait failed most likely lands."""
+    def test_pending_settlement_runs_the_job_and_follows_the_receipt(self, client):
+        """A broadcast whose confirmation wait failed most likely lands: the job runs."""
         reset()
         _price_ok()
-        respx.post(WAVESPEED_SUBMIT).mock(
+        submit = respx.post(WAVESPEED_SUBMIT).mock(
             return_value=httpx.Response(200, json={"outputs": ["ok"]})
         )
+        price = apply_commission(Decimal("0.003"), 0.04, 0.001)
 
         with patch("x402gate.app.payment_handler") as mock_ph:
             _paid_handler(mock_ph, EVM_NETWORK, "0xPayer")
-            mock_ph.settle = AsyncMock(
-                return_value={
-                    "success": False,
-                    "pending": True,
-                    "error_reason": "settlement_pending",
-                }
-            )
+            mock_ph.settlement_receipt = AsyncMock(return_value=None)
+            mock_ph.settle = AsyncMock(return_value=_pending_settle())
             response = _post_wavespeed(client)
             replay = _post_wavespeed(client)
 
         assert response.status_code == 200
+        assert response.json()["data"] == {"outputs": ["ok"]}
+        assert submit.call_count == 1
         assert replay.status_code == 409
-
-    @respx.mock
-    def test_crashed_settle_withholds_result_and_keeps_claim(self, client):
-        """A settle that crashed (None) withholds the result but holds the payment."""
-        reset()
-        _price_ok()
-        respx.post(WAVESPEED_SUBMIT).mock(
-            return_value=httpx.Response(200, json={"outputs": ["secret"]})
-        )
-
-        with patch("x402gate.app.payment_handler") as mock_ph:
-            _paid_handler(mock_ph, EVM_NETWORK, "0xPayer")
-            mock_ph.settle = AsyncMock(return_value=None)
-            response = _post_wavespeed(client)
-            replay = _post_wavespeed(client)
-
-        assert response.status_code == 402
-        assert "secret" not in response.text
-        assert replay.status_code == 409
+        # The reconcile keeps the amount counted until the receipt resolves.
+        assert len(gateway._pending_reconciles) == 1
+        assert _in_flight() == price
 
     @respx.mock
     def test_pending_settlement_on_provider_failure_credits_nothing(self, client):
@@ -1151,13 +1207,16 @@ class TestBaseSettlementEdgeCases:
 
         with patch("x402gate.app.payment_handler") as mock_ph:
             _paid_handler(mock_ph, EVM_NETWORK, "0xPayer")
+            mock_ph.settlement_receipt = AsyncMock(return_value=None)
             mock_ph.settle = AsyncMock(
                 return_value={"success": False, "pending": True, "error_reason": "x"}
             )
             response = _post_wavespeed(client)
 
         assert response.status_code == 502
-        assert "refunded_to_prepaid" not in response.json()
+        body = response.json()
+        for field in ("refunded_to_prepaid", "settlement_pending", "pending_refund"):
+            assert field not in body
         assert get_balance("0xPayer") == 0
 
     @respx.mock
@@ -1185,13 +1244,19 @@ class TestBaseSettlementEdgeCases:
         assert "still settling" in response.json()["error"]
         assert mock_ph.check_evm_balance.await_args.args[2] == price * 2
         assert not submit.called
+        assert mock_ph.settle.await_count == 0
         # The rejected request takes back its own promise only.
         gateway.base_in_flight.remove("0xpayer", price)
         assert gateway.base_in_flight.add("0xpayer", Decimal("0")) == 0
 
+    @pytest.mark.parametrize(
+        "settled",
+        [_settled_ok("ETH"), {"success": False, "error_reason": "insufficient_funds"}],
+        ids=["ok", "failed"],
+    )
     @respx.mock
-    def test_in_flight_amount_is_released_after_settle(self, client):
-        """Once a settle finishes, the wallet's promise is gone."""
+    def test_in_flight_amount_is_released_after_settle(self, client, settled):
+        """Once a settle ends with a known outcome, the wallet's promise is gone."""
         reset()
         _price_ok()
         respx.post(WAVESPEED_SUBMIT).mock(
@@ -1200,11 +1265,11 @@ class TestBaseSettlementEdgeCases:
 
         with patch("x402gate.app.payment_handler") as mock_ph:
             _paid_handler(mock_ph, EVM_NETWORK, "0xPayer")
-            mock_ph.settle = AsyncMock(return_value=_settled_ok("ETH"))
-            response = _post_wavespeed(client)
+            mock_ph.settle = AsyncMock(return_value=settled)
+            _post_wavespeed(client)
 
-        assert response.status_code == 200
         assert gateway.base_in_flight.add("0xpayer", Decimal("0")) == 0
+        assert gateway._pending_reconciles == set()
 
     @respx.mock
     def test_solana_pending_settlement_runs_the_job(self, client):
@@ -1224,6 +1289,7 @@ class TestBaseSettlementEdgeCases:
 
         assert response.status_code == 200
         assert submit.called
+        assert gateway._pending_reconciles == set()
 
 
 class TestRequestLimits:
@@ -1667,15 +1733,11 @@ class TestPrepaidReservation:
 
 
 def _drain(client) -> None:
-    """Wait for settlements and jobs the gateway finishes in the background."""
+    """Wait for jobs the gateway finishes in the background."""
 
     async def _wait() -> None:
         for _ in range(20):
-            pending = [
-                task
-                for task in (*_pending_settlements, *getattr(gateway, "_pending_jobs", ()))
-                if not task.done()
-            ]
+            pending = [task for task in gateway._pending_jobs if not task.done()]
             if not pending:
                 return
             await asyncio.wait(pending, timeout=1)
@@ -1683,8 +1745,13 @@ def _drain(client) -> None:
     client.portal.call(_wait)
 
 
-def _post_and_leave(client, path: str, headers: dict[str, str]) -> list[dict]:
-    """POST a WaveSpeed job over raw ASGI and disconnect after the first heartbeat."""
+def _post_and_leave(
+    client, path: str, headers: dict[str, str], *, at_once: bool = False
+) -> list[dict]:
+    """POST a WaveSpeed job over raw ASGI and disconnect after the first heartbeat.
+
+    With ``at_once`` the client is gone as soon as the body is sent.
+    """
 
     async def _run() -> list[dict]:
         raw = json.dumps({"prompt": "a cat"}).encode()
@@ -1708,6 +1775,8 @@ def _post_and_leave(client, path: str, headers: dict[str, str]) -> list[dict]:
             "state": {},
         }
         left = asyncio.Event()
+        if at_once:
+            left.set()
         request_sent = False
         messages: list[dict] = []
 
@@ -1913,6 +1982,84 @@ class TestClientDisconnect:
             _drain(client)
 
         assert mock_ph.settle.await_count == 1
+
+    @respx.mock
+    def test_base_client_that_leaves_during_settle_still_gets_the_job_run(self, client):
+        """Leaving does not stop the settle, and the job runs once it settles."""
+        reset()
+        _price_ok()
+        seen: dict[str, int] = {}
+
+        def on_submit(request):
+            seen["settle_before_submit"] = mock_ph.settle.await_count
+            return httpx.Response(200, json={"outputs": ["ok"]})
+
+        respx.post(WAVESPEED_SUBMIT).mock(side_effect=on_submit)
+
+        async def slow_settle(*args, **kwargs):
+            await asyncio.sleep(0.05)
+            return _settled_ok("ETH")
+
+        with patch("x402gate.app.payment_handler") as mock_ph:
+            _paid_handler(mock_ph, EVM_NETWORK, "0xPayer")
+            mock_ph.settle = AsyncMock(side_effect=slow_settle)
+            _post_and_leave(
+                client,
+                "/v1/wavespeed/wavespeed-ai/flux-dev",
+                {"Payment-Signature": "fake-sig"},
+                at_once=True,
+            )
+            _drain(client)
+
+        assert seen["settle_before_submit"] == 1
+        assert _in_flight() == 0
+
+    @respx.mock
+    def test_base_settle_stopped_midway_holds_the_payment(self, client):
+        """A cancelled request leaves the settle running; a settle stopped midway holds all."""
+        reset()
+        _price_ok()
+        submit = respx.post(WAVESPEED_SUBMIT).mock(
+            return_value=httpx.Response(200, json={"outputs": ["ok"]})
+        )
+        price = apply_commission(Decimal("0.003"), 0.04, 0.001)
+
+        async def _cancel_mid_settle() -> None:
+            settling = asyncio.Event()
+
+            async def slow_settle(*args, **kwargs):
+                settling.set()
+                await asyncio.sleep(30)
+
+            mock_ph.settle = AsyncMock(side_effect=slow_settle)
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+                request = asyncio.create_task(
+                    http.post(
+                        "/v1/wavespeed/wavespeed-ai/flux-dev",
+                        json={"prompt": "a cat"},
+                        headers={"Payment-Signature": "fake-sig"},
+                    )
+                )
+                await settling.wait()
+                request.cancel()
+                await asyncio.gather(request, return_exceptions=True)
+                # The settle runs in the job task, which the request does not own.
+                jobs = [task for task in gateway._pending_jobs if not task.done()]
+                assert len(jobs) == 1
+                # Stopped midway (a crash or a cancel), it may have broadcast.
+                jobs[0].cancel()
+                await asyncio.gather(*jobs, return_exceptions=True)
+
+        with patch("x402gate.app.payment_handler") as mock_ph:
+            _paid_handler(mock_ph, EVM_NETWORK, "0xPayer")
+            client.portal.call(_cancel_mid_settle)
+
+        assert not submit.called
+        # "fake-sig" carries no validBefore, so the configured max_timeout applies.
+        assert _held_for("fake-sig") > 3600
+        assert _in_flight() == price
+        assert len(gateway._pending_reconciles) == 1
 
     @respx.mock
     def test_solana_failure_after_leaving_is_credited(self, client):
@@ -2617,6 +2764,7 @@ class TestUnknownBaseSettlement:
             return _receipt_settlement(tx_hash, landed=True) if landed.is_set() else None
 
         with self._unknown_job(client, receipt) as job:
+            assert _in_flight() == price
             landed.set()
         response = job.response
 
@@ -2685,6 +2833,7 @@ class TestUnknownBaseSettlement:
         assert lookup.await_count >= 1
         assert get_balance("0xpayer") == 0
         assert gateway.stats._stats.total_refund_credit_usd == 0
+        assert gateway.stats.get_stats()["providers"]["wavespeed"]["revenue_usd"] == "0.0000"
         assert _in_flight() == 0
 
     def _fail_after_reconcile(self, lookups: list[str]):

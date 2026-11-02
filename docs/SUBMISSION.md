@@ -37,7 +37,7 @@ AI agents need to pay for services. Today that means:
 
 ### Key Design Principles
 
-- **Refund on known failure.** The payment settles on-chain with the request: on Base in parallel with the provider call (the result is returned only once it lands), on Solana just before it. If the provider reports a failure, the full settled amount is credited to the agent's prepaid balance on the gateway (in memory, not sent back on-chain) for its next requests; on Base, if the settlement is still unconfirmed, the refund is credited once the transfer confirms. If the outcome is unknown (a timeout or dropped connection after the request was sent), the payment is kept, because the provider may have run and billed the job.
+- **Refund on known failure.** The payment settles on-chain before the provider is called, on Base and Solana; a failed settlement gets HTTP 402 and the provider is not called. If the provider reports a failure, the full settled amount is credited to the agent's prepaid balance on the gateway (in memory, not sent back on-chain) for its next requests; on Base, if the settlement is still unconfirmed, the refund is credited once the transfer confirms. If the outcome is unknown (a timeout or dropped connection after the request was sent), the payment is kept, because the provider may have run and billed the job.
 - **Transparent pricing.** 4% commission + $0.001 gas surcharge. All costs visible in the 402 response.
 - **Multi-network.** Both Base (EVM) and Solana are supported simultaneously.
 - **Prepaid mode.** For high-frequency agents: top-up once, skip per-request blockchain transactions.
@@ -84,14 +84,13 @@ Agent                      x402gate                   AI Provider
   │                          │                          │
   ├─ POST + PAYMENT-SIGNATURE►                          │
   │                          ├─ verify on-chain          │
+  │                          ├─ settle on-chain          │
   │                          ├─ forward request ────────►│
-  │                          ├─ settle on-chain (Base)   │
   │                          │◄─ result ────────────────┤
-  │                          ├─ wait for settlement      │
   │◄─── 200 + result ───────┤                          │
 ```
 
-On Solana the settle step runs right after verify, before the request is forwarded, because the signed transaction expires in about a minute.
+On both networks the settle step runs right after verify, before the request is forwarded.
 
 ## On-Chain Artifacts
 

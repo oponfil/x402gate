@@ -32,21 +32,20 @@ Client                    x402gate                  WaveSpeed AI
   │                          │                          │
   ├─ POST + PAYMENT-SIGNATURE►                          │
   │                          ├─ verify (on-chain)        │
+  │                          ├─ settle (on-chain)        │
   │                          ├─ forward request ────────►│
-  │                          ├─ settle (on-chain, Base)  │
   │                          │◄─ result ────────────────┤
-  │                          ├─ wait for settlement      │
   │◄─── 200 + result ───────┤                          │
 ```
 
-On Solana the settle step runs right after verify, before the request is forwarded. A price quote that gets a 5xx is retried; a submit that reached the provider is never sent twice (see **Retries** below). Only CloudConvert takes multipart uploads: any other managed provider answers a multipart body with HTTP 400 before payment, without reading it. WaveSpeed's `enable_sync_mode` is dropped: the gateway always polls. A JSON body (or `/v1/topup` body) with an integer longer than 40 characters gets HTTP 400 `Invalid JSON body` before pricing.
+On both networks the settle step runs right after verify, before the request is forwarded. A price quote that gets a 5xx is retried; a submit that reached the provider is never sent twice (see **Retries** below). Only CloudConvert takes multipart uploads: any other managed provider answers a multipart body with HTTP 400 before payment, without reading it. WaveSpeed's `enable_sync_mode` is dropped: the gateway always polls. A JSON body (or `/v1/topup` body) with an integer longer than 40 characters gets HTTP 400 `Invalid JSON body` before pricing.
 
 1. Client sends a request → gateway fetches the price from the provider
 2. Gateway responds with **HTTP 402** and payment options for all configured networks
 3. Client picks a network (Base or Solana), signs the payment, retries with `PAYMENT-SIGNATURE` header
-4. Gateway verifies the payment, then forwards the request and returns the result. On Base it settles while the provider runs and returns the result only once the payment has landed. On Solana it settles first, because the signed transaction expires in about a minute.
+4. Gateway verifies and settles the payment, then forwards the request and returns the result. If the settlement fails, the response is HTTP 402 and the provider is not called.
 
-On both networks the payment is settled by the time the provider answers, so a task the provider reports as failed credits that amount to the payer's prepaid balance. One payment buys one request: a payment that another request or a top-up is still using gets HTTP 409. When the outcome is unknown (the task timed out, or the connection to the provider dropped after the request was sent), the payment is kept on both networks, because the provider may have run and billed the job. See [Error Handling](#error-handling).
+On both networks the payment is settled before the provider is called, so a task the provider reports as failed credits that amount to the payer's prepaid balance. One payment buys one request: a payment that another request or a top-up is still using gets HTTP 409. When the outcome is unknown (the task timed out, or the connection to the provider dropped after the request was sent), the payment is kept on both networks, because the provider may have run and billed the job. See [Error Handling](#error-handling).
 
 ### Chat (OpenRouter, NanoGPT)
 
@@ -118,7 +117,7 @@ After each settled payment, the gateway logs a one-line summary:
 TX wavespeed settled: $0.0062 -> cost=$0.005 gas=$0.000855 SOL profit=$0.000345 (0.0s -> 0.0s)
 ```
 
-Settlement runs before the provider call (Solana) or alongside it (Base), so `cost` and `profit` in this line are the pre-payment estimate. The actual cost, computed from real usage after the response, goes to the dashboard's revenue and profit figures:
+Settlement runs before the provider call, so `cost` and `profit` in this line are the pre-payment estimate. The actual cost, computed from real usage after the response, goes to the dashboard's revenue and profit figures:
 
 - **cost** (log line) — the estimate the client paid for
 - **Actual cost** (dashboard) — from the provider's reported usage (`usage.cost` or token counts)
@@ -154,9 +153,9 @@ An OpenRouter or NanoGPT 2xx that carries only an `error` object, with no usage 
 
 **Pricing errors** come before any payment, so nothing is charged. A 429 (for example, all audio parse slots busy) carries `Retry-After: 2`, and a request the gateway itself fails to price gets 400 `Could not price this request`.
 
-**Long calls:** any managed call, synchronous (chat, TTS, STT) or polled, that runs longer than 20 seconds is kept open with newline heartbeats. The status is then already 200 and the `X-Timing` and `X-Prepaid-*` headers are absent; a failure arrives as the usual error JSON in the body, with `status`, `outcome_unknown` and, in prepaid mode, `prepaid`. Read the body, not only the status.
+**Long calls:** any managed call, synchronous (chat, TTS, STT) or polled, that runs longer than 20 seconds, settlement included, is kept open with newline heartbeats. The status is then already 200 and the `X-Timing` and `X-Prepaid-*` headers are absent; a failure arrives as the usual error JSON in the body, with `status`, `outcome_unknown` and, in prepaid mode, `prepaid`. A settlement that fails after the heartbeats started arrives the same way, with `status: 402`. Read the body, not only the status.
 
-**Client disconnects:** a long job keeps running if the client closes the connection. It is charged or refunded by the same rules, as if the client had stayed, but the result cannot be delivered.
+**Client disconnects:** a long job keeps running if the client closes the connection, even during settlement. It is charged or refunded by the same rules, as if the client had stayed, but the result cannot be delivered.
 
 **Payment rejection reasons:** When payment verification fails (e.g. insufficient USDC, stale transaction, network mismatch), the 402 response includes the specific reason:
 
@@ -169,12 +168,12 @@ An OpenRouter or NanoGPT 2xx that carries only an `error` object, with no usage 
 
 On Base only EIP-3009 authorizations are accepted; a Permit2 payload gets 402 `Payment verification failed: unsupported_payload: Permit2 is not accepted`.
 
-**Base payment still pending:** if the provider reports a failure while a Base settlement is still unconfirmed, the error carries `settlement_pending: true`, `pending_refund` (the full price) and `transaction`, and the refund is credited to prepaid once the transaction's receipt shows the transfer (or at once, as `refunded_to_prepaid`, if it landed during the job). These three fields appear only while the gateway is still following the receipt: if the transfer already reverted or its authorization expired during the job, nothing was charged and the error carries none of them. A revert, an expiry or a gateway restart after the error credits nothing. Check `GET /v1/balance/{address}` later.
+**Base payment still pending:** a Base settlement that was sent but not confirmed in time still runs the job. If the provider then reports a failure, the error carries `settlement_pending: true`, `pending_refund` (the full price) and `transaction`, and the refund is credited to prepaid once the transaction's receipt shows the transfer (or at once, as `refunded_to_prepaid`, if it landed during the job). These three fields appear only while the gateway is still following the receipt: if the transfer already reverted or its authorization expired during the job, nothing was charged and the error carries none of them. A revert, an expiry or a gateway restart after the error credits nothing. Check `GET /v1/balance/{address}` later.
 
 **Retries:** a request that starts a job is never sent twice once it reached the provider, because the first one may already be running and billing. It is retried only when the connection never opened. The exception is SpicyAPI job creation: it carries an Idempotency-Key, so after a server error or a timeout it is retried up to **2 times** with that same key, and SpicyAPI does not start a second job. A WaveSpeed or SpicyAPI price quote starts nothing, so it is also retried on a server error (502, 503, etc.), up to **2 times** with exponential backoff (2s → 4s). A WaveSpeed, SpicyAPI, OpenRouter, NanoGPT, ElevenLabs, MiniMax, Fish Audio or SocialDownload submit answered with 504, 520 or 524 (a gateway timeout in front of the provider) has an unknown outcome; the payment is kept and the client gets 504. For CloudConvert, any failure while creating the job (a 5xx, a timeout or a dropped connection) or before the whole file was uploaded is a known failure and is refunded; after the whole file was sent, a lost answer or a 504, 520 or 524 from the upload host keeps the payment (504). While a job is polled, rate limits (429) and server errors are waited out until the provider's `poll_timeout` (wall-clock time, with one last poll at the deadline); WaveSpeed and SpicyAPI also wait out a briefly missing task (404) and back off up to 30s between polls. Client errors (4xx) are never retried. An upstream 401, 402 or 403 reaches the client as 502 with a fixed message, without the upstream body (a SpicyAPI balance error as 503), so it is not mistaken for an x402 payment request. A 3xx at submit is refunded as 502.
 
 
-> **Note:** On Base, USDC moves while the provider runs, and the result is returned only if that settlement succeeded; otherwise the response is 402. On Solana, USDC moves before the provider is called. The gateway rebroadcasts that same signed transaction until it lands. If the blockhash expires first, or the transaction lands with an error, the response is 402 and the client is not charged. If the provider then reports a failure, the error JSON includes `refunded_to_prepaid` and `prepaid_balance` — the full settled amount, credited in memory, not sent back on-chain.
+> **Note:** On both networks USDC moves before the provider is called; if that settlement fails, the response is 402 and the client is not charged. On Solana the gateway rebroadcasts the same signed transaction until it lands. If the blockhash expires first, or the transaction lands with an error, the response is 402 and the client is not charged. If the provider then reports a failure, the error JSON includes `refunded_to_prepaid` and `prepaid_balance` — the full settled amount, credited in memory, not sent back on-chain.
 
 ### Prepaid Mode
 

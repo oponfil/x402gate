@@ -168,10 +168,9 @@
 # Sign payment, then retry with PAYMENT-SIGNATURE header</code></pre>
     {% endif %}
     {% endfor %}
-    <div class="note">On Base your payment settles while the provider runs, and the result is returned only
-        once it lands; if that settlement fails you get HTTP 402 and are not charged. On Solana it settles
-        before the provider is called. If the provider reports a failure, the settled amount is credited to
-        your prepaid balance (in memory, not sent back on-chain); on Base, if your payment is still unconfirmed,
+    <div class="note">Your payment settles before the provider is called, on Base and Solana; if that
+        settlement fails you get HTTP 402 and are not charged. If the provider reports a failure, the
+        settled amount is credited to your prepaid balance (in memory, not sent back on-chain); on Base, if your payment is still unconfirmed,
         once it confirms. If the outcome is unknown (a timeout or a
         dropped connection after the request was sent), the payment is kept. Use a new payment for every
         request.</div>

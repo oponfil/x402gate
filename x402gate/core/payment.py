@@ -324,9 +324,12 @@ class InFlightAmounts:
     """USDC that each Base payer has promised to requests still settling.
 
     Each authorization has its own nonce, so the payment claim cannot see
-    two of them drawing on one balance. Without this, a wallet holding the
-    price of one job could start many paid provider calls at once; only
-    one settlement would land.
+    two of them drawing on one balance. Without this, parallel
+    authorizations over one balance would each be broadcast, and all but
+    one would revert at the gateway's gas cost. An unknown settlement
+    keeps its amount here until its receipt resolves: its job runs before
+    the transfer lands, and a newer nonce spending the same USDC could
+    make it revert.
     """
 
     def __init__(self) -> None:

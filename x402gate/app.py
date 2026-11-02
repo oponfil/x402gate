@@ -271,9 +271,8 @@ def _record_onchain_settlement(
 async def _refund_settled_payment(payer: str, amount: Decimal) -> dict[str, str]:
     """Credit a settled x402 payment back to the payer's prepaid balance.
 
-    Used when the provider fails after the payment settled: Solana settles
-    before the provider call, Base settles while it runs. The balance is
-    in-memory and is lost on restart.
+    Used when the provider fails after the payment settled, which happens
+    before the provider call. The balance is in-memory and is lost on restart.
     """
     new_balance = await deposit(payer, amount)
     stats.record_refund_credit(amount)
@@ -336,7 +335,6 @@ config: AppConfig
 providers: dict[str, BaseProvider | None] = {}  # None = passthrough (no provider object)
 payment_handler: PaymentHandler
 price_cache: PriceCache
-_pending_settlements: set[asyncio.Task] = set()
 _pending_jobs: set[asyncio.Task] = set()
 # Followers of Base settlements whose outcome was unknown (_reconcile_base).
 _pending_reconciles: set[asyncio.Task] = set()
@@ -742,13 +740,11 @@ async def lifespan(app: FastAPI):
     for task in warm_ups:
         task.cancel()
     await asyncio.gather(*warm_ups, return_exceptions=True)
-    # Shutdown: finish provider jobs (they may start settlements), then settle
+    # Shutdown: finish provider jobs, which settle, then refund or record
+    # their payments
     if _pending_jobs:
         logger.info("Waiting for %d provider job(s)...", len(_pending_jobs))
         await asyncio.gather(*_pending_jobs, return_exceptions=True)
-    if _pending_settlements:
-        logger.info("Waiting for %d pending settlement(s)...", len(_pending_settlements))
-        await asyncio.gather(*_pending_settlements, return_exceptions=True)
     # Unknown Base settlements can take until validBefore, up to hours. What
     # they would credit lives in memory and dies with the process, so they
     # stop here. Each looks its receipt up once more (at most
@@ -1389,15 +1385,15 @@ async def _managed_flow(
     3. Apply commission (4% + gas fee)
     4. If no PAYMENT-SIGNATURE header → return 402
     5. Verify payment via facilitator
-    5b. Solana: settle immediately. The signed transaction's blockhash expires
-        in about a minute, before a long job finishes. A failed settle does
-        not call the provider. If the provider fails afterwards, the amount
-        is credited to the payer's prepaid balance.
-    6. Forward request to provider as-is. Base: settle at the same time.
+    5c. Settle before the provider call, inside the job task so heartbeats
+        cover it. A failed settle does not call the provider. If the
+        provider fails afterwards, a settled amount is credited to the
+        payer's prepaid balance; an unknown Base one once it lands.
+    6. Forward request to provider as-is
     7. If async (task_id present) → poll for result; else use response directly
-    8. Base: return the result only if the settlement succeeded. If the
-        provider failed, a settled amount is credited to prepaid.
-    9. Return result to client
+    8. Calculate the actual cost
+    9. Record revenue for the settled payment
+    10. Return result to client
     """
     provider = providers.get(provider_name)
     if provider is None:
@@ -1557,7 +1553,6 @@ async def _managed_flow(
     payment_network = ""
     payer = ""
     upfront_settlement: dict[str, Any] | None = None
-    base_settle: asyncio.Task[dict[str, Any] | None] | None = None
     payment_id = ""
     prepaid_reserved: Decimal | None = None
 
@@ -1584,8 +1579,9 @@ async def _managed_flow(
                 "This payment is already used by another request. Sign a new payment.",
             )
         # The balance must also cover this payer's other Base requests that
-        # have not settled yet, each signed with its own nonce. The check runs
-        # on-chain because the provider is paid before the settlement lands.
+        # have not settled yet, each signed with its own nonce. Without it,
+        # parallel authorizations over one balance each cost us a reverted
+        # transaction.
         if payment_network.startswith("eip155:"):
             in_flight = base_in_flight.add(payer, final_price)
             has_funds = await payment_handler.check_evm_balance(payment_network, payer, in_flight)
@@ -1639,50 +1635,7 @@ async def _managed_flow(
     # Paid or held: the upload may stay in memory for the job.
     upload.release()
 
-    # 5b. Solana transactions carry a blockhash that expires in about a minute.
-    # Settle before the provider call so a long job cannot outlive the signature.
-    if payment_sig and payment_network.startswith("solana:"):
-        t_settle_start = time.monotonic()
-        state = "unknown"
-        try:
-            upfront_settlement = await payment_handler.settle(
-                payment_sig,
-                final_price,
-                payment_network,
-                extra_context={
-                    "provider_name": provider_name,
-                    "estimated_cost": float(base_price),
-                    "provider_cost": float(base_price),
-                    "generation_s": 0.0,
-                    "t_client": time.monotonic() - t_start,
-                    "commission_rate": config.gateway.commission,
-                    "gas_surcharge": config.gateway.gas_surcharge,
-                },
-            )
-            state = settlement_state(upfront_settlement)
-        finally:
-            # Only a clear failure frees the payment at once. A crash or a
-            # cancel may still have broadcast the transaction.
-            payment_claims.release(payment_id, _claim_hold_s(payment_sig, payment_network, state))
-        if state == "failed" or upfront_settlement is None:
-            # None means settle crashed, maybe before sending anything. The
-            # claim stays held in case the transaction went out.
-            reason = (upfront_settlement or {}).get("error_reason") or "unknown"
-            return _error_response(402, f"Payment settlement failed: {reason}")
-        if state == "unknown":
-            # Sent, but its confirmation wait failed: it most likely lands. The
-            # client gets the job. A provider failure is not credited, since
-            # the payment may never land.
-            logger.error(
-                "Solana settlement status unknown for %s; running the job anyway", provider_name
-            )
-        else:
-            _record_onchain_settlement(
-                provider_name,
-                payment_network,
-                upfront_settlement,
-                time.monotonic() - t_settle_start,
-            )
+    is_base = payment_network.startswith("eip155:")
 
     # A Base settlement with an unknown outcome is followed by a reconcile,
     # which may see the transfer land before or after the job ends. Whichever
@@ -1717,17 +1670,6 @@ async def _managed_flow(
         base_follow["refund"] = refund
         base_follow["cost"] = cost
 
-    async def _landed(receipt_settlement: dict[str, Any]) -> None:
-        """Record a Base settlement whose unknown outcome later landed."""
-        _record_onchain_settlement(
-            provider_name,
-            payment_network,
-            receipt_settlement,
-            time.monotonic() - t_gen_start,
-        )
-        base_follow["landed"] = receipt_settlement
-        await _follow_up()
-
     def _unresolved(state: str) -> None:
         """Note that the reconcile ended without the transfer landing."""
         base_follow["resolved"] = state
@@ -1740,17 +1682,33 @@ async def _managed_flow(
         """
         return base_follow["refund"] is True
 
-    async def _settle_base() -> dict[str, Any] | None:
-        """Settle the Base authorization while the provider runs.
+    async def _settle() -> JSONResponse | None:
+        """5c. Settle the x402 payment before the provider call.
 
-        The result goes out only after this succeeds. A payer who reuses
-        the authorization, moves the USDC or cancels it during the job
-        gets an error instead of a free result.
+        Returns a 402 if the settlement failed; the provider is then not
+        called. A Solana transaction carries a blockhash that expires in
+        about a minute, before a long job finishes, and a Base payer could
+        move the USDC while the job runs. This runs inside the job task, so
+        heartbeats cover a slow settle and a client that leaves does not
+        stop it.
         """
-        settlement: dict[str, Any] | None = None
+        nonlocal upfront_settlement
         t_settle_start = time.monotonic()
+
+        async def _landed(receipt_settlement: dict[str, Any]) -> None:
+            """Record a Base settlement whose unknown outcome later landed."""
+            _record_onchain_settlement(
+                provider_name,
+                payment_network,
+                receipt_settlement,
+                time.monotonic() - t_settle_start,
+            )
+            base_follow["landed"] = receipt_settlement
+            await _follow_up()
+
+        state = "unknown"
         try:
-            settlement = await payment_handler.settle(
+            upfront_settlement = await payment_handler.settle(
                 payment_sig,
                 final_price,
                 payment_network,
@@ -1764,39 +1722,50 @@ async def _managed_flow(
                     "gas_surcharge": config.gateway.gas_surcharge,
                 },
             )
+            state = settlement_state(upfront_settlement)
         finally:
-            # An unknown outcome keeps the claim until the authorization
-            # expires: a replay would pass verify while the transaction waits.
-            state = settlement_state(settlement)
+            # Only a clear failure frees the payment at once. A crash or a
+            # cancel may still have broadcast the transaction, and an unknown
+            # Base outcome keeps the claim until the authorization expires.
             payment_claims.release(payment_id, _claim_hold_s(payment_sig, payment_network, state))
-            if state == "unknown":
+            if is_base and state == "unknown":
                 # The amount stays counted until the receipt resolves, so a
                 # new nonce cannot spend the same USDC in the meantime.
                 _start_base_reconcile(
                     payment_network,
                     payer,
                     payment_sig,
-                    settlement,
+                    upfront_settlement,
                     final_price,
                     _landed,
                     owed=_owed,
                     on_unresolved=_unresolved,
                 )
-            else:
+            elif is_base:
                 base_in_flight.remove(payer, final_price)
-        if state == "ok":
+        if state == "failed" or upfront_settlement is None:
+            # None means settle crashed, maybe before sending anything. The
+            # claim stays held in case the transaction went out.
+            reason = (upfront_settlement or {}).get("error_reason") or "unknown"
+            return _error_response(402, f"Payment settlement failed: {reason}")
+        if state == "unknown":
+            # Sent, but its confirmation wait failed: it most likely lands. The
+            # client gets the job. On Base the reconcile credits a known
+            # failure once the transfer lands; on Solana nothing follows the
+            # receipt, so a failure is not credited.
+            logger.error(
+                "%s settlement status unknown for %s; running the job anyway",
+                "Base" if is_base else "Solana",
+                provider_name,
+            )
+        else:
             _record_onchain_settlement(
                 provider_name,
                 payment_network,
-                settlement,
+                upfront_settlement,
                 time.monotonic() - t_settle_start,
             )
-        return settlement
-
-    async def _base_settlement() -> dict[str, Any] | None:
-        """Wait for the Base settlement. A client that leaves does not cancel it."""
-        assert base_settle is not None
-        return await asyncio.shield(base_settle)
+        return None
 
     async def _provider_error(
         status_code: int,
@@ -1812,7 +1781,7 @@ async def _managed_flow(
         ``keep_payment`` the outcome is unknown: the job may have run and
         billed us, so the prepaid hold is charged and a settled x402
         payment is kept. Otherwise a settled payment goes to the payer's
-        prepaid balance. A Base settlement that failed took nothing.
+        prepaid balance, and an unknown Base settlement once it lands.
         """
         if keep_payment:
             extra["outcome_unknown"] = True
@@ -1829,10 +1798,8 @@ async def _managed_flow(
             extra["prepaid"] = report
         else:
             settlement = upfront_settlement
-            if base_settle is not None:
-                settlement = await _base_settlement()
             tx_hash = (settlement or {}).get("transaction") or ""
-            if settlement_state(settlement) == "unknown" and base_settle is not None and tx_hash:
+            if settlement_state(settlement) == "unknown" and is_base and tx_hash:
                 # The reconcile follows this transaction. A known failure is
                 # credited once the receipt shows the transfer, which may
                 # already have happened; a revert or an expiry credits nothing.
@@ -1865,7 +1832,7 @@ async def _managed_flow(
                         provider_name,
                         tx_hash,
                     )
-            elif settlement_state(settlement) == "unknown" and (upfront_settlement or base_settle):
+            elif settlement_state(settlement) == "unknown":
                 logger.error(
                     "%s failed and the payment status is unknown; nothing credited",
                     provider_name,
@@ -1924,13 +1891,9 @@ async def _managed_flow(
             keep_payment=True,
         )
 
-    # 6. Forward request to provider. Base settles at the same time.
     body["_caller"] = (prepaid_pubkey or payer or "x402")[:12]
+    # Reset by _run_job once the payment has settled.
     t_gen_start = time.monotonic()
-    if payment_sig and payment_network.startswith("eip155:"):
-        base_settle = asyncio.create_task(_settle_base())
-        _pending_settlements.add(base_settle)
-        base_settle.add_done_callback(_pending_settlements.discard)
     # Set by _run_job once the provider answers; _respond reads them.
     result: dict[str, Any] = {}
     is_async = False
@@ -1992,51 +1955,24 @@ async def _managed_flow(
             content["prepaid"] = report
             return JSONResponse(content=content, headers=_prepaid_headers(report))
 
-        # 9. Solana settled before the provider call. Base settled while it
-        #    ran: the result is withheld unless that settlement succeeded.
-        if upfront_settlement is not None:
+        # 9. The payment settled before the provider call. An unknown Base
+        #    settlement is counted as revenue if the reconcile sees it land.
+        if is_base and settlement_state(upfront_settlement) == "unknown":
+            _job_ended(refund=False, cost=actual_base_price)
+            await _follow_up()
+        elif upfront_settlement is not None:
             stats.record_revenue(
                 provider_name,
                 Decimal(str(upfront_settlement.get("amount_usdc", 0))),
                 actual_base_price,
             )
+        if upfront_settlement is not None:
             logger.info(
-                "Solana %s completed after upfront settle: cost=$%s (%.1fs)",
+                "%s completed after upfront settle: cost=$%s (%.1fs)",
                 provider_name,
                 actual_base_price,
                 generation_s,
             )
-        else:
-            settlement = await _base_settlement()
-            state = settlement_state(settlement)
-            if state == "unknown" and settlement is not None:
-                # Sent, but its confirmation wait failed: it most likely lands,
-                # and a payer cannot cause that on purpose. The result goes out.
-                logger.error(
-                    "Base settlement status unknown for %s; returning the result", provider_name
-                )
-                # Revenue is counted if the reconcile sees the transfer land.
-                _job_ended(refund=False, cost=actual_base_price)
-                await _follow_up()
-            elif state != "ok":
-                # A failure, or a settle that crashed (None), maybe before sending.
-                reason = (settlement or {}).get("error_reason") or "unknown"
-                logger.warning(
-                    "Withholding %s result: Base settlement failed: %s", provider_name, reason
-                )
-                stats.record_request(
-                    provider_name,
-                    generation_s,
-                    False,
-                    error_msg=f"Base settlement failed: {reason}",
-                )
-                return _error_response(402, f"Payment settlement failed: {reason}")
-            else:
-                stats.record_revenue(
-                    provider_name,
-                    Decimal(str(settlement.get("amount_usdc", 0))),
-                    actual_base_price,
-                )
         t_client = time.monotonic() - t_start
 
         # 10. Return result to client
@@ -2058,8 +1994,14 @@ async def _managed_flow(
         )
 
     async def _run_job() -> JSONResponse:
-        """Call the provider, wait for a polled job, then charge or refund it."""
-        nonlocal result, is_async, task_id
+        """Settle the payment, call the provider, then charge or refund it."""
+        nonlocal result, is_async, task_id, t_gen_start
+        if payment_sig:
+            refused = await _settle()
+            if refused is not None:
+                return refused
+        # 6. Forward request to provider
+        t_gen_start = time.monotonic()
         try:
             if isinstance(provider, SpicyApiProvider):
                 # SpicyAPI refuses a fresh quote above the price charged here.
@@ -2089,8 +2031,9 @@ async def _managed_flow(
             return await _job_crashed(e)
         return await _respond(output)
 
-    # The job runs in its own task, so a client that disconnects does not
-    # stop it. It still finishes and is charged or refunded on its outcome.
+    # The job runs in its own task, from the settle on, so a client that
+    # disconnects does not stop it. It still finishes and is charged or
+    # refunded on its outcome.
     # Synchronous calls (chat, TTS) run the same way: a long one sends no
     # bytes until it ends, and Railway would cut the idle connection.
     finish = asyncio.create_task(_run_job())
