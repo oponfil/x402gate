@@ -4160,3 +4160,63 @@ class TestFishAudioExpressiveness:
         sent = json.loads(route.calls.last.request.content)
         assert sent["temperature"] == 0.9
         assert sent["top_p"] == 0.6
+
+
+class TestAliasHold:
+    """A ~ alias is held at its family's dearest price and charged its actual cost."""
+
+    CATALOG = {
+        "data": [
+            {
+                "id": "~deepseek/deepseek-flash-latest",
+                "pricing": {"prompt": "0.000000035", "completion": "0.0000005"},
+            },
+            {
+                "id": "deepseek/deepseek-v4.1-flash-1017",
+                "pricing": {"prompt": "0.0000003", "completion": "0.0000012"},
+            },
+        ]
+    }
+    BODY = {
+        "model": "~deepseek/deepseek-flash-latest",
+        "messages": [{"role": "user", "content": "x" * 27_000}],  # 10k tokens
+    }
+
+    @respx.mock
+    def test_hold_covers_the_family_and_the_rest_goes_back(self, client):
+        reset()
+        kp = Keypair()
+        pubkey = str(kp.pubkey())
+        asyncio.run(deposit(pubkey, Decimal("1.00")))
+        respx.get("https://openrouter.ai/api/v1/models").mock(
+            return_value=httpx.Response(200, json=self.CATALOG)
+        )
+        held: list[Decimal] = []
+
+        async def chat(request):
+            held.append(Decimal("1.00") - get_balance(pubkey))
+            return httpx.Response(
+                200,
+                json={
+                    "id": "gen-1",
+                    "model": "deepseek/deepseek-v4.1-flash-1017",
+                    "choices": [{"message": {"content": "ok"}}],
+                    "usage": {"prompt_tokens": 10_000, "completion_tokens": 10, "cost": 0.0030012},
+                },
+            )
+
+        respx.post("https://openrouter.ai/api/v1/chat/completions").mock(side_effect=chat)
+        response = client.post(
+            OPENROUTER_CHAT,
+            json=self.BODY,
+            headers=_prepaid_headers(kp, "openrouter/chat/completions"),
+        )
+
+        assert response.status_code == 200
+        output = providers["openrouter"]._default_max_tokens
+        # Held at the newest model's rates, not the alias's listed $0.035/M.
+        assert held == [
+            Decimal(10_000) * Decimal("0.0000003") + Decimal(output) * Decimal("0.0000012")
+        ]
+        assert response.headers["x-prepaid-cost"] == "0.0030012"
+        assert get_balance(pubkey) == Decimal("1.00") - Decimal("0.0030012")

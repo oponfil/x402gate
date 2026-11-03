@@ -3399,3 +3399,149 @@ class TestVideoInput:
             openrouter.check_content_parts(self._body(self.VIDEO), "nanogpt")
         with pytest.raises(ProviderError, match="not supported"):
             estimate_chat_input_tokens(self._body(self.VIDEO), "nanogpt")
+
+
+class TestAliasFamily:
+    """A ~ alias is priced at the highest rates among the models of its family."""
+
+    ALIAS = {
+        "id": "~deepseek/deepseek-flash-latest",
+        "context_length": 100_000,
+        "pricing": {"prompt": "0.000000035", "completion": "0.0000005"},
+    }
+    NEWEST = {
+        "id": "deepseek/deepseek-v4.1-flash-1017",
+        "context_length": 100_000,
+        "pricing": {
+            "prompt": "0.00000015",
+            "completion": "0.0000006",
+            # Weekday peak hours bill double.
+            "overrides": [
+                {"utc_days": ["monday"], "utc_start": 100, "utc_end": 400, "prompt": "0.0000003",
+                 "completion": "0.0000012"},
+            ],
+        },
+    }  # fmt: skip
+    VISION = {
+        "id": "deepseek/deepseek-v4-flash-vision-exp",
+        "context_length": 200_000,
+        "pricing": {"prompt": "0.0000002156", "completion": "0.0000006468"},
+    }
+
+    @staticmethod
+    def _body(model: str = "~deepseek/deepseek-flash-latest", **extra) -> dict:
+        return {"model": model, "messages": [{"role": "user", "content": "Hi"}], **extra}
+
+    @staticmethod
+    def _cost(prompt: str, completion: str, max_tokens: int = 1024) -> Decimal:
+        return Decimal(_ascii_tokens("Hi")) * Decimal(prompt) + Decimal(max_tokens) * Decimal(
+            completion
+        )
+
+    async def _price(self, provider, body: dict, *models: dict) -> Decimal:
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = _catalog(*models)
+            return await provider.get_price("chat/completions", body)
+
+    @pytest.mark.asyncio
+    async def test_alias_is_priced_at_the_dearest_rates_of_its_family(self, provider):
+        """Each rate is the highest among the family, the peak-hour override included."""
+        price = await self._price(provider, self._body(), self.ALIAS, self.NEWEST, self.VISION)
+        assert price == self._cost("0.0000003", "0.0000012")
+
+    @pytest.mark.asyncio
+    async def test_rates_come_from_different_members(self, provider):
+        newest = {**self.NEWEST, "pricing": {"prompt": "0.00000015", "completion": "0.0000006"}}
+        price = await self._price(provider, self._body(), self.ALIAS, newest, self.VISION)
+        assert price == self._cost("0.0000002156", "0.0000006468")
+
+    @pytest.mark.asyncio
+    async def test_a_concrete_model_keeps_its_own_price(self, provider):
+        body = self._body("deepseek/deepseek-v4-flash-vision-exp")
+        price = await self._price(provider, body, self.ALIAS, self.NEWEST, self.VISION)
+        assert price == self._cost("0.0000002156", "0.0000006468")
+
+    @pytest.mark.asyncio
+    async def test_alias_without_family_keeps_its_own_price(self, provider, caplog):
+        price = await self._price(provider, self._body(), self.ALIAS)
+        assert price == self._cost("0.000000035", "0.0000005")
+        assert "no family models" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_unpriceable_member_is_skipped(self, provider):
+        router = {
+            "id": "deepseek/deepseek-flash-router",
+            "pricing": {"prompt": "-1", "completion": "-1"},
+        }
+        price = await self._price(provider, self._body(), self.ALIAS, self.VISION, router)
+        assert price == self._cost("0.0000002156", "0.0000006468")
+
+    @pytest.mark.asyncio
+    async def test_alias_in_a_fallback_list_is_priced_by_family(self, provider):
+        mini = {
+            "id": "openai/gpt-4o-mini",
+            "pricing": {"prompt": "0.00000015", "completion": "0.0000006"},
+        }
+        body = self._body("openai/gpt-4o-mini", models=["~deepseek/deepseek-flash-latest"])
+        price = await self._price(provider, body, mini, self.ALIAS, self.VISION)
+        tokens = estimate_chat_input_tokens(body, "openrouter")
+        assert price == Decimal(tokens) * Decimal("0.0000002156") + Decimal(1024) * Decimal(
+            "0.0000006468"
+        )
+
+    @pytest.mark.asyncio
+    async def test_video_window_covers_the_family(self, provider):
+        video = {"type": "video_url", "video_url": {"url": "https://example.com/a.mp4"}}
+        body = self._body(messages=[{"role": "user", "content": [video]}])
+        price = await self._price(provider, body, self.ALIAS, self.VISION)
+        assert price == Decimal(200_000) * Decimal("0.0000002156") + Decimal(1024) * Decimal(
+            "0.0000006468"
+        )
+
+    @pytest.mark.asyncio
+    async def test_family_is_found_again_in_a_refreshed_catalog(self, provider):
+        provider._catalogs.put("", {m["id"]: m for m in (self.ALIAS, self.NEWEST)})
+        first = await provider.get_price("chat/completions", self._body())
+        provider._catalogs.put("", {m["id"]: m for m in (self.ALIAS, self.NEWEST, self.VISION)})
+        newest = {**self.NEWEST, "pricing": {"prompt": "0.00000015", "completion": "0.0000006"}}
+        provider._catalogs.put("", {m["id"]: m for m in (self.ALIAS, newest, self.VISION)})
+        second = await provider.get_price("chat/completions", self._body())
+        assert first == self._cost("0.0000003", "0.0000012")
+        assert second == self._cost("0.0000002156", "0.0000006468")
+
+    @pytest.mark.parametrize(
+        ("alias", "family"),
+        [
+            (
+                "~deepseek/deepseek-flash-latest",
+                ["deepseek/deepseek-v4.1-flash-1017", "deepseek/deepseek-v4-flash"],
+            ),
+            # v4.1 is a word of its own, so it is not in the v4 family.
+            ("~deepseek/deepseek-v4-flash-latest", ["deepseek/deepseek-v4-flash"]),
+            ("~anthropic/claude-sonnet-latest", ["anthropic/claude-sonnet-5.5"]),
+            ("deepseek/deepseek-v4-flash", []),
+            ("~", []),
+        ],
+    )
+    def test_family_rule(self, alias, family):
+        models = {
+            model_id: {}
+            for model_id in (
+                "deepseek/deepseek-v4.1-flash-1017",
+                "deepseek/deepseek-v4-flash",
+                "deepseek/deepseek-v4.1-flash:batch",  # a variant
+                "deepseek/deepseek-v4-pro",  # another family
+                "acme/deepseek-flash",  # another vendor
+                "~deepseek/deepseek-v4-flash-latest",  # another alias
+                "anthropic/claude-sonnet-5.5",
+                "anthropic/claude-opus-5.5",
+            )
+        }
+        assert openrouter._alias_family(alias, models) == family
+
+    @pytest.mark.asyncio
+    async def test_actual_cost_is_what_openrouter_reports(self, provider):
+        """The hold is only a ceiling: usage.cost is what gets charged."""
+        result = {"model": "deepseek/deepseek-v4.1-flash-1017", "usage": {"cost": 0.0026}}
+        cost = await provider.calculate_actual_cost(self._body(), result)
+        assert cost == Decimal("0.0026")

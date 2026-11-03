@@ -190,6 +190,15 @@ _NATIVE_SEARCHES = 5
 _DEEP_RESEARCH = "deep-research"
 _SEARCH_PREVIEW = "-search-preview"
 
+# A "~vendor/family-latest" model is an alias that OpenRouter redirects to
+# the newest model of the family, billed at that model's price. The alias's
+# own catalog price is not that price (~deepseek/deepseek-flash-latest lists
+# $0.035/M input and bills up to $0.30/M), so an alias is priced at the
+# highest rates among the catalog models of its family: same vendor, every
+# word of the alias name. Variants (":free", ":batch") are other products.
+_ALIAS_PREFIX = "~"
+_ALIAS_SUFFIX = "-latest"
+
 # Tool types the model only writes a call for, which the client then runs:
 # billed as tokens. Every other type (web_search, web_search_preview,
 # openrouter:web_search, Anthropic's web_search_20250305, code_interpreter,
@@ -625,6 +634,22 @@ def _online_variant(model_id: str) -> bool:
     one, at that provider's per-search rates, so it is refused.
     """
     return "online" in model_id.lower().split(":")[1:]
+
+
+def _alias_family(alias_id: str, models: Catalog) -> list[str]:
+    """Catalog models a ``~`` alias may redirect to; empty for any other model."""
+    vendor, _, name = alias_id.removeprefix(_ALIAS_PREFIX).partition("/")
+    if not alias_id.startswith(_ALIAS_PREFIX) or not name:
+        return []
+    words = set(name.removesuffix(_ALIAS_SUFFIX).split("-"))
+    family = []
+    for model_id in models:
+        if model_id.startswith(_ALIAS_PREFIX) or ":" in model_id:
+            continue
+        model_vendor, _, model_name = model_id.partition("/")
+        if model_vendor == vendor and words <= set(model_name.split("-")):
+            family.append(model_id)
+    return family
 
 
 def _searches_every_request(model_id: str) -> bool:
@@ -1452,6 +1477,9 @@ class OpenRouterProvider(BaseProvider):
         self._catalogs = CatalogCache(
             float(config.models_cache_ttl), self._fetch_models_list, self.name
         )
+        # Family of each ~ alias, by catalog key and alias, with the catalog
+        # it was found in: a refreshed catalog finds it again.
+        self._families: dict[tuple[str, str], tuple[Catalog, list[str]]] = {}
         self._default_max_tokens = default_max_tokens
         self._web_search_tokens_per_result = web_search_tokens_per_result
         self._default_web_search_max_results = default_web_search_max_results
@@ -1931,11 +1959,44 @@ class OpenRouterProvider(BaseProvider):
         per_model = []
         for model_id in model_ids:
             model_info = await self._fetch_model_info(model_id, output_modalities=output_modalities)
-            rates = self._model_rates(model_id, model_info)
-            if input_tokens is not None:
-                rates = _tiered_rates(rates, model_info.get("pricing", {}), input_tokens)
-            per_model.append(rates)
+            per_model.append(self._rates_at(model_id, model_info, input_tokens))
+            # A ~ alias bills at the price of the model it leads to.
+            for member_id, member_info in await self._family(model_id, output_modalities):
+                try:
+                    per_model.append(self._rates_at(member_id, member_info, input_tokens))
+                except ProviderError:
+                    continue  # unpriceable (a router), so not where the alias leads
         return {key: max(rates[key] for rates in per_model) for key in per_model[0]}
+
+    def _rates_at(
+        self, model_id: str, model_info: dict[str, Any], input_tokens: int | Decimal | None
+    ) -> dict[str, Decimal]:
+        """One model's rates, tiered for a prompt of ``input_tokens`` when given."""
+        rates = self._model_rates(model_id, model_info)
+        if input_tokens is None:
+            return rates
+        return _tiered_rates(rates, model_info.get("pricing", {}), input_tokens)
+
+    async def _family(
+        self, model_id: str, output_modalities: str
+    ) -> list[tuple[str, dict[str, Any]]]:
+        """The catalog entries of a ``~`` alias's family; empty for any other model."""
+        if not model_id.startswith(_ALIAS_PREFIX):
+            return []
+        models = await self._catalogs.get(output_modalities)
+        cached = self._families.get((output_modalities, model_id))
+        if cached is not None and cached[0] is models:
+            family = cached[1]
+        else:
+            family = _alias_family(model_id, models)
+            self._families[(output_modalities, model_id)] = (models, family)
+            if not family:
+                logger.warning(
+                    "OpenRouter alias %s has no family models in the catalog; "
+                    "priced at its own rates",
+                    model_id,
+                )
+        return [(member_id, models[member_id]) for member_id in family]
 
     async def _max_context_window(self, model_ids: list[str]) -> int:
         """Largest context window among the models OpenRouter may route to.
@@ -1953,6 +2014,8 @@ class OpenRouterProvider(BaseProvider):
                     "price video input for it before payment."
                 )
             windows.append(window)
+            for _, member_info in await self._family(model_id, ""):
+                windows.append(_context_window(member_info) or window)
         return max(windows)
 
     async def _measure_stt_audio(self, inputs: dict[str, Any]) -> int:
