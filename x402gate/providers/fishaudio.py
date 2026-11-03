@@ -40,6 +40,10 @@ _ONE_THOUSAND = Decimal("1000")
 # model names such as "s1" or "speech-1.6" pass.
 _MODEL_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
+# Sampling settings forwarded to Fish Audio, each a number from 0 to 1
+# (default 0.7). A higher temperature gives a more varied intonation.
+_SAMPLING_PARAMS = ("temperature", "top_p")
+
 
 def _model_header(inputs: dict[str, Any], provider_name: str) -> str:
     """Return the optional ``model`` header value, ``""`` when missing or null.
@@ -56,6 +60,24 @@ def _model_header(inputs: dict[str, Any], provider_name: str) -> str:
             status_code=400,
         )
     return model
+
+
+def _check_sampling(inputs: dict[str, Any], provider_name: str) -> None:
+    """Refuse a temperature or top_p Fish Audio would reject, before payment.
+
+    Raises:
+        ProviderError: 400 for a value that is not a number from 0 to 1.
+    """
+    for key in _SAMPLING_PARAMS:
+        value = inputs.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1:
+            raise ProviderError(
+                provider=provider_name,
+                detail=f"'{key}' must be a number from 0 to 1",
+                status_code=400,
+            )
 
 
 class FishAudioProvider(BaseProvider):
@@ -87,6 +109,7 @@ class FishAudioProvider(BaseProvider):
         # model becomes an HTTP header; both are checked before payment.
         _model_header(inputs, self.name)
         optional_str(inputs, "reference_id", self.name)
+        _check_sampling(inputs, self.name)
 
         utf8_bytes = len(text.encode("utf-8"))
         price = Decimal(utf8_bytes) / _ONE_THOUSAND * self._price_per_1k
@@ -120,6 +143,7 @@ class FishAudioProvider(BaseProvider):
             ProviderError: On validation failure or API error.
         """
         text = require_text(body, self.name)
+        _check_sampling(body, self.name)
 
         reference_id = optional_str(body, "reference_id", self.name)
         chunk_length = body.get("chunk_length", 200)
@@ -150,6 +174,9 @@ class FishAudioProvider(BaseProvider):
         # Forward any extra params the client sends (except model — sent as header)
         for key in ("mp3_bitrate", "opus_bitrate", "normalize", "prosody"):
             if key in body:
+                payload[key] = body[key]
+        for key in _SAMPLING_PARAMS:
+            if body.get(key) is not None:
                 payload[key] = body[key]
 
         try:

@@ -91,6 +91,11 @@ providers:
     poll_timeout: 10
     models_cache_ttl: 86400
     max_stt_audio_mb: 25
+  fishaudio:
+    enabled: true
+    base_url: "https://api.fish.audio"
+    api_key: "test-fish-key"
+    poll_timeout: 10
   tungsten:
     enabled: false
     base_url: "https://api.tungsten.run/v1"
@@ -2165,13 +2170,14 @@ class TestWarmUp:
                 stack.enter_context(patch.object(cls, "warm_up", _fake_warm_up))
             with TestClient(app) as c:
                 deadline = time.monotonic() + 2
-                while len(warmed) < 3 and time.monotonic() < deadline:
+                while len(warmed) < 4 and time.monotonic() < deadline:
                     time.sleep(0.01)
                 assert c.get("/health").status_code == 200
 
         # Enabled managed providers only; blockrun is a passthrough.
         assert sorted(warmed) == [
             "CloudConvertProvider",
+            "FishAudioProvider",
             "OpenRouterProvider",
             "WaveSpeedProvider",
         ]
@@ -4121,3 +4127,36 @@ class TestVideoNeedsPrepaid:
             )
         assert response.status_code == 402
         assert "_prepaid_only" not in seen[0]
+
+
+class TestFishAudioExpressiveness:
+    """Fish Audio temperature and top_p are checked before payment and forwarded."""
+
+    TTS_URL = "https://api.fish.audio/v1/tts"
+
+    def test_unpaid_request_with_temperature_is_priced(self, client):
+        response = client.post("/v1/fishaudio/tts", json={"text": "hi", "temperature": 0.9})
+        assert response.status_code == 402
+
+    def test_temperature_above_one_gets_400_before_payment(self, client):
+        response = client.post("/v1/fishaudio/tts", json={"text": "hi", "temperature": 2})
+        assert response.status_code == 400
+        assert "temperature" in response.json()["error"]
+
+    @respx.mock
+    def test_prepaid_request_forwards_temperature_and_top_p(self, client):
+        reset()
+        kp = Keypair()
+        asyncio.run(deposit(str(kp.pubkey()), Decimal("1.00")))
+        route = respx.post(self.TTS_URL).mock(
+            return_value=httpx.Response(200, content=b"a", headers={"content-type": "audio/mpeg"})
+        )
+        response = client.post(
+            "/v1/fishaudio/tts",
+            json={"text": "hi", "temperature": 0.9, "top_p": 0.6},
+            headers=_prepaid_headers(kp, "fishaudio/tts"),
+        )
+        assert response.status_code == 200
+        sent = json.loads(route.calls.last.request.content)
+        assert sent["temperature"] == 0.9
+        assert sent["top_p"] == 0.6

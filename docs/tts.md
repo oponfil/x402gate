@@ -180,7 +180,8 @@ POST /v1/fishaudio/tts
   "model": "s2-pro",
   "format": "mp3",
   "reference_id": "e58b0d7efca34eb38d5c4985e378abcb",
-  "prosody": {"speed": 1.1}
+  "prosody": {"speed": 1.1},
+  "temperature": 0.9
 }
 ```
 
@@ -193,6 +194,8 @@ POST /v1/fishaudio/tts
 | `format` | string | | `mp3` | Output format: `mp3`, `wav`, `ogg`, `flac` |
 | `reference_id` | string | | — | Voice ID from [fish.audio/app/discovery](https://fish.audio/app/discovery) |
 | `prosody` | object | | — | `{"speed": 1.1}` — speech rate multiplier |
+| `temperature` | number | | `0.7` | Expressiveness, 0 to 1: higher gives a more varied intonation |
+| `top_p` | number | | `0.7` | Nucleus sampling, 0 to 1 |
 | `chunk_length` | int | | — | Chunk length for processing |
 | `latency` | string | | `normal` | `normal` or `balanced` |
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import json
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -315,6 +316,53 @@ class TestInputTypes:
             await _make_provider().get_price("tts", {"text": "hi", key: value})
         assert caught.value.status_code == 400
         assert key in caught.value.detail
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("key", ["temperature", "top_p"])
+    @pytest.mark.parametrize("value", [-0.1, 1.01, "0.9", True, [0.5], {"a": 1}])
+    async def test_sampling_outside_zero_to_one_is_rejected(self, key, value):
+        with pytest.raises(ProviderError) as caught:
+            await _make_provider().get_price("tts", {"text": "hi", key: value})
+        assert caught.value.status_code == 400
+        assert key in caught.value.detail
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", [0, 0.7, 1, None])
+    async def test_sampling_does_not_change_the_price(self, value):
+        provider = _make_provider()
+        body = {"text": "hi", "temperature": value, "top_p": value}
+        assert await provider.get_price("tts", body) == await provider.get_price(
+            "tts", {"text": "hi"}
+        )
+
+    @respx.mock
+    async def test_submit_forwards_expressiveness(self, pooled):
+        """temperature, top_p and prosody reach the JSON sent to Fish Audio."""
+        route = respx.post(_TTS_URL).mock(
+            return_value=httpx.Response(200, content=b"a", headers={"content-type": "audio/mpeg"})
+        )
+        body = {"text": "hi", "temperature": 0.9, "top_p": 0.5, "prosody": {"speed": 1.1}}
+        await _make_provider().submit("tts", body)
+        sent = json.loads(route.calls.last.request.content)
+        assert sent["temperature"] == 0.9
+        assert sent["top_p"] == 0.5
+        assert sent["prosody"] == {"speed": 1.1}
+
+    @respx.mock
+    async def test_null_sampling_is_left_out(self, pooled):
+        route = respx.post(_TTS_URL).mock(
+            return_value=httpx.Response(200, content=b"a", headers={"content-type": "audio/mpeg"})
+        )
+        await _make_provider().submit("tts", {"text": "hi", "temperature": None, "top_p": None})
+        sent = json.loads(route.calls.last.request.content)
+        assert "temperature" not in sent
+        assert "top_p" not in sent
+
+    @pytest.mark.asyncio
+    async def test_submit_refuses_bad_sampling_too(self):
+        with pytest.raises(ProviderError) as caught:
+            await _make_provider().submit("tts", {"text": "hi", "temperature": 2})
+        assert caught.value.status_code == 400
 
     @respx.mock
     async def test_null_model_is_left_out(self, pooled):
