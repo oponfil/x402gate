@@ -1377,3 +1377,83 @@ class TestAudioInput:
         usage = {"prompt_tokens": 40, "completion_tokens": 10}
         cost = await provider.calculate_actual_cost(body, {"usage": usage})
         assert cost == Decimal(40) * Decimal("0.3") / _MILLION + Decimal(25) / _MILLION
+
+
+class TestIdCase:
+    """A model id in another case is found, and NanoGPT gets the catalog's spelling."""
+
+    HERETIC = "pqhaz/deepseek-v4.1-flash-1017-heretic"
+
+    @staticmethod
+    def _sent_model(provider, model: str, *catalog_ids: str) -> str:
+        provider._catalog.put("", {model_id: _priced(model_id) for model_id in catalog_ids})
+        response = httpx.Response(
+            status_code=200,
+            json={"choices": [{"message": {"content": "ok"}}], "usage": {"total_tokens": 3}},
+        )
+        with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = response
+            asyncio.run(provider.submit("chat/completions", _chat_body(model=model)))
+        return mock_post.call_args.kwargs["json"]["model"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "pqhaz/DeepSeek-V4.1-Flash-1017-Heretic",
+            "PQHAZ/DEEPSEEK-V4.1-FLASH-1017-HERETIC:thinking",
+            "pqhaz/deepseek-v4.1-flash-1017-heretic:THINKING:cheap",
+        ],
+    )
+    async def test_other_case_is_priced_as_the_catalog_model(self, provider, model):
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = _catalog(_priced(self.HERETIC))
+            price = await provider.get_price("chat/completions", _chat_body(model=model))
+        assert price == _expected(1)
+
+    @pytest.mark.parametrize(
+        ("model", "catalog", "sent"),
+        [
+            ("pqhaz/DeepSeek-V4.1-Flash-1017-Heretic", [HERETIC], HERETIC),
+            # A suffix that is not its own row keeps the client's spelling.
+            ("PQHAZ/deepseek-v4.1-flash-1017-heretic:thinking", [HERETIC], HERETIC + ":thinking"),
+            # A suffixed row of its own is matched whole.
+            ("a/B:Thinking", ["a/B", "a/B:thinking"], "a/B:thinking"),
+            ("tee/kimi-k3.1-pro", ["TEE/kimi-k3.1-pro"], "TEE/kimi-k3.1-pro"),
+            ("TEE/kimi-k3.1-pro", ["TEE/kimi-k3.1-pro"], "TEE/kimi-k3.1-pro"),
+            # Not in the catalog: forwarded as written.
+            ("x/Unknown", [HERETIC], "x/Unknown"),
+        ],
+    )
+    def test_submit_sends_the_catalog_spelling(self, provider, model, catalog, sent):
+        assert self._sent_model(provider, model, *catalog) == sent
+
+    def test_submit_before_any_catalog_sends_the_id_and_fetches_nothing(self, provider):
+        response = httpx.Response(status_code=200, json={"choices": [], "usage": {}})
+        with (
+            patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get,
+            patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post,
+        ):
+            mock_post.return_value = response
+            asyncio.run(provider.submit("chat/completions", _chat_body(model="Demo/Model")))
+        mock_get.assert_not_called()
+        assert mock_post.call_args.kwargs["json"]["model"] == "Demo/Model"
+
+    @pytest.mark.asyncio
+    async def test_ids_that_differ_only_in_case_need_the_exact_spelling(self, provider):
+        catalog = _catalog(_priced("a/Model"), _priced("a/MODEL"))
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = catalog
+            assert await provider.get_price("chat/completions", _chat_body(model="a/Model"))
+            with pytest.raises(ProviderError) as caught:
+                await provider.get_price("chat/completions", _chat_body(model="a/model"))
+        assert caught.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_actual_cost_uses_the_catalog_model(self, provider):
+        provider._catalog.put("", {self.HERETIC: _priced(self.HERETIC)})
+        body = _chat_body(model="pqhaz/DeepSeek-V4.1-Flash-1017-Heretic")
+        cost = await provider.calculate_actual_cost(
+            body, {"usage": {"prompt_tokens": 1_000_000, "completion_tokens": 0}}
+        )
+        assert cost == PROMPT_PER_MILLION

@@ -285,19 +285,36 @@ def _published_tier(model_info: dict[str, Any], input_tokens: int) -> dict[str, 
     return tier
 
 
-def _lookup(models: Catalog, model_id: str) -> dict[str, Any] | None:
-    """Catalog entry of a model id, or None."""
-    if model_id in models:
-        return models[model_id]
+def _folded_ids(models: Catalog) -> dict[str, str]:
+    """Catalog ids by their lowercase spelling; ids that differ only in case are left out."""
+    folded: dict[str, str | None] = {}
+    for model_id in models:
+        key = model_id.lower()
+        folded[key] = None if key in folded else model_id
+    return {key: model_id for key, model_id in folded.items() if model_id is not None}
+
+
+def _lookup(
+    models: Catalog, folded: dict[str, str], model_id: str
+) -> tuple[str, dict[str, Any]] | None:
+    """The catalog spelling of a model id and its entry, or None.
+
+    The site shows display names ("DeepSeek V4.1 Flash Heretic") and ids
+    keep their own case (TEE/..., deepseek-ai/DeepSeek-R1-0528), so an id
+    in another case is found too, and the catalog's spelling is what goes
+    to NanoGPT.
+    """
     # Routing suffixes (:thinking, :abliteration, :cheap) are not always
     # their own catalog rows. The price is the underlying model. Suffixes
     # that add a separate charge (:online, :memory) are refused before this.
     candidate = model_id
-    while ":" in candidate:
+    while True:
+        key = candidate if candidate in models else folded.get(candidate.lower())
+        if key is not None:
+            return key + model_id[len(candidate) :], models[key]
+        if ":" not in candidate:
+            return None
         candidate = candidate.rsplit(":", 1)[0]
-        if candidate in models:
-            return models[candidate]
-    return None
 
 
 class NanoGptProvider(BaseProvider):
@@ -313,6 +330,8 @@ class NanoGptProvider(BaseProvider):
         self._catalog = CatalogCache(
             float(config.models_cache_ttl), self._fetch_models_list, self.name
         )
+        # Case-folded ids of the current catalog, rebuilt when it is replaced.
+        self._folded: tuple[Catalog, dict[str, str]] | None = None
         self._default_max_tokens = default_max_tokens
         # Caps on each input_audio part's size and on the request's total audio
         # length, both checked before payment.
@@ -475,20 +494,29 @@ class NanoGptProvider(BaseProvider):
         ) from last_error
 
     async def _model_info(self, model_id: str) -> dict[str, Any]:
+        return (await self._resolve(model_id))[1]
+
+    async def _resolve(self, model_id: str) -> tuple[str, dict[str, Any]]:
+        """The catalog spelling of ``model_id`` and its catalog entry."""
         # An expired catalog is served while it refreshes in the background,
         # except for a model it lacks (perhaps added since), which waits for
         # the fresh catalog; in the retry delay after a failed refresh it is
         # not found without a fetch, so unknown ids cannot start one each.
-        info = _lookup(await self._catalog.get(""), model_id)
-        if info is None and self._catalog.may_fetch(""):
-            info = _lookup(await self._catalog.load(""), model_id)
-        if info is not None:
-            return info
+        found = self._find(await self._catalog.get(""), model_id)
+        if found is None and self._catalog.may_fetch(""):
+            found = self._find(await self._catalog.load(""), model_id)
+        if found is not None:
+            return found
         raise ProviderError(
             provider=self.name,
             detail=f"Model '{model_id}' not found on NanoGPT",
             status_code=404,
         )
+
+    def _find(self, models: Catalog, model_id: str) -> tuple[str, dict[str, Any]] | None:
+        if self._folded is None or self._folded[0] is not models:
+            self._folded = (models, _folded_ids(models))
+        return _lookup(models, self._folded[1], model_id)
 
     def _rates(self, model_id: str, model_info: dict[str, Any]) -> tuple[Decimal, Decimal, dict]:
         pricing = model_info.get("pricing")
@@ -654,6 +682,15 @@ class NanoGptProvider(BaseProvider):
             body = {k: v for k, v in body.items() if k != "max_completion_tokens"}
         # Off by default upstream; pinned off so transcripts are never billed.
         body = {**body, "youtube_transcripts": False}
+        # The id as the catalog spells it: one get_price found in another case
+        # would not be found upstream. Read from the catalog as it is, with no
+        # fetch after payment; a model gone from it is sent as the client wrote it.
+        models = self._catalog.cached("")
+        model_id = body.get("model")
+        if models is not None and isinstance(model_id, str):
+            found = self._find(models, model_id)
+            if found is not None:
+                body["model"] = found[0]
 
         resp = await post_billed_request(
             f"{self._config.base_url.rstrip('/')}/{path.strip('/')}",

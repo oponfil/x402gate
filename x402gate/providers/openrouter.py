@@ -1400,6 +1400,10 @@ class CatalogCache:
             return None
         return previous[0]
 
+    def cached(self, key: str) -> Catalog | None:
+        """The catalog as it is now, without fetching; None when never loaded."""
+        return self._catalogs.get(key)
+
     async def get(self, key: str) -> Catalog:
         """The catalog, stale or not; waits only when it was never loaded."""
         models = self._catalogs.get(key)

@@ -91,6 +91,11 @@ providers:
     poll_timeout: 10
     models_cache_ttl: 86400
     max_stt_audio_mb: 25
+  nanogpt:
+    enabled: true
+    base_url: "https://api.nano-gpt.com/api/v1"
+    api_key: "test-nano-key"
+    poll_timeout: 10
   fishaudio:
     enabled: true
     base_url: "https://api.fish.audio"
@@ -2170,7 +2175,7 @@ class TestWarmUp:
                 stack.enter_context(patch.object(cls, "warm_up", _fake_warm_up))
             with TestClient(app) as c:
                 deadline = time.monotonic() + 2
-                while len(warmed) < 4 and time.monotonic() < deadline:
+                while len(warmed) < 5 and time.monotonic() < deadline:
                     time.sleep(0.01)
                 assert c.get("/health").status_code == 200
 
@@ -2178,6 +2183,7 @@ class TestWarmUp:
         assert sorted(warmed) == [
             "CloudConvertProvider",
             "FishAudioProvider",
+            "NanoGptProvider",
             "OpenRouterProvider",
             "WaveSpeedProvider",
         ]
@@ -4220,3 +4226,55 @@ class TestAliasHold:
         ]
         assert response.headers["x-prepaid-cost"] == "0.0030012"
         assert get_balance(pubkey) == Decimal("1.00") - Decimal("0.0030012")
+
+
+class TestNanoGptIdCase:
+    """A NanoGPT model id in another case is priced and sent as the catalog spells it."""
+
+    MODELS_URL = "https://api.nano-gpt.com/api/v1/models"
+    CHAT_URL = "https://api.nano-gpt.com/api/v1/chat/completions"
+    MODEL = "pqhaz/deepseek-v4.1-flash-1017-heretic"
+    CATALOG = {
+        "data": [
+            {
+                "id": MODEL,
+                "pricing": {"prompt": "0.198", "completion": "0.792", "unit": "per_million_tokens"},
+            }
+        ]
+    }
+
+    @respx.mock
+    def test_prepaid_request_in_another_case_reaches_nanogpt_as_the_catalog_id(self, client):
+        reset()
+        kp = Keypair()
+        asyncio.run(deposit(str(kp.pubkey()), Decimal("1.00")))
+        respx.get(self.MODELS_URL).mock(return_value=httpx.Response(200, json=self.CATALOG))
+        chat = respx.post(self.CHAT_URL).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "choices": [{"message": {"content": "ok"}}],
+                    "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6},
+                },
+            )
+        )
+        response = client.post(
+            "/v1/nanogpt/chat/completions",
+            json={
+                "model": "pqhaz/DeepSeek-V4.1-Flash-1017-Heretic:thinking",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            headers=_prepaid_headers(kp, "nanogpt/chat/completions"),
+        )
+        assert response.status_code == 200
+        sent = json.loads(chat.calls.last.request.content)
+        assert sent["model"] == self.MODEL + ":thinking"
+
+    @respx.mock
+    def test_unknown_model_is_still_404_before_payment(self, client):
+        respx.get(self.MODELS_URL).mock(return_value=httpx.Response(200, json=self.CATALOG))
+        response = client.post(
+            "/v1/nanogpt/chat/completions",
+            json={"model": "pqhaz/other", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert response.status_code == 404
