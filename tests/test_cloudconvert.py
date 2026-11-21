@@ -1136,3 +1136,81 @@ class TestUploadOverTheNetwork:
         with patch.object(http, "timeout", return_value=httpx.Timeout(0.5)):
             caught, _ = await self._submit(upload_host)
         assert outcome_unknown(caught) is False
+
+
+class TestNullTaskResult:
+    """CloudConvert sends "result": null for a task that did not finish; nothing crashes on it."""
+
+    _NULL_PROCESS = {
+        "data": {
+            "id": "job_1",
+            "status": "error",
+            "tasks": [
+                {
+                    "name": "process-file",
+                    "operation": "convert",
+                    "status": "error",
+                    "code": "INVALID_CONVERSION_TYPE",
+                    "message": "This conversion type is not supported",
+                    "output_format": "pdf",
+                    "result": None,
+                },
+                {"name": "export-file", "status": "error", "result": None},
+            ],
+        }
+    }
+
+    @pytest.mark.asyncio
+    async def test_failed_job_with_null_results_is_a_known_failure(self):
+        """A failed conversion is a ProviderError (refunded), not a gateway crash."""
+        provider = _make_provider(base_url=_POLL_ONLY, poll_interval=1, poll_timeout=10)
+        client = _mock_client("get", [_response(200, self._NULL_PROCESS)])
+        with (
+            patch("x402gate.providers.cloudconvert.shared_client", return_value=client),
+            patch("x402gate.providers.cloudconvert.asyncio.sleep", new_callable=AsyncMock),
+            pytest.raises(ProviderError) as caught,
+        ):
+            await provider.get_result("job_1")
+        assert caught.value.status_code == 502
+        assert caught.value.detail == (
+            "Conversion failed (?→pdf): [process-file] INVALID_CONVERSION_TYPE: "
+            "This conversion type is not supported"
+        )
+
+    @pytest.mark.parametrize("result", [None, {"files": None}, {"files": [None, "x"]}, "x"])
+    def test_finished_export_without_files_is_a_known_failure(self, result):
+        job = {"tasks": [{"name": "export-file", "status": "finished", "result": result}]}
+        with pytest.raises(ProviderError, match="No export files"):
+            CloudConvertProvider._extract_result(job)
+
+    @pytest.mark.parametrize("tasks", [None, "x", [None, "task"], {"name": "export-file"}])
+    def test_malformed_task_lists_are_read_as_empty(self, tasks):
+        job = {"tasks": tasks}
+        assert CloudConvertProvider._extract_error(job) == "Unknown error"
+        assert CloudConvertProvider._extract_formats(job) == ""
+
+    def test_error_details_with_a_null_result(self):
+        job = {
+            "tasks": [{"name": "process-file", "status": "error", "message": "bad", "result": None}]
+        }
+        assert CloudConvertProvider._extract_error(job) == "[process-file] bad"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "created",
+        [
+            {"data": {"id": "job_1", "tasks": [{"name": "upload-file", "result": None}]}},
+            {"data": {"id": "job_1", "tasks": [{"name": "upload-file", "result": {"form": None}}]}},
+            {"data": None},
+        ],
+    )
+    async def test_submit_with_null_upload_form_fails_before_uploading(self, created):
+        provider = _make_provider()
+        client = _mock_client("post", [_response(201, created)])
+        with (
+            patch("x402gate.providers.cloudconvert.shared_client", return_value=client),
+            pytest.raises(ProviderError) as caught,
+        ):
+            await provider.submit("convert", dict(_VALID_BODY))
+        assert caught.value.status_code == 502
+        assert client.post.call_count == 1  # the job was created, nothing was uploaded

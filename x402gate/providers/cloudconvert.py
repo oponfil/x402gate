@@ -64,6 +64,22 @@ class _SyncWaitError(Exception):
         self.transient = transient
 
 
+def _obj(value: Any) -> dict[str, Any]:
+    """``value`` when it is a JSON object, else an empty one.
+
+    CloudConvert sends ``"result": null`` for a task that did not finish (a
+    failed conversion's process task, say), and ``.get(key, {})`` returns
+    that None, so every nested read goes through this.
+    """
+    return value if isinstance(value, dict) else {}
+
+
+def _tasks(job: dict[str, Any]) -> list[dict[str, Any]]:
+    """The job's tasks that are objects."""
+    tasks = job.get("tasks")
+    return [task for task in tasks if isinstance(task, dict)] if isinstance(tasks, list) else []
+
+
 def _sync_wait_url(base_url: str, job_id: str) -> str | None:
     """Return the sync API URL that waits for ``job_id``, or None if there is none.
 
@@ -287,7 +303,8 @@ class CloudConvertProvider(BaseProvider):
             )
 
         try:
-            job = resp.json().get("data", resp.json())
+            payload = resp.json()
+            job = _obj(payload.get("data", payload) if isinstance(payload, dict) else None)
         except Exception as e:
             raise ProviderError(
                 provider=self.name,
@@ -297,7 +314,7 @@ class CloudConvertProvider(BaseProvider):
 
         # 2. Find upload task and upload the file
         upload_task = None
-        for task in job.get("tasks", []):
+        for task in _tasks(job):
             if task.get("name") == "upload-file":
                 upload_task = task
                 break
@@ -309,8 +326,9 @@ class CloudConvertProvider(BaseProvider):
                 status_code=502,
             )
 
-        upload_url = upload_task.get("result", {}).get("form", {}).get("url")
-        upload_params = upload_task.get("result", {}).get("form", {}).get("parameters", {})
+        form = _obj(_obj(upload_task.get("result")).get("form"))
+        upload_url = form.get("url")
+        upload_params = _obj(form.get("parameters"))
 
         if not upload_url:
             raise ProviderError(
@@ -602,9 +620,10 @@ class CloudConvertProvider(BaseProvider):
     @staticmethod
     def _extract_result(job: dict[str, Any]) -> dict[str, Any]:
         """Extract export URLs from a finished job."""
-        for task in job.get("tasks", []):
+        for task in _tasks(job):
             if task.get("name") == "export-file" and task.get("status") == "finished":
-                files = task.get("result", {}).get("files", [])
+                files = _obj(task.get("result")).get("files")
+                files = [f for f in files if isinstance(f, dict)] if isinstance(files, list) else []
                 if files:
                     return {
                         "status": "completed",
@@ -622,9 +641,9 @@ class CloudConvertProvider(BaseProvider):
     @staticmethod
     def _extract_formats(job: dict[str, Any]) -> str:
         """Extract 'input→output' format string from a job's process-file task."""
-        for task in job.get("tasks", []):
+        for task in _tasks(job):
             if task.get("name") == "process-file":
-                inp = task.get("input_format") or task.get("result", {}).get("input", {}).get(
+                inp = task.get("input_format") or _obj(_obj(task.get("result")).get("input")).get(
                     "ext", ""
                 )
                 out = task.get("output_format", "")
@@ -636,7 +655,7 @@ class CloudConvertProvider(BaseProvider):
     def _extract_error(job: dict[str, Any]) -> str:
         """Extract error message from a failed job."""
         errors: list[str] = []
-        for task in job.get("tasks", []):
+        for task in _tasks(job):
             if task.get("status") == "error":
                 code = task.get("code", "")
                 msg = task.get("message", "")
@@ -646,15 +665,13 @@ class CloudConvertProvider(BaseProvider):
                 base = f"{code}: {msg}" if code else msg
 
                 # Extract detailed errors from result.errors (if present)
-                result_errors = task.get("result", {})
-                if isinstance(result_errors, dict):
-                    detail_list = result_errors.get("errors", [])
-                    if detail_list:
-                        details = "; ".join(
-                            e.get("message", str(e)) if isinstance(e, dict) else str(e)
-                            for e in detail_list
-                        )
-                        base = f"{base} ({details})" if base else details
+                detail_list = _obj(task.get("result")).get("errors")
+                if isinstance(detail_list, list) and detail_list:
+                    details = "; ".join(
+                        e.get("message", str(e)) if isinstance(e, dict) else str(e)
+                        for e in detail_list
+                    )
+                    base = f"{base} ({details})" if base else details
 
                 if base:
                     errors.append(f"[{task_name}] {base}" if task_name else base)
