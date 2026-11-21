@@ -91,7 +91,7 @@ docker compose up -d
 
 ### Prerequisites
 
-- Python 3.11+
+- Python 3.12+ (WAV pricing needs the `wave` module of 3.12, which reads WAVE_FORMAT_EXTENSIBLE files)
 - systemd (for service management)
 - nginx (for reverse proxy / TLS)
 

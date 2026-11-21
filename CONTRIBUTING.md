@@ -8,7 +8,7 @@
 
 ## Code Style
 
-- **Python 3.11+** — use modern syntax (type hints, `match`, `|` union).
+- **Python 3.12+** — use modern syntax (type hints, `match`, `|` union).
 - Keep functions focused and small.
 - Use `async/await` for all I/O-bound operations.
 - Use `Decimal` for monetary values, never `float`.
