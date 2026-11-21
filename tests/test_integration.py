@@ -25,7 +25,7 @@ import x402gate.app as gateway
 from tests.helpers import make_wav_b64
 from x402gate.app import app, providers
 from x402gate.core.config import load_config as real_load
-from x402gate.core.payment import payment_key
+from x402gate.core.payment import NETWORK_UNAVAILABLE, payment_key
 from x402gate.core.prepaid import deposit, get_balance, reset
 from x402gate.core.pricing import PriceCache, apply_commission
 from x402gate.core.proxy import TaskTimeoutError
@@ -4278,3 +4278,93 @@ class TestNanoGptIdCase:
             json={"model": "pqhaz/other", "messages": [{"role": "user", "content": "hi"}]},
         )
         assert response.status_code == 404
+
+
+class TestVerifyNetworkUnavailable:
+    """A payment the chain's RPC could not check gets 503 (retry), not 402."""
+
+    def _unchecked(self, mock_ph) -> None:
+        mock_ph.extract_payment_signature.return_value = "fake-sig"
+        mock_ph.verify = AsyncMock(
+            return_value=(False, EVM_NETWORK, "0xPayer", NETWORK_UNAVAILABLE)
+        )
+        mock_ph.check_evm_balance = AsyncMock(return_value=True)
+
+    @respx.mock
+    def test_paid_request_gets_503_and_nothing_is_held(self, client):
+        _price_ok()
+        with patch("x402gate.app.payment_handler") as mock_ph:
+            self._unchecked(mock_ph)
+            response = _post_wavespeed(client)
+        assert response.status_code == 503
+        assert response.json()["error"] == "Payment network unavailable, retry"
+        mock_ph.check_evm_balance.assert_not_called()
+        assert gateway.payment_claims.claim(payment_key("fake-sig"))
+
+    def test_topup_gets_503(self, client):
+        with patch("x402gate.app.payment_handler") as mock_ph:
+            self._unchecked(mock_ph)
+            mock_ph.extract_payment_signature.return_value = TOPUP_SIG
+            response = _topup(client)
+        assert response.status_code == 503
+        assert response.json()["error"] == "Payment network unavailable, retry"
+        mock_ph.settle.assert_not_called()
+
+
+class TestCloudConvertFailedConversion:
+    """A conversion CloudConvert reports as failed is refunded, even with null task results."""
+
+    @respx.mock
+    def test_prepaid_failed_conversion_returns_the_hold(self, client):
+        reset()
+        kp = Keypair()
+        pubkey = str(kp.pubkey())
+        asyncio.run(deposit(pubkey, Decimal("1.00")))
+        respx.post("https://api.cloudconvert.com/v2/jobs").mock(
+            return_value=httpx.Response(
+                201,
+                json={
+                    "data": {
+                        "id": "job_1",
+                        "tasks": [
+                            {
+                                "name": "upload-file",
+                                "result": {
+                                    "form": {"url": "https://upload.example/u", "parameters": {}}
+                                },
+                            }
+                        ],
+                    }
+                },
+            )
+        )
+        respx.post("https://upload.example/u").mock(return_value=httpx.Response(201))
+        failed = {
+            "data": {
+                "id": "job_1",
+                "status": "error",
+                "tasks": [
+                    {
+                        "name": "process-file",
+                        "status": "error",
+                        "code": "INVALID_CONVERSION_TYPE",
+                        "message": "not supported",
+                        "output_format": "pdf",
+                        "result": None,
+                    }
+                ],
+            }
+        }
+        respx.get(url__regex=r"https://(sync\.)?api\.cloudconvert\.com/v2/jobs/job_1.*").mock(
+            return_value=httpx.Response(200, json=failed)
+        )
+        response = client.post(
+            "/v1/cloudconvert/convert",
+            data={"output_format": "pdf"},
+            files={"file": ("a.docx", b"data")},
+            headers=_prepaid_headers(kp, "cloudconvert/convert"),
+        )
+        assert response.status_code == 502
+        assert "Conversion failed" in response.json()["error"]
+        assert "outcome_unknown" not in response.json()
+        assert get_balance(pubkey) == Decimal("1.00")

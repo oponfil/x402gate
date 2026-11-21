@@ -13,6 +13,7 @@ import functools
 import hashlib
 import json
 import logging
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -245,6 +246,19 @@ def _canonical_nonce(nonce: str) -> str:
 
 
 _PERMIT2_REFUSED = "unsupported_payload: Permit2 is not accepted"
+
+# verify's reason when the chain's RPC could not be reached, so the payment
+# was not checked at all: the app answers 503 (retry), not 402 (bad payment).
+NETWORK_UNAVAILABLE = "network_unavailable"
+# The SDK turns any exception in its checks into an invalid payment and keeps
+# only the exception's text. These are the texts of an RPC that did not
+# answer: requests' timeouts and dropped connections, web3's timeout, and an
+# HTTP 429 or 5xx from the node.
+_RPC_UNREACHABLE = re.compile(
+    r"HTTPS?ConnectionPool\(|Read timed out|Max retries exceeded|Connection aborted"
+    r"|RemoteDisconnected|Connection reset|did not receive a response"
+    r"|\b(?:429|5\d\d) (?:Client|Server) Error"
+)
 
 
 def _is_permit2(payload_dict: Any) -> bool:
@@ -974,6 +988,14 @@ class PaymentHandler:
             payer = getattr(result, "payer", "") or ""
             invalid_reason = getattr(result, "invalid_reason", "") or ""
             invalid_message = getattr(result, "invalid_message", "") or ""
+            if not result.is_valid and _RPC_UNREACHABLE.search(invalid_message):
+                logger.warning(
+                    "Payment not checked: the %s RPC did not answer (%s): %s",
+                    network,
+                    invalid_reason,
+                    invalid_message[:200],
+                )
+                return False, network, payer, NETWORK_UNAVAILABLE
             if result.is_valid:
                 logger.info(
                     "Payment verified: $%g USDC from %s on %s (valid=True)",

@@ -14,6 +14,7 @@ from web3.exceptions import RequestTimedOut, TransactionNotFound, Web3RPCError
 
 from x402gate.core.config import NetworkConfig
 from x402gate.core.payment import (
+    NETWORK_UNAVAILABLE,
     InFlightAmounts,
     PaymentClaims,
     PaymentHandler,
@@ -2288,3 +2289,67 @@ class TestBaseReadsAreBounded:
         assert await handler.check_evm_balance(_BASE, _PAYER, Decimal("1")) is None
         # Its own two attempts, each tried once.
         assert time.monotonic() - start < 3 * t
+
+
+class TestRpcUnreachableAtVerify:
+    """A Base RPC that does not answer during verify is not a refused payment."""
+
+    def _verify(self, handler: PaymentHandler, invalid_reason: str, invalid_message: str):
+        ns = handler._schemes["eip155:8453"]
+        ns.scheme = Mock()
+        ns.scheme.verify.return_value = SimpleNamespace(
+            is_valid=False,
+            payer="0xabc",
+            invalid_reason=invalid_reason,
+            invalid_message=invalid_message,
+        )
+        accepted = handler.get_payment_requirements_for_network(Decimal("0.5"), "eip155:8453")
+        header = _encoded(
+            {
+                "x402Version": 2,
+                "accepted": accepted,
+                "payload": {"signature": "0x1", "authorization": {"from": "0xabc", "nonce": "1"}},
+            }
+        )
+        return handler.verify(header, Decimal("0.5"))
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "HTTPSConnectionPool(host='mainnet.base.org', port=443): Read timed out. "
+            "(read timeout=10)",
+            "HTTPSConnectionPool(host='mainnet.base.org', port=443): Max retries exceeded "
+            "with url: / (Caused by NewConnectionError(...))",
+            "503 Server Error: Service Unavailable for url: https://mainnet.base.org/",
+            "429 Client Error: Too Many Requests for url: https://mainnet.base.org/",
+            "HTTP request to https://mainnet.base.org did not receive a response within 10 seconds",
+            "('Connection aborted.', RemoteDisconnected('Remote end closed connection'))",
+        ],
+    )
+    async def test_rpc_failure_reads_as_network_unavailable(
+        self, handler: PaymentHandler, fresh_prices, message
+    ):
+        ok, network, payer, reason = await self._verify(
+            handler, "invalid_exact_evm_failed_to_verify_signature", message
+        )
+        assert (ok, network, payer, reason) == (False, "eip155:8453", "0xabc", NETWORK_UNAVAILABLE)
+
+    @pytest.mark.parametrize(
+        ("invalid_reason", "message"),
+        [
+            (
+                "invalid_exact_evm_payload_signature",
+                "('execution reverted: FiatTokenV2: invalid signature', '0x08c379a0')",
+            ),
+            (
+                "invalid_exact_evm_insufficient_balance",
+                "('execution reverted: ERC20: transfer amount exceeds balance', '0x08c379a0')",
+            ),
+        ],
+    )
+    async def test_a_bad_payment_is_still_refused(
+        self, handler: PaymentHandler, fresh_prices, invalid_reason, message
+    ):
+        ok, _, _, reason = await self._verify(handler, invalid_reason, message)
+        assert ok is False
+        assert reason == f"{invalid_reason}: {message}"

@@ -31,6 +31,7 @@ from x402gate.core.config import AppConfig, load_config
 from x402gate.core.http import KEEPALIVE_EXPIRY_S, close_shared_client
 from x402gate.core.http import timeout as upstream_timeout
 from x402gate.core.payment import (
+    NETWORK_UNAVAILABLE,
     InFlightAmounts,
     PaymentClaims,
     PaymentHandler,
@@ -1107,6 +1108,8 @@ async def topup(request: Request) -> Response:
     is_valid, payment_network, payer, reason = await payment_handler.verify(
         payment_sig, topup_amount
     )
+    if reason == NETWORK_UNAVAILABLE:
+        return _error_response(503, "Payment network unavailable, retry")
     if not is_valid or not payer:
         msg = f"Payment verification failed: {reason}" if reason else "Payment verification failed"
         return _error_response(402, msg)
@@ -1574,6 +1577,9 @@ async def _managed_flow(
         is_valid, payment_network, payer, reason = await payment_handler.verify(
             payment_sig, final_price
         )
+        if reason == NETWORK_UNAVAILABLE:
+            # The payment was not checked, so it is not refused as bad.
+            return _error_response(503, "Payment network unavailable, retry")
         if not is_valid:
             verify_s = time.monotonic() - t_verify_start
             msg = (

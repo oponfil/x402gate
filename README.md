@@ -166,7 +166,7 @@ An OpenRouter or NanoGPT 2xx that carries only an `error` object, with no usage 
 }
 ```
 
-On Base only EIP-3009 authorizations are accepted; a Permit2 payload gets 402 `Payment verification failed: unsupported_payload: Permit2 is not accepted`.
+On Base only EIP-3009 authorizations are accepted; a Permit2 payload gets 402 `Payment verification failed: unsupported_payload: Permit2 is not accepted`. When the chain's RPC does not answer while the payment is checked (a timeout, a dropped connection, a 429 or 5xx from the node), the payment was not checked at all, so the response is 503 `Payment network unavailable, retry` rather than a 402: sign nothing new, send the same request again.
 
 **Base payment still pending:** a Base settlement that was sent but not confirmed in time still runs the job. If the provider then reports a failure, the error carries `settlement_pending: true`, `pending_refund` (the full price) and `transaction`, and the refund is credited to prepaid once the transaction's receipt shows the transfer (or at once, as `refunded_to_prepaid`, if it landed during the job). These three fields appear only while the gateway is still following the receipt: if the transfer already reverted or its authorization expired during the job, nothing was charged and the error carries none of them. A revert, an expiry or a gateway restart after the error credits nothing. Check `GET /v1/balance/{address}` later.
 
